@@ -1,0 +1,746 @@
+"""
+MACD Divergencia + TD Sequence Bot para BingX Perpetual Futures
+Estrategia:
+  1. Entrada en divergencia MACD (bullish/bearish)
+  2. TD9 multi-timeframe gestiona adds/reduces de posición
+  3. Trailing stop protege ganancias
+  4. Notificaciones Telegram
+"""
+
+import os
+import sys
+import time
+import json
+import hmac
+import hashlib
+import logging
+import requests
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Tuple
+from dataclasses import dataclass, field, asdict
+
+# ─────────────────────────────────────────────
+# CONFIGURACIÓN
+# ─────────────────────────────────────────────
+SYMBOL          = os.getenv("SYMBOL", "ETH-USDT")
+API_KEY         = os.getenv("BINGX_API_KEY", "")
+API_SECRET      = os.getenv("BINGX_API_SECRET", "")
+TG_TOKEN        = os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
+BASE_URL        = "https://open-api.bingx.com"
+
+# Parámetros estrategia
+RISK_PER_TRADE          = float(os.getenv("RISK_PCT", "0.02"))      # 2% riesgo por trade
+MIN_DIV_STRENGTH        = float(os.getenv("MIN_DIV", "0.25"))
+ATR_STOP_MULT           = float(os.getenv("ATR_STOP", "1.5"))       # SL inicial
+TRAILING_ATR            = float(os.getenv("TRAIL_ATR", "2.0"))      # Trailing stop ATR
+TRAILING_PCT            = float(os.getenv("TRAIL_PCT", "0.05"))     # Trailing stop 5%
+MIN_PROFIT_TRAIL        = float(os.getenv("MIN_PROFIT_TRAIL","0.01"))
+ENABLE_BUY_FILTER       = os.getenv("BUY_FILTER", "true").lower() == "true"
+BUY_RSI_THRESHOLD       = float(os.getenv("RSI_THRESH", "40"))
+BUY_VOL_RATIO           = float(os.getenv("VOL_RATIO", "0.8"))
+ENABLE_30M_CLEAR        = os.getenv("CLEAR_30M", "true").lower() == "true"
+MIN_BARS_PROTECTION     = int(os.getenv("MIN_BARS", "1"))
+INITIAL_ADD_SIZE        = float(os.getenv("INITIAL_ADD", "0.3"))    # 30% add inicial
+MAX_LEVERAGE            = float(os.getenv("MAX_LEV", "10"))
+CHECK_INTERVAL          = int(os.getenv("CHECK_SEC", "60"))
+KLINES_LIMIT            = int(os.getenv("KLINES_LIMIT", "500"))
+MAX_POSITION_USDT       = float(os.getenv("MAX_POS_USDT", "20"))
+MIN_POSITION_USDT       = float(os.getenv("MIN_POS_USDT", "5"))
+
+# Ratios de reducción por nivel TD
+TP_RATIOS = {"1m": 0.25, "3m": 0.20, "5m": 0.25}
+
+STATE_FILE = "bot_state.json"
+
+# ─────────────────────────────────────────────
+# LOGGER
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")]
+)
+log = logging.getLogger("MACD_TD_BOT")
+
+# ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
+def tg(msg: str):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception as e:
+        log.warning(f"Telegram error: {e}")
+
+# ─────────────────────────────────────────────
+# BINGX API
+# ─────────────────────────────────────────────
+def _sign(params: dict) -> str:
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+
+def _req(method: str, path: str, params: dict = None, data: dict = None) -> Optional[dict]:
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["signature"] = _sign(params)
+    headers = {"X-BX-APIKEY": API_KEY}
+    url = BASE_URL + path
+    try:
+        if method == "GET":
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+        else:
+            r = requests.post(url, params=params, json=data, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.error(f"API {method} {path} error: {e}")
+        return None
+
+def get_balance() -> float:
+    """Obtiene balance USDT disponible."""
+    r = _req("GET", "/openApi/swap/v2/user/balance")
+    if r and r.get("code") == 0:
+        for asset in r["data"]["balance"]:
+            if asset.get("asset") == "USDT":
+                return float(asset.get("availableMargin", 0))
+    log.error(f"Balance error: {r}")
+    return 0.0
+
+def get_mark_price() -> float:
+    r = _req("GET", "/openApi/swap/v2/quote/price", {"symbol": SYMBOL})
+    if r and r.get("code") == 0:
+        return float(r["data"]["price"])
+    return 0.0
+
+def get_klines(interval: str, limit: int = 500) -> Optional[pd.DataFrame]:
+    """Descarga klines de BingX y devuelve DataFrame con OHLCV."""
+    r = _req("GET", "/openApi/swap/v3/quote/klines",
+             {"symbol": SYMBOL, "interval": interval, "limit": limit})
+    if not r or r.get("code") != 0:
+        log.error(f"Klines {interval} error: {r}")
+        return None
+    data = r["data"]
+    df = pd.DataFrame(data, columns=["time","open","high","low","close","volume","_"])
+    df = df[["time","open","high","low","close","volume"]].copy()
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
+    df["time"] = pd.to_datetime(df["time"].astype(float), unit="ms", utc=True)
+    df.sort_values("time", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+def set_leverage(leverage: int):
+    _req("POST", "/openApi/swap/v2/trade/leverage",
+         {"symbol": SYMBOL, "side": "LONG", "leverage": leverage})
+    _req("POST", "/openApi/swap/v2/trade/leverage",
+         {"symbol": SYMBOL, "side": "SHORT", "leverage": leverage})
+
+def place_order(side: str, usdt_size: float, reduce_only: bool = False) -> Optional[dict]:
+    """
+    side: 'BUY' (long) o 'SELL' (short)
+    Usa MARKET order con tamaño en USDT (quantity).
+    """
+    price = get_mark_price()
+    if price <= 0:
+        return None
+    # Calcular qty en contratos (1 contrato = 1 unidad del activo)
+    qty = round(usdt_size / price, 4)
+    if qty <= 0:
+        return None
+
+    params = {
+        "symbol": SYMBOL,
+        "side": side,
+        "positionSide": "LONG" if side == "BUY" else "SHORT",
+        "type": "MARKET",
+        "quantity": qty,
+    }
+    if reduce_only:
+        params["reduceOnly"] = "true"
+        params["positionSide"] = "LONG" if side == "SELL" else "SHORT"
+
+    r = _req("POST", "/openApi/swap/v2/trade/order", params)
+    if r and r.get("code") == 0:
+        log.info(f"Order OK: {side} {qty} @ ~{price:.2f}")
+        return {"qty": qty, "price": price, "usdt": qty * price}
+    log.error(f"Order FAILED: {r}")
+    return None
+
+def close_position_all(pos_side: str) -> bool:
+    """Cierra toda la posición de un lado."""
+    r = _req("POST", "/openApi/swap/v2/trade/closeAllPositions",
+             {"symbol": SYMBOL, "positionSide": pos_side})
+    return r and r.get("code") == 0
+
+def get_open_position() -> Optional[dict]:
+    """Devuelve posición abierta activa si existe."""
+    r = _req("GET", "/openApi/swap/v2/user/positions", {"symbol": SYMBOL})
+    if r and r.get("code") == 0:
+        for p in r.get("data", []):
+            if float(p.get("positionAmt", 0)) != 0:
+                return p
+    return None
+
+# ─────────────────────────────────────────────
+# INDICADORES
+# ─────────────────────────────────────────────
+def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    close = df["close"].values.astype(float)
+    high  = df["high"].values.astype(float)
+    low   = df["low"].values.astype(float)
+    vol   = df["volume"].values.astype(float)
+
+    # MACD estándar 12/26/9
+    ema12 = _ema(close, 12)
+    ema26 = _ema(close, 26)
+    macd  = ema12 - ema26
+    sig9  = _ema(macd, 9)
+    hist  = macd - sig9
+
+    # MACD rápido 8/17/6
+    ema8  = _ema(close, 8)
+    ema17 = _ema(close, 17)
+    macd_fast = ema8 - ema17
+    sig6  = _ema(macd_fast, 6)
+
+    # ATR 14
+    atr = _atr(high, low, close, 14)
+
+    # EMA 20/60
+    ema20 = _ema(close, 20)
+    ema60 = _ema(close, 60)
+
+    # RSI 14
+    rsi = _rsi(close, 14)
+
+    # Volumen ratio
+    vol_ma = _sma(vol, 20)
+    vol_ratio = np.where(vol_ma > 0, vol / vol_ma, 1.0)
+
+    df["macd"]      = macd
+    df["macd_sig"]  = sig9
+    df["macd_hist"] = hist
+    df["macd_fast"] = macd_fast - sig6
+    df["atr"]       = atr
+    df["ema20"]     = ema20
+    df["ema60"]     = ema60
+    df["rsi"]       = rsi
+    df["vol_ratio"] = vol_ratio
+    return df.dropna().reset_index(drop=True)
+
+def _ema(data: np.ndarray, period: int) -> np.ndarray:
+    result = np.full(len(data), np.nan)
+    if len(data) < period:
+        return result
+    k = 2 / (period + 1)
+    result[period - 1] = np.mean(data[:period])
+    for i in range(period, len(data)):
+        result[i] = data[i] * k + result[i - 1] * (1 - k)
+    return result
+
+def _sma(data: np.ndarray, period: int) -> np.ndarray:
+    result = np.full(len(data), np.nan)
+    for i in range(period - 1, len(data)):
+        result[i] = np.mean(data[i - period + 1:i + 1])
+    return result
+
+def _atr(high, low, close, period: int) -> np.ndarray:
+    tr = np.maximum(high[1:] - low[1:],
+         np.maximum(abs(high[1:] - close[:-1]),
+                    abs(low[1:] - close[:-1])))
+    tr = np.concatenate([[high[0] - low[0]], tr])
+    return _sma(tr, period)
+
+def _rsi(close: np.ndarray, period: int) -> np.ndarray:
+    delta = np.diff(close)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    avg_gain = _sma(gain, period)
+    avg_loss = _sma(loss, period)
+    rs = np.where(avg_loss > 0, avg_gain / avg_loss, 100.0)
+    rsi_vals = 100 - (100 / (1 + rs))
+    return np.concatenate([[np.nan], rsi_vals])
+
+# ─────────────────────────────────────────────
+# DIVERGENCIA MACD
+# ─────────────────────────────────────────────
+def find_extremes(data: np.ndarray, window: int = 3) -> Tuple[List, List]:
+    peaks, troughs = [], []
+    for i in range(window, len(data) - window):
+        if all(data[i] > data[i-j] and data[i] > data[i+j] for j in range(1, window+1)):
+            peaks.append((i, data[i]))
+        if all(data[i] < data[i-j] and data[i] < data[i+j] for j in range(1, window+1)):
+            troughs.append((i, data[i]))
+    return peaks, troughs
+
+def bullish_divergence(price_tr, macd_tr, fast_tr=None) -> Tuple[bool, float, Optional[dict]]:
+    """Precio hace mínimo más bajo, MACD hace mínimo más alto → señal alcista."""
+    if len(price_tr) < 2 or len(macd_tr) < 2:
+        return False, 0, None
+    p1, p2 = price_tr[-2], price_tr[-1]
+    m1, m2 = macd_tr[-2], macd_tr[-1]
+    if p2[1] < p1[1] and m2[1] > m1[1]:
+        strength = min(1.0,
+            abs((p2[1]-p1[1])/p1[1]) * 50 +
+            ((m2[1]-m1[1])/abs(m1[1]) if m1[1] != 0 else 1) * 50)
+        return True, strength, {"price_low": p2[1], "index": p2[0], "strength": strength}
+    # MACD rápido
+    if fast_tr and len(fast_tr) >= 2:
+        f1, f2 = fast_tr[-2], fast_tr[-1]
+        if p2[1] < p1[1] and f2[1] > f1[1]:
+            strength = min(0.8,
+                abs((p2[1]-p1[1])/p1[1]) * 30 +
+                ((f2[1]-f1[1])/abs(f1[1]) if f1[1] != 0 else 1) * 30)
+            return True, strength, {"price_low": p2[1], "index": p2[0], "strength": strength, "fast": True}
+    return False, 0, None
+
+def bearish_divergence(price_pk, macd_pk, fast_pk=None) -> Tuple[bool, float, Optional[dict]]:
+    """Precio hace máximo más alto, MACD hace máximo más bajo → señal bajista."""
+    if len(price_pk) < 2 or len(macd_pk) < 2:
+        return False, 0, None
+    p1, p2 = price_pk[-2], price_pk[-1]
+    m1, m2 = macd_pk[-2], macd_pk[-1]
+    if p2[1] > p1[1] and m2[1] < m1[1]:
+        strength = min(1.0,
+            abs((p2[1]-p1[1])/p1[1]) * 50 +
+            abs((m2[1]-m1[1])/abs(m1[1]) if m1[1] != 0 else 1) * 50)
+        return True, strength, {"price_high": p2[1], "index": p2[0], "strength": strength}
+    if fast_pk and len(fast_pk) >= 2:
+        f1, f2 = fast_pk[-2], fast_pk[-1]
+        if p2[1] > p1[1] and f2[1] < f1[1]:
+            strength = min(0.8,
+                abs((p2[1]-p1[1])/p1[1]) * 30 +
+                abs((f2[1]-f1[1])/abs(f1[1]) if f1[1] != 0 else 1) * 30)
+            return True, strength, {"price_high": p2[1], "index": p2[0], "strength": strength, "fast": True}
+    return False, 0, None
+
+# ─────────────────────────────────────────────
+# TD SETUP
+# ─────────────────────────────────────────────
+def td_setup(df: pd.DataFrame, period: int = 9) -> int:
+    """
+    Retorna:
+       1  → Buy Setup completo (9 barras con close < close[4])
+      -1  → Sell Setup completo (9 barras con close > close[4])
+       0  → Sin setup
+    """
+    closes = df["close"].values
+    if len(closes) < period + 4:
+        return 0
+    buy  = all(closes[-i] <= closes[-i-4] for i in range(1, period+1))
+    sell = all(closes[-i] >= closes[-i-4] for i in range(1, period+1))
+    return 1 if buy else (-1 if sell else 0)
+
+def get_td_signals(dfs: dict) -> dict:
+    """Calcula TD9 en todos los timeframes."""
+    return {tf: td_setup(df) for tf, df in dfs.items()}
+
+# ─────────────────────────────────────────────
+# ESTADO
+# ─────────────────────────────────────────────
+@dataclass
+class Position:
+    side: str              # "long" o "short"
+    entry_price: float
+    entry_time: str
+    size_usdt: float       # tamaño original
+    remain_usdt: float     # tamaño restante
+    stop_loss: float
+    highest: float         # máximo desde entrada (long)
+    lowest: float          # mínimo desde entrada (short)
+    tp_done: List[str] = field(default_factory=list)
+    initial_added: bool = False
+    entry_bar: int = 0
+
+@dataclass
+class BotState:
+    balance: float = 0.0
+    position: Optional[dict] = None
+    last_bull_idx: int = -1
+    last_bear_idx: int = -1
+    trades: List[dict] = field(default_factory=list)
+
+def load_state() -> BotState:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                d = json.load(f)
+            return BotState(**d)
+        except Exception as e:
+            log.warning(f"State load error: {e}")
+    return BotState()
+
+def save_state(st: BotState):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(asdict(st), f, indent=2, default=str)
+    except Exception as e:
+        log.error(f"State save error: {e}")
+
+# ─────────────────────────────────────────────
+# LÓGICA PRINCIPAL
+# ─────────────────────────────────────────────
+class MACDTDBot:
+    def __init__(self):
+        self.state = load_state()
+        self.pos: Optional[Position] = None
+        if self.state.position:
+            self.pos = Position(**self.state.position)
+        log.info(f"Bot iniciado. Posición: {self.pos}")
+        tg(f"🤖 <b>MACD+TD Bot iniciado</b>\nSímbolo: {SYMBOL}\nRiesgo: {RISK_PER_TRADE*100:.0f}%")
+        set_leverage(int(MAX_LEVERAGE))
+
+    # ── datos ──────────────────────────────────
+    def fetch_all(self) -> Optional[dict]:
+        dfs = {}
+        for tf in ["1m", "3m", "5m", "15m", "30m"]:
+            df = get_klines(tf, KLINES_LIMIT)
+            if df is None or len(df) < 100:
+                log.error(f"Sin datos {tf}")
+                return None
+            dfs[tf] = calc_indicators(df)
+        return dfs
+
+    # ── filtro compra ───────────────────────────
+    def buy_filter_ok(self, df15: pd.DataFrame) -> Tuple[bool, str]:
+        if not ENABLE_BUY_FILTER:
+            return True, "sin filtro"
+        row = df15.iloc[-1]
+        conds = []
+        if row["rsi"] < BUY_RSI_THRESHOLD:
+            conds.append(f"RSI={row['rsi']:.1f}")
+        if row["close"] < row["ema60"]:
+            conds.append("close<EMA60")
+        if row["vol_ratio"] > BUY_VOL_RATIO:
+            conds.append(f"vol×{row['vol_ratio']:.2f}")
+        ok = len(conds) >= 2
+        return ok, ("✅ " if ok else "❌ ") + ", ".join(conds) if conds else "❌ sin condiciones"
+
+    # ── tamaño posición ─────────────────────────
+    def calc_size(self, price: float, stop: float, strength: float) -> float:
+        bal = get_balance()
+        if bal <= 0:
+            return 0.0
+        self.state.balance = bal
+        risk   = bal * RISK_PER_TRADE
+        dist   = abs(price - stop)
+        if dist <= 0:
+            dist = price * 0.01
+        mult   = 0.5 + strength
+        size   = risk * mult / (dist / price)
+        size   = min(size, MAX_POSITION_USDT, bal * MAX_LEVERAGE)
+        size   = max(size, MIN_POSITION_USDT)
+        return round(size, 2)
+
+    # ── trailing stop ───────────────────────────
+    def update_trailing(self, price: float, atr: float) -> bool:
+        if not self.pos:
+            return False
+        profit_pct = ((price - self.pos.entry_price) / self.pos.entry_price
+                      if self.pos.side == "long"
+                      else (self.pos.entry_price - price) / self.pos.entry_price)
+        if profit_pct < MIN_PROFIT_TRAIL:
+            return False
+        updated = False
+        if self.pos.side == "long":
+            if price > self.pos.highest:
+                self.pos.highest = price
+            new_sl = max(self.pos.highest - atr * TRAILING_ATR,
+                         self.pos.highest * (1 - TRAILING_PCT))
+            if new_sl > self.pos.stop_loss:
+                self.pos.stop_loss = new_sl
+                updated = True
+        else:
+            if price < self.pos.lowest:
+                self.pos.lowest = price
+            new_sl = min(self.pos.lowest + atr * TRAILING_ATR,
+                         self.pos.lowest * (1 + TRAILING_PCT))
+            if new_sl < self.pos.stop_loss:
+                self.pos.stop_loss = new_sl
+                updated = True
+        return updated
+
+    # ── abrir posición ──────────────────────────
+    def open_long(self, price: float, stop: float, strength: float, reason: str):
+        size = self.calc_size(price, stop, strength)
+        if size <= 0:
+            return
+        res = place_order("BUY", size)
+        if not res:
+            tg(f"❌ Error abriendo LONG")
+            return
+        self.pos = Position(
+            side="long", entry_price=res["price"], entry_time=str(datetime.now(timezone.utc)),
+            size_usdt=res["usdt"], remain_usdt=res["usdt"],
+            stop_loss=stop, highest=res["price"], lowest=res["price"],
+            entry_bar=0
+        )
+        self._sync_entry_bar()
+        self.state.position = asdict(self.pos)
+        save_state(self.state)
+        msg = (f"📈 <b>LONG abierto</b>\n"
+               f"Precio: ${res['price']:.2f}\n"
+               f"Tamaño: ${res['usdt']:.2f} USDT\n"
+               f"Stop: ${stop:.2f}\n"
+               f"Fuerza div.: {strength:.2f}\n"
+               f"Razón: {reason}")
+        log.info(msg)
+        tg(msg)
+
+    def open_short(self, price: float, stop: float, strength: float):
+        size = self.calc_size(price, stop, strength)
+        if size <= 0:
+            return
+        res = place_order("SELL", size)
+        if not res:
+            tg(f"❌ Error abriendo SHORT")
+            return
+        self.pos = Position(
+            side="short", entry_price=res["price"], entry_time=str(datetime.now(timezone.utc)),
+            size_usdt=res["usdt"], remain_usdt=res["usdt"],
+            stop_loss=stop, highest=res["price"], lowest=res["price"],
+            entry_bar=0
+        )
+        self._sync_entry_bar()
+        self.state.position = asdict(self.pos)
+        save_state(self.state)
+        msg = (f"📉 <b>SHORT abierto</b>\n"
+               f"Precio: ${res['price']:.2f}\n"
+               f"Tamaño: ${res['usdt']:.2f} USDT\n"
+               f"Stop: ${stop:.2f}\n"
+               f"Fuerza div.: {strength:.2f}")
+        log.info(msg)
+        tg(msg)
+
+    def _sync_entry_bar(self):
+        """Guarda índice de entrada para protección de barras."""
+        self._entry_bar_count = 0
+
+    # ── cerrar parcial ──────────────────────────
+    def close_partial(self, price: float, pct: float, level: str):
+        if not self.pos:
+            return
+        close_usdt = self.pos.size_usdt * pct
+        if close_usdt < MIN_POSITION_USDT or close_usdt > self.pos.remain_usdt:
+            return
+        side = "SELL" if self.pos.side == "long" else "BUY"
+        res = place_order(side, close_usdt, reduce_only=True)
+        if not res:
+            return
+        pnl = ((price - self.pos.entry_price) if self.pos.side == "long"
+               else (self.pos.entry_price - price)) * (res["qty"])
+        self.pos.remain_usdt -= close_usdt
+        self.pos.tp_done.append(level)
+        self.state.position = asdict(self.pos)
+        save_state(self.state)
+        msg = (f"🎯 Reducción <b>{level}</b> ({pct*100:.0f}%)\n"
+               f"Precio: ${price:.2f}\n"
+               f"PnL: ${pnl:+.2f}\n"
+               f"Resto: ${self.pos.remain_usdt:.2f} USDT")
+        log.info(msg)
+        tg(msg)
+
+    # ── cerrar total ────────────────────────────
+    def close_all(self, price: float, reason: str):
+        if not self.pos:
+            return
+        side_close = "SELL" if self.pos.side == "long" else "BUY"
+        close_position_all("LONG" if self.pos.side == "long" else "SHORT")
+        pnl = ((price - self.pos.entry_price) if self.pos.side == "long"
+               else (self.pos.entry_price - price)) * (self.pos.remain_usdt / self.pos.entry_price)
+        self.state.trades.append({
+            "side": self.pos.side, "entry": self.pos.entry_price,
+            "exit": price, "pnl": round(pnl, 4), "reason": reason,
+            "time": str(datetime.now(timezone.utc))
+        })
+        self.pos = None
+        self.state.position = None
+        save_state(self.state)
+        emoji = "🟢" if pnl > 0 else "🔴"
+        msg = (f"{emoji} <b>CERRADO</b> ({reason})\n"
+               f"Precio: ${price:.2f}\n"
+               f"PnL: ${pnl:+.2f}")
+        log.info(msg)
+        tg(msg)
+
+    # ── ciclo principal ─────────────────────────
+    def run_once(self):
+        dfs = self.fetch_all()
+        if not dfs:
+            return
+
+        df15 = dfs["15m"]
+        price = get_mark_price()
+        if price <= 0:
+            return
+        atr = df15["atr"].iloc[-1]
+
+        # TD signals
+        td = get_td_signals({tf: dfs[tf] for tf in ["1m","3m","5m","15m","30m"]})
+
+        # ── sin posición: buscar entrada ────────
+        if self.pos is None:
+            window  = df15.tail(200)
+            cl = window["close"].values
+            mc = window["macd"].values
+            mf = window["macd_fast"].values
+
+            pk_cl, tr_cl = find_extremes(cl)
+            pk_mc, tr_mc = find_extremes(mc)
+            pk_mf, tr_mf = find_extremes(mf)
+
+            bull, bull_str, bull_info = bullish_divergence(tr_cl, tr_mc, tr_mf)
+            bear, bear_str, bear_info = bearish_divergence(pk_cl, pk_mc, pk_mf)
+
+            if bull and bull_str >= MIN_DIV_STRENGTH:
+                idx = bull_info["index"]
+                if idx != self.state.last_bull_idx:
+                    ok, fmsg = self.buy_filter_ok(df15)
+                    if ok:
+                        stop = bull_info["price_low"] - atr * ATR_STOP_MULT
+                        self.open_long(price, stop, bull_str, fmsg)
+                        self.state.last_bull_idx = idx
+                    else:
+                        log.info(f"Divergencia alcista filtrada: {fmsg}")
+
+            elif bear and bear_str >= MIN_DIV_STRENGTH:
+                idx = bear_info["index"]
+                if idx != self.state.last_bear_idx:
+                    stop = bear_info["price_high"] + atr * ATR_STOP_MULT
+                    self.open_short(price, stop, bear_str)
+                    self.state.last_bear_idx = idx
+
+        # ── con posición: gestionar ─────────────
+        else:
+            self._entry_bar_count = getattr(self, "_entry_bar_count", 0) + 1
+            in_protection = self._entry_bar_count < MIN_BARS_PROTECTION
+
+            in_profit = ((price > self.pos.entry_price) if self.pos.side == "long"
+                         else (price < self.pos.entry_price))
+
+            # Trailing stop
+            if in_profit and not in_protection:
+                upd = self.update_trailing(price, atr)
+                if upd:
+                    log.info(f"Trailing stop → ${self.pos.stop_loss:.2f}")
+
+            # ── Check stop loss ─────────────────
+            sl_hit = ((price <= self.pos.stop_loss) if self.pos.side == "long"
+                      else (price >= self.pos.stop_loss))
+            if sl_hit:
+                self.close_all(price, "Stop Loss")
+                return
+
+            # ── Check TD signals ────────────────
+            if not in_protection:
+                # Reducción multi-nivel (sólo en beneficio)
+                if in_profit:
+                    for level, pct in TP_RATIOS.items():
+                        if level in self.pos.tp_done:
+                            continue
+                        td_val = td.get(level, 0)
+                        trigger = (td_val == -1 if self.pos.side == "long" else td_val == 1)
+                        if trigger:
+                            self.close_partial(price, pct, level)
+
+                # Add inicial (15m TD9 a favor + en beneficio + sin haber añadido)
+                if in_profit and not self.pos.initial_added:
+                    td15 = td.get("15m", 0)
+                    add_ok = (td15 == 1 if self.pos.side == "long" else td15 == -1)
+                    if add_ok:
+                        add_usdt = self.pos.size_usdt * INITIAL_ADD_SIZE
+                        if add_usdt >= MIN_POSITION_USDT:
+                            side_add = "BUY" if self.pos.side == "long" else "SELL"
+                            res = place_order(side_add, add_usdt)
+                            if res:
+                                self.pos.remain_usdt += res["usdt"]
+                                self.pos.initial_added = True
+                                self.state.position = asdict(self.pos)
+                                save_state(self.state)
+                                msg = (f"➕ <b>Add inicial</b>\n"
+                                       f"USD añadido: ${res['usdt']:.2f}\n"
+                                       f"Trigger: 15m TD9\n"
+                                       f"Total: ${self.pos.remain_usdt:.2f} USDT")
+                                log.info(msg); tg(msg)
+
+                # Re-add tras reducción (3m/5m TD9 a favor)
+                if self.pos.tp_done and in_profit:
+                    td3, td5 = td.get("3m", 0), td.get("5m", 0)
+                    readd_tf = None
+                    if self.pos.side == "long":
+                        if td3 == 1: readd_tf = "3m"
+                        elif td5 == 1: readd_tf = "5m"
+                    else:
+                        if td3 == -1: readd_tf = "3m"
+                        elif td5 == -1: readd_tf = "5m"
+                    if readd_tf:
+                        closed_pct = sum(TP_RATIOS.get(s, 0) for s in self.pos.tp_done)
+                        target = self.pos.size_usdt * (1 - closed_pct)
+                        if self.pos.remain_usdt < target:
+                            add_usdt = min(target - self.pos.remain_usdt, self.pos.size_usdt * 0.3)
+                            if add_usdt >= MIN_POSITION_USDT:
+                                side_add = "BUY" if self.pos.side == "long" else "SELL"
+                                res = place_order(side_add, add_usdt)
+                                if res:
+                                    self.pos.remain_usdt += res["usdt"]
+                                    self.pos.tp_done = []
+                                    self.state.position = asdict(self.pos)
+                                    save_state(self.state)
+                                    msg = (f"🔄 <b>Re-add tras reducción</b> ({readd_tf})\n"
+                                           f"USD añadido: ${res['usdt']:.2f}")
+                                    log.info(msg); tg(msg)
+
+                # Cierre total (15m/30m TD9 en contra)
+                td15, td30 = td.get("15m", 0), td.get("30m", 0)
+                clear = False
+                clear_src = ""
+                if self.pos.side == "long":
+                    if td15 == -1: clear, clear_src = True, "15m"
+                    elif ENABLE_30M_CLEAR and td30 == -1: clear, clear_src = True, "30m"
+                else:
+                    if td15 == 1: clear, clear_src = True, "15m"
+                    elif ENABLE_30M_CLEAR and td30 == 1: clear, clear_src = True, "30m"
+                if clear:
+                    self.close_all(price, f"TD9 {clear_src}")
+                    return
+
+            # Log periódico de estado
+            pnl_unreal = ((price - self.pos.entry_price) if self.pos.side == "long"
+                          else (self.pos.entry_price - price))
+            pnl_usdt = pnl_unreal / self.pos.entry_price * self.pos.remain_usdt * MAX_LEVERAGE
+            log.info(f"Posición: {self.pos.side.upper()} | Precio: ${price:.2f} | "
+                     f"Entrada: ${self.pos.entry_price:.2f} | PnL≈${pnl_usdt:+.2f} | "
+                     f"SL: ${self.pos.stop_loss:.2f} | TD: {td}")
+
+        save_state(self.state)
+
+    def start(self):
+        log.info("=" * 60)
+        log.info(f"BOT MACD+TD arrancando — {SYMBOL}")
+        log.info(f"Riesgo: {RISK_PER_TRADE*100:.0f}% | Trailing: {TRAILING_PCT*100:.0f}%/{TRAILING_ATR}×ATR")
+        log.info(f"Intervalo: {CHECK_INTERVAL}s")
+        log.info("=" * 60)
+        while True:
+            try:
+                self.run_once()
+            except Exception as e:
+                log.exception(f"Error en ciclo: {e}")
+                tg(f"⚠️ Error ciclo: {e}")
+            time.sleep(CHECK_INTERVAL)
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    bot = MACDTDBot()
+    bot.start()
