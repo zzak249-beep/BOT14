@@ -226,60 +226,64 @@ def get_open_position() -> Optional[dict]:
 # ─────────────────────────────────────────────
 def calc_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """
-    Calcula indicadores técnicos sobre el DataFrame de velas.
-
-    Estrategia de NaN:
-    - Los primeros ~70 registros tendrán NaN en EMA60/RSI (warmup normal).
-    - Se hace dropna() SOLO sobre columnas OHLCV para eliminar velas corruptas.
-    - Las filas de warmup de indicadores se descartan con iloc[WARMUP:].
-    - Devuelve None si quedan menos de MIN_DF_ROWS filas útiles.
+    Calcula indicadores usando pandas EWM/rolling.
+    Sin funciones numpy propias para evitar problemas de longitud de arrays.
     """
-    # Warmup = máximo periodo usado (EMA60) + señal MACD (9) + margen
-    WARMUP = 70
+    WARMUP = 40  # EWM converge rápido, 40 filas de margen es suficiente
 
-    if df is None or len(df) < WARMUP + 10:
-        log.warning(f"DataFrame entrada muy pequeño: {len(df) if df is not None else 0} filas")
+    if df is None or len(df) < WARMUP + 20:
+        log.warning(f"DataFrame entrada pequeño: {len(df) if df is not None else 0} filas")
         return None
 
     df = df.copy()
-
-    # Eliminar solo filas con OHLCV corruptos (vela incompleta de la API)
     df.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
-    # Eliminar velas con close=0 (datos inválidos de BingX)
     df = df[df["close"] > 0].copy()
     df.reset_index(drop=True, inplace=True)
 
-    if len(df) < WARMUP + 10:
-        log.warning(f"DataFrame con {len(df)} filas tras limpiar OHLCV, insuficiente")
+    if len(df) < WARMUP + 20:
+        log.warning(f"Solo {len(df)} filas OHLCV limpias, insuficiente")
         return None
 
-    close = df["close"].values.astype(float)
-    high  = df["high"].values.astype(float)
-    low   = df["low"].values.astype(float)
-    vol   = df["volume"].values.astype(float)
+    c  = df["close"]
+    h  = df["high"]
+    lo = df["low"]
+    v  = df["volume"]
 
-    ema12 = _ema(close, 12)
-    ema26 = _ema(close, 26)
+    # MACD 12/26/9
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
     macd  = ema12 - ema26
-    sig9  = _ema(macd, 9)
-    hist  = macd - sig9
+    sig9  = macd.ewm(span=9, adjust=False).mean()
 
-    ema8      = _ema(close, 8)
-    ema17     = _ema(close, 17)
+    # MACD rápido 8/17/6
+    ema8      = c.ewm(span=8,  adjust=False).mean()
+    ema17     = c.ewm(span=17, adjust=False).mean()
     macd_fast = ema8 - ema17
-    sig6      = _ema(macd_fast, 6)
+    sig6      = macd_fast.ewm(span=6, adjust=False).mean()
 
-    atr   = _atr(high, low, close, 14)
-    ema20 = _ema(close, 20)
-    ema60 = _ema(close, 60)
-    rsi   = _rsi(close, 14)
+    # ATR 14
+    prev_c = c.shift(1)
+    tr     = pd.concat([(h - lo), (h - prev_c).abs(), (lo - prev_c).abs()], axis=1).max(axis=1)
+    atr    = tr.rolling(14).mean()
 
-    vol_ma    = _sma(vol, 20)
-    vol_ratio = np.where(vol_ma > 0, vol / vol_ma, 1.0)
+    # EMA 20/60
+    ema20 = c.ewm(span=20, adjust=False).mean()
+    ema60 = c.ewm(span=60, adjust=False).mean()
+
+    # RSI 14
+    delta    = c.diff()
+    avg_gain = delta.clip(lower=0).rolling(14).mean()
+    avg_loss = (-delta).clip(lower=0).rolling(14).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    rsi      = 100 - (100 / (1 + rs))
+
+    # Vol ratio
+    vol_ma    = v.rolling(20).mean()
+    vol_ratio = (v / vol_ma.replace(0, np.nan)).fillna(1.0)
 
     df["macd"]      = macd
     df["macd_sig"]  = sig9
-    df["macd_hist"] = hist
+    df["macd_hist"] = macd - sig9
     df["macd_fast"] = macd_fast - sig6
     df["atr"]       = atr
     df["ema20"]     = ema20
@@ -287,22 +291,23 @@ def calc_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     df["rsi"]       = rsi
     df["vol_ratio"] = vol_ratio
 
-    # Descartar filas de warmup (donde los indicadores aún son NaN)
-    # en lugar de dropna() que puede dejar 0 filas si hay algún NaN suelto
+    # Descartar filas de warmup y NaN residuales
     df = df.iloc[WARMUP:].copy()
     df.reset_index(drop=True, inplace=True)
 
-    # Ahora sí, eliminar cualquier fila residual con NaN en indicadores clave
     key_cols = ["macd", "macd_sig", "atr", "ema20", "ema60", "rsi"]
+    nan_info = {col: int(df[col].isna().sum()) for col in key_cols}
+    if any(n > 0 for n in nan_info.values()):
+        log.warning(f"NaN residuales tras warmup: {nan_info}")
+
     before = len(df)
     df.dropna(subset=key_cols, inplace=True)
     df.reset_index(drop=True, inplace=True)
-    after = len(df)
-    if before != after:
-        log.debug(f"Eliminadas {before - after} filas con NaN residual en indicadores")
+
+    log.info(f"calc_indicators OK: {before}→{len(df)} filas útiles")
 
     if len(df) < MIN_DF_ROWS:
-        log.warning(f"DataFrame con solo {len(df)} filas tras procesar indicadores, insuficiente")
+        log.warning(f"Solo {len(df)} filas útiles, mínimo={MIN_DF_ROWS}")
         return None
 
     return df
@@ -315,6 +320,26 @@ def _ema(data: np.ndarray, period: int) -> np.ndarray:
     result[period - 1] = np.mean(data[:period])
     for i in range(period, len(data)):
         result[i] = data[i] * k + result[i - 1] * (1 - k)
+    return result
+
+def _ema_of_nan(data: np.ndarray, period: int) -> np.ndarray:
+    """EMA que ignora los NaN iniciales y arranca desde el primer valor válido."""
+    result = np.full(len(data), np.nan)
+    k = 2 / (period + 1)
+    # Buscar primer índice no-NaN
+    start = -1
+    for i in range(len(data)):
+        if not np.isnan(data[i]):
+            start = i
+            break
+    if start < 0 or len(data) - start < period:
+        return result
+    result[start + period - 1] = np.nanmean(data[start:start + period])
+    for i in range(start + period, len(data)):
+        if not np.isnan(data[i]):
+            result[i] = data[i] * k + result[i - 1] * (1 - k)
+        else:
+            result[i] = result[i - 1]
     return result
 
 def _sma(data: np.ndarray, period: int) -> np.ndarray:
@@ -331,14 +356,24 @@ def _atr(high, low, close, period: int) -> np.ndarray:
     return _sma(tr, period)
 
 def _rsi(close: np.ndarray, period: int) -> np.ndarray:
-    delta = np.diff(close)
-    gain  = np.where(delta > 0, delta, 0.0)
-    loss  = np.where(delta < 0, -delta, 0.0)
-    avg_gain = _sma(gain, period)
-    avg_loss = _sma(loss, period)
-    rs   = np.where(avg_loss > 0, avg_gain / avg_loss, 100.0)
-    rsi_vals = 100 - (100 / (1 + rs))
-    return np.concatenate([[np.nan], rsi_vals])
+    """RSI con output del mismo tamaño que el input."""
+    result = np.full(len(close), np.nan)
+    if len(close) < period + 1:
+        return result
+    delta    = np.diff(close)                              # len N-1
+    gain     = np.where(delta > 0, delta, 0.0)
+    loss     = np.where(delta < 0, -delta, 0.0)
+    # Calcular SMA(period) sobre gain/loss — arrays de len N-1
+    # El primer valor de RSI corresponde al índice `period` del close original
+    for i in range(period - 1, len(delta)):
+        avg_g = np.mean(gain[i - period + 1:i + 1])
+        avg_l = np.mean(loss[i - period + 1:i + 1])
+        if avg_l == 0:
+            result[i + 1] = 100.0
+        else:
+            rs = avg_g / avg_l
+            result[i + 1] = 100.0 - (100.0 / (1.0 + rs))
+    return result
 
 # ─────────────────────────────────────────────
 # DIVERGENCIA MACD
