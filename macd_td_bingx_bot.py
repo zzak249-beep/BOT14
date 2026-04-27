@@ -51,7 +51,8 @@ MAX_POSITION_USDT       = float(os.getenv("MAX_POS_USDT", "20"))
 MIN_POSITION_USDT       = float(os.getenv("MIN_POS_USDT", "5"))
 
 # Mínimo de filas útiles después de calc_indicators
-MIN_DF_ROWS = 60
+# EMA60 necesita 60 filas + 9 de warmup + margen = 80 mínimo
+MIN_DF_ROWS = 80
 
 # Ratios de reducción por nivel TD
 TP_RATIOS = {"1m": 0.25, "3m": 0.20, "5m": 0.25}
@@ -225,12 +226,33 @@ def get_open_position() -> Optional[dict]:
 # ─────────────────────────────────────────────
 def calc_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """
-    Calcula indicadores. Devuelve None si el DataFrame resultante
-    tiene menos de MIN_DF_ROWS filas útiles.
+    Calcula indicadores técnicos sobre el DataFrame de velas.
+
+    Estrategia de NaN:
+    - Los primeros ~70 registros tendrán NaN en EMA60/RSI (warmup normal).
+    - Se hace dropna() SOLO sobre columnas OHLCV para eliminar velas corruptas.
+    - Las filas de warmup de indicadores se descartan con iloc[WARMUP:].
+    - Devuelve None si quedan menos de MIN_DF_ROWS filas útiles.
     """
-    if df is None or len(df) < MIN_DF_ROWS:
+    # Warmup = máximo periodo usado (EMA60) + señal MACD (9) + margen
+    WARMUP = 70
+
+    if df is None or len(df) < WARMUP + 10:
+        log.warning(f"DataFrame entrada muy pequeño: {len(df) if df is not None else 0} filas")
         return None
+
     df = df.copy()
+
+    # Eliminar solo filas con OHLCV corruptos (vela incompleta de la API)
+    df.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
+    # Eliminar velas con close=0 (datos inválidos de BingX)
+    df = df[df["close"] > 0].copy()
+    df.reset_index(drop=True, inplace=True)
+
+    if len(df) < WARMUP + 10:
+        log.warning(f"DataFrame con {len(df)} filas tras limpiar OHLCV, insuficiente")
+        return None
+
     close = df["close"].values.astype(float)
     high  = df["high"].values.astype(float)
     low   = df["low"].values.astype(float)
@@ -265,11 +287,22 @@ def calc_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     df["rsi"]       = rsi
     df["vol_ratio"] = vol_ratio
 
-    df.dropna(inplace=True)
+    # Descartar filas de warmup (donde los indicadores aún son NaN)
+    # en lugar de dropna() que puede dejar 0 filas si hay algún NaN suelto
+    df = df.iloc[WARMUP:].copy()
     df.reset_index(drop=True, inplace=True)
 
+    # Ahora sí, eliminar cualquier fila residual con NaN en indicadores clave
+    key_cols = ["macd", "macd_sig", "atr", "ema20", "ema60", "rsi"]
+    before = len(df)
+    df.dropna(subset=key_cols, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    after = len(df)
+    if before != after:
+        log.debug(f"Eliminadas {before - after} filas con NaN residual en indicadores")
+
     if len(df) < MIN_DF_ROWS:
-        log.warning(f"DataFrame con solo {len(df)} filas tras dropna, insuficiente")
+        log.warning(f"DataFrame con solo {len(df)} filas tras procesar indicadores, insuficiente")
         return None
 
     return df
@@ -428,22 +461,23 @@ class MACDTDBot:
 
     # ── datos ──────────────────────────────────
     def fetch_all(self) -> Optional[dict]:
+        # Necesitamos al menos WARMUP(70) + MIN_DF_ROWS(80) = 150 velas crudas
+        MIN_RAW_ROWS = 150
         dfs = {}
         for tf in ["1m", "3m", "5m", "15m", "30m"]:
             raw = get_klines(tf, KLINES_LIMIT)
             if raw is None:
                 log.error(f"Sin datos crudos para {tf}")
                 return None
-            if len(raw) < MIN_DF_ROWS:
-                log.error(f"Datos insuficientes para {tf}: {len(raw)} filas")
+            log.info(f"Klines {tf}: {len(raw)} velas crudas recibidas")
+            if len(raw) < MIN_RAW_ROWS:
+                log.error(f"Velas insuficientes para {tf}: {len(raw)} < {MIN_RAW_ROWS}")
                 return None
             df = calc_indicators(raw)
             if df is None:
                 log.error(f"calc_indicators devolvió None para {tf}")
                 return None
-            if len(df) < MIN_DF_ROWS:
-                log.error(f"DataFrame procesado insuficiente para {tf}: {len(df)} filas")
-                return None
+            log.info(f"Klines {tf}: {len(df)} filas útiles tras indicadores")
             dfs[tf] = df
         return dfs
 
