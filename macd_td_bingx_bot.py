@@ -26,10 +26,18 @@ from dataclasses import dataclass, field, asdict
 # ─────────────────────────────────────────────
 SYMBOL          = os.getenv("SYMBOL", "ETH-USDT")
 API_KEY         = os.getenv("BINGX_API_KEY", "")
-API_SECRET      = os.getenv("BINGX_API_SECRET", "")
-TG_TOKEN        = os.getenv("TELEGRAM_TOKEN", "")
+API_SECRET      = os.getenv("BINGX_SECRET_KEY", "")        # Railway: BINGX_SECRET_KEY
+TG_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")      # Railway: TELEGRAM_BOT_TOKEN
 TG_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
 BASE_URL        = "https://open-api.bingx.com"
+
+# ORDER_SIZE=10 → tamaño de orden en USDT (Railway: ORDER_SIZE)
+_order_size       = float(os.getenv("ORDER_SIZE", "10"))
+MAX_POSITION_USDT = _order_size
+MIN_POSITION_USDT = max(5.0, _order_size * 0.5)
+
+# MODE=false → paper trading desactivado (órdenes reales)
+PAPER_MODE      = os.getenv("MODE", "false").lower() == "true"
 
 # Parámetros estrategia
 RISK_PER_TRADE          = float(os.getenv("RISK_PCT", "0.02"))
@@ -44,11 +52,9 @@ BUY_VOL_RATIO           = float(os.getenv("VOL_RATIO", "0.8"))
 ENABLE_30M_CLEAR        = os.getenv("CLEAR_30M", "true").lower() == "true"
 MIN_BARS_PROTECTION     = int(os.getenv("MIN_BARS", "1"))
 INITIAL_ADD_SIZE        = float(os.getenv("INITIAL_ADD", "0.3"))
-MAX_LEVERAGE            = float(os.getenv("MAX_LEV", "10"))
+MAX_LEVERAGE            = float(os.getenv("LEVERAGE", "10"))   # Railway: LEVERAGE
 CHECK_INTERVAL          = int(os.getenv("CHECK_SEC", "60"))
 KLINES_LIMIT            = int(os.getenv("KLINES_LIMIT", "500"))
-MAX_POSITION_USDT       = float(os.getenv("MAX_POS_USDT", "20"))
-MIN_POSITION_USDT       = float(os.getenv("MIN_POS_USDT", "5"))
 
 # Mínimo de filas útiles después de calc_indicators
 # EMA60 necesita 60 filas + 9 de warmup + margen = 80 mínimo
@@ -188,6 +194,11 @@ def place_order(side: str, usdt_size: float, reduce_only: bool = False) -> Optio
     price = get_mark_price()
     if price <= 0:
         return None
+    # PAPER MODE: simular orden sin enviar a BingX
+    if PAPER_MODE:
+        qty = round(usdt_size / price, 4)
+        log.info(f"[PAPER] Orden simulada: {side} {qty} @ ~{price:.2f} (${usdt_size:.2f} USDT)")
+        return {"qty": qty, "price": price, "usdt": qty * price}
     qty = round(usdt_size / price, 4)
     if qty <= 0:
         return None
@@ -491,7 +502,8 @@ class MACDTDBot:
         if self.state.position:
             self.pos = Position(**self.state.position)
         log.info(f"Bot iniciado. Posición: {self.pos}")
-        tg(f"🤖 <b>MACD+TD Bot iniciado</b>\nSímbolo: {SYMBOL}\nRiesgo: {RISK_PER_TRADE*100:.0f}%")
+        mode_str = "📋 PAPER" if PAPER_MODE else "💰 REAL"
+        tg(f"🤖 <b>MACD+TD Bot iniciado</b>\nSímbolo: {SYMBOL}\nRiesgo: {RISK_PER_TRADE*100:.0f}%\nModo: {mode_str}\nTamaño orden: ${MAX_POSITION_USDT} USDT\nApalancamiento: {int(MAX_LEVERAGE)}x")
         set_leverage(int(MAX_LEVERAGE))
 
     # ── datos ──────────────────────────────────
