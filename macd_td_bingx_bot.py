@@ -530,18 +530,50 @@ class MACDTDBot:
 
     # ── filtro compra ───────────────────────────
     def buy_filter_ok(self, df15: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        Filtro de entrada LONG: necesita 2 de 4 condiciones.
+        Lógica: en divergencia alcista el precio YA está bajo,
+        no exigir close<EMA60 como condición obligatoria.
+        """
         if not ENABLE_BUY_FILTER:
             return True, "sin filtro"
         if df15 is None or len(df15) == 0:
             return False, "❌ DataFrame vacío en filtro"
         row = df15.iloc[-1]
         conds = []
-        if row["rsi"] < BUY_RSI_THRESHOLD:
+        # RSI no sobrecomprado (< 65 es suficiente para long)
+        if row["rsi"] < 65:
             conds.append(f"RSI={row['rsi']:.1f}")
-        if row["close"] < row["ema60"]:
-            conds.append("close<EMA60")
+        # MACD histograma subiendo (momentum positivo)
+        if len(df15) >= 2 and df15["macd_hist"].iloc[-1] > df15["macd_hist"].iloc[-2]:
+            conds.append("MACD↑")
+        # Volumen por encima de media
         if row["vol_ratio"] > BUY_VOL_RATIO:
             conds.append(f"vol×{row['vol_ratio']:.2f}")
+        # No en tendencia bajista fuerte (precio no muy lejos de EMA20)
+        dist_ema20 = (row["close"] - row["ema20"]) / row["ema20"]
+        if dist_ema20 > -0.05:  # no más del 5% bajo EMA20
+            conds.append(f"dist_EMA20={dist_ema20*100:.1f}%")
+        ok = len(conds) >= 2
+        return ok, ("✅ " if ok else "❌ ") + ", ".join(conds) if conds else "❌ sin condiciones"
+
+    def sell_filter_ok(self, df15: pd.DataFrame) -> Tuple[bool, str]:
+        """Filtro de entrada SHORT: simétrico al de long."""
+        if not ENABLE_BUY_FILTER:
+            return True, "sin filtro"
+        if df15 is None or len(df15) == 0:
+            return False, "❌ DataFrame vacío en filtro"
+        row = df15.iloc[-1]
+        conds = []
+        if row["rsi"] > 35:
+            conds.append(f"RSI={row['rsi']:.1f}")
+        if len(df15) >= 2 and df15["macd_hist"].iloc[-1] < df15["macd_hist"].iloc[-2]:
+            conds.append("MACD↓")
+        if row["vol_ratio"] > BUY_VOL_RATIO:
+            conds.append(f"vol×{row['vol_ratio']:.2f}")
+        dist_ema20 = (row["close"] - row["ema20"]) / row["ema20"]
+        if dist_ema20 < 0.05:
+            conds.append(f"dist_EMA20={dist_ema20*100:.1f}%")
         ok = len(conds) >= 2
         return ok, ("✅ " if ok else "❌ ") + ", ".join(conds) if conds else "❌ sin condiciones"
 
@@ -616,7 +648,7 @@ class MACDTDBot:
                f"Razón: {reason}")
         log.info(msg); tg(msg)
 
-    def open_short(self, price: float, stop: float, strength: float):
+    def open_short(self, price: float, stop: float, strength: float, reason: str = ""):
         size = self.calc_size(price, stop, strength)
         if size <= 0:
             return
@@ -638,7 +670,8 @@ class MACDTDBot:
                f"Precio: ${res['price']:.2f}\n"
                f"Tamaño: ${res['usdt']:.2f} USDT\n"
                f"Stop: ${stop:.2f}\n"
-               f"Fuerza div.: {strength:.2f}")
+               f"Fuerza div.: {strength:.2f}\n"
+               f"Razón: {reason}")
         log.info(msg); tg(msg)
 
     def _sync_entry_bar(self):
@@ -719,6 +752,16 @@ class MACDTDBot:
 
         # ── sin posición: buscar entrada ────────
         if self.pos is None:
+            # Heartbeat cada 60 ciclos cuando no hay posición
+            self._idle_count = getattr(self, "_idle_count", 0) + 1
+            if self._idle_count >= 60:
+                self._idle_count = 0
+                bal = get_balance()
+                tg(f"💤 <b>Bot activo — sin posición</b>\n"
+                   f"Par: {SYMBOL} | Precio: ${price:.2f}\n"
+                   f"Balance: ${bal:.2f} USDT\n"
+                   f"Buscando divergencias...")
+
             window = df15.tail(200)
             if len(window) < 20:
                 log.warning("Ventana de divergencia demasiado pequeña")
@@ -745,13 +788,27 @@ class MACDTDBot:
                         self.state.last_bull_idx = idx
                     else:
                         log.info(f"Divergencia alcista filtrada: {fmsg}")
+                        tg(f"👀 <b>Señal LONG filtrada</b>\n"
+                           f"Par: {SYMBOL}\n"
+                           f"Precio: ${price:.2f}\n"
+                           f"Fuerza div.: {bull_str:.2f}\n"
+                           f"Filtro: {fmsg}")
 
             elif bear and bear_str >= MIN_DIV_STRENGTH:
                 idx = bear_info["index"]
                 if idx != self.state.last_bear_idx:
-                    stop = bear_info["price_high"] + atr * ATR_STOP_MULT
-                    self.open_short(price, stop, bear_str)
-                    self.state.last_bear_idx = idx
+                    ok_s, fmsg_s = self.sell_filter_ok(df15)
+                    if ok_s:
+                        stop = bear_info["price_high"] + atr * ATR_STOP_MULT
+                        self.open_short(price, stop, bear_str, fmsg_s)
+                        self.state.last_bear_idx = idx
+                    else:
+                        log.info(f"Divergencia bajista filtrada: {fmsg_s}")
+                        tg(f"👀 <b>Señal SHORT filtrada</b>\n"
+                           f"Par: {SYMBOL}\n"
+                           f"Precio: ${price:.2f}\n"
+                           f"Fuerza div.: {bear_str:.2f}\n"
+                           f"Filtro: {fmsg_s}")
 
         # ── con posición: gestionar ─────────────
         else:
@@ -765,6 +822,13 @@ class MACDTDBot:
                 upd = self.update_trailing(price, atr)
                 if upd:
                     log.info(f"Trailing stop → ${self.pos.stop_loss:.2f}")
+                    # Notificar solo cada 10 actualizaciones para no spamear
+                    self._trail_notif = getattr(self, "_trail_notif", 0) + 1
+                    if self._trail_notif % 10 == 1:
+                        profit_pct = abs(price - self.pos.entry_price) / self.pos.entry_price * 100
+                        tg(f"🛡 <b>Trailing stop actualizado</b>\n"
+                           f"Nuevo SL: ${self.pos.stop_loss:.2f}\n"
+                           f"Precio: ${price:.2f} (+{profit_pct:.1f}%)")
 
             sl_hit = ((price <= self.pos.stop_loss) if self.pos.side == "long"
                       else (price >= self.pos.stop_loss))
@@ -845,6 +909,18 @@ class MACDTDBot:
             log.info(f"Posición: {self.pos.side.upper()} | Precio: ${price:.2f} | "
                      f"Entrada: ${self.pos.entry_price:.2f} | PnL≈${pnl_usdt:+.2f} | "
                      f"SL: ${self.pos.stop_loss:.2f} | TD: {td}")
+            # Heartbeat Telegram cada ~60 ciclos (~1h con CHECK_INTERVAL=60s)
+            self._hb_count = getattr(self, "_hb_count", 0) + 1
+            if self._hb_count >= 60:
+                self._hb_count = 0
+                emoji = "📈" if self.pos.side == "long" else "📉"
+                tg(f"{emoji} <b>Estado posición</b>\n"
+                   f"Par: {SYMBOL} | {self.pos.side.upper()}\n"
+                   f"Entrada: ${self.pos.entry_price:.2f}\n"
+                   f"Precio actual: ${price:.2f}\n"
+                   f"PnL≈: ${pnl_usdt:+.2f} USDT\n"
+                   f"SL: ${self.pos.stop_loss:.2f}\n"
+                   f"Restante: ${self.pos.remain_usdt:.2f} USDT")
 
         save_state(self.state)
 
