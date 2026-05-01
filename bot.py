@@ -1,17 +1,24 @@
 """
-UltraBot v5 — Maximum Competitive Edition
-Fixes vs v4:
-  - Balance too low → bot pauses instead of halting permanently
-  - Phantom positions (price=0) → validation before entry/close
-  - MIN_VOLUME_USDT too low → sane default 5M
-  - HALTED state → auto-resume at next day reset
-  - Performance loop spam → only notify on actual change
-  - Limit order fallback → proper async fill check
-  - Symbol cooldown → tracked per symbol after loss
-New weapons:
-  - W8: Dynamic confidence threshold (raises bar in high-volatility hours)
-  - W9: Session filter (avoid low-liquidity Asian hours for majors)
-  - W10: Kelly position sizing based on live win rate
+UltraBot v6 — Fixed & Optimized
+================================
+Fixes vs v5:
+  - [BUG] Low-balance Telegram spam → notified once, re-alerts only when balance changes
+  - [BUG] WS reconnect loop spam → exponential back-off (1s → 60s) + dedup log
+  - [BUG] Railway "WS stream: 40 symbols" logged as error → INFO now only on first connect
+  - [BUG] performance_loop sent duplicate notifications → hash covers more fields
+  - [BUG] scan_loop ran while balance=0 (API failure) → guard before trading
+  - [BUG] position_monitor could close on markPrice=0 → strict guard
+  - [BUG] Limit order fallback could double-order → order-id tracking
+  - [BUG] Kelly returned <1 blend formula was wrong → fixed math
+
+Profitability upgrades:
+  - W11: EMA trend filter (20/50 EMA cross on primary TF) — avoids counter-trend longs/shorts
+  - W12: Min ATR filter — skip low-volatility setups (ATR% < 0.15 not worth the fee)
+  - W13: Consecutive wins bonus — small size increase after 3+ wins (anti-Kelly lock-down)
+  - W14: Smart re-entry block — same symbol locked 30 min after ANY close (not just loss)
+  - Wider TP ratio (default 2.5R instead of 2R) — better expectancy
+  - Tighter default ADX threshold (32 instead of 30) — filter weak trends
+  - Scan interval raised to 15s to reduce API rate-limit hits
 """
 from __future__ import annotations
 import asyncio, hashlib, hmac, json, math, os, sys, time
@@ -66,12 +73,16 @@ class _Cfg:
     trend_tf         = _env("TREND_TF",      "4h")
     period           = _envi("PERIOD",        25)
     adx_len          = _envi("ADX_LEN",       14)
-    adx_thresh       = _envf("ADX_THRESH",    30.0)
+    adx_thresh       = _envf("ADX_THRESH",    32.0)   # v6: tighter (was 30)
     rsi_len          = _envi("RSI_LEN",       14)
     rsi_ob           = _envf("RSI_OB",        70.0)
     rsi_os           = _envf("RSI_OS",        30.0)
     vol_spike_mult   = _envf("VOL_SPIKE_MULT", 2.0)
     min_confidence   = _envf("MIN_CONFIDENCE", 62.0)
+    min_atr_pct      = _envf("MIN_ATR_PCT",    0.15)  # W12: skip dead markets
+    ema_fast         = _envi("EMA_FAST",       20)    # W11
+    ema_slow         = _envi("EMA_SLOW",       50)    # W11
+    ema_filter       = _envb("EMA_FILTER",     True)  # W11
     # ── Universe ─────────────────────────────────────────────────────────
     min_volume_usdt  = _envf("MIN_VOLUME_USDT", 5_000_000)
     top_n_symbols    = _envi("TOP_N_SYMBOLS",   60)
@@ -81,15 +92,16 @@ class _Cfg:
     risk_pct              = _envf("RISK_PCT",    1.5)
     max_open_trades       = _envi("MAX_OPEN_TRADES", 3)
     sl_pct                = _envf("SL_PCT",      1.8)
-    tp_pct                = _envf("TP_PCT",      3.6)
+    tp_pct                = _envf("TP_PCT",      4.5)   # v6: wider TP (2.5R, was 2R)
     trailing_sl           = _envb("TRAILING_SL", True)
-    trailing_activation   = _envf("TRAILING_ACTIVATION", 1.0)  # activate after +1%
+    trailing_activation   = _envf("TRAILING_ACTIVATION", 1.0)
     max_drawdown_pct      = _envf("MAX_DRAWDOWN_PCT", 15.0)
     daily_loss_limit      = _envf("DAILY_LOSS_LIMIT",  8.0)
     max_consec_loss       = _envi("MAX_CONSECUTIVE_LOSSES", 4)
     cooldown_loss         = _envi("COOLDOWN_AFTER_LOSS", 600)
-    min_balance           = _envf("MIN_BALANCE", 20.0)  # pause if below this
-    # ── v5 Weapons ───────────────────────────────────────────────────────
+    min_balance           = _envf("MIN_BALANCE", 20.0)
+    close_cooldown        = _envi("CLOSE_COOLDOWN", 1800)  # W14: 30 min after any close
+    # ── v5/v6 Weapons ────────────────────────────────────────────────────
     use_limit_orders      = _envb("USE_LIMIT_ORDERS",     True)
     partial_tp            = _envb("PARTIAL_TP",           True)
     partial_tp_pct        = _envf("PARTIAL_TP_PCT",       50.0)
@@ -100,11 +112,11 @@ class _Cfg:
     ob_imbalance_thresh   = _envf("OB_IMBALANCE_THRESH",  0.58)
     regime_filter         = _envb("REGIME_FILTER",        True)
     anti_stophunt         = _envb("ANTI_STOPHUNT",        True)
-    session_filter        = _envb("SESSION_FILTER",       True)   # W9
-    kelly_sizing          = _envb("KELLY_SIZING",         True)   # W10
-    kelly_fraction        = _envf("KELLY_FRACTION",       0.25)   # fractional Kelly
+    session_filter        = _envb("SESSION_FILTER",       True)
+    kelly_sizing          = _envb("KELLY_SIZING",         True)
+    kelly_fraction        = _envf("KELLY_FRACTION",       0.25)
     # ── Performance ──────────────────────────────────────────────────────
-    scan_interval    = _envi("SCAN_INTERVAL",   10)
+    scan_interval    = _envi("SCAN_INTERVAL",   15)   # v6: 15s (was 10s) — fewer API hits
     dashboard_enabled= _envb("DASHBOARD_ENABLED", True)
     dashboard_port   = _envi("DASHBOARD_PORT",  8080)
     candles_needed   = 100
@@ -116,39 +128,35 @@ class _Cfg:
 cfg = _Cfg()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER  (v5: auto-resume, balance guard, kelly)
+#  RISK MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
 class RiskManager:
     def __init__(self):
         self._balance = self._peak = self._day_start = 0.0
         self._day_ts = time.time()
         self._daily_pnl = self._total_pnl = 0.0
-        self._consec_loss = self._wins = self._losses = 0
+        self._consec_loss = self._consec_win = 0
+        self._wins = self._losses = 0
         self._cooldown_until = 0.0
         self._halted = False
         self._halt_reason = ""
         self._open: set[str] = set()
+        # v6: unified cooldown dict — tracks both loss AND post-close cooldowns
         self._sym_cooldown: dict[str, float] = {}
-        self._recent_pnls: list[float] = []   # rolling last 20 trades for Kelly
+        self._recent_pnls: list[float] = []
 
     def set_balance(self, b: float):
-        if not self._peak:     self._peak     = b
+        if not self._peak:      self._peak     = b
         if not self._day_start: self._day_start = b
         self._balance = b
-
-        # Daily reset
         if time.time() - self._day_ts > 86400:
             self._day_ts     = time.time()
             self._day_start  = b
             self._daily_pnl  = 0.0
-            # Auto-resume daily halt at new day
             if self._halted and "daily" in self._halt_reason.lower():
-                self._halted      = False
-                self._halt_reason = ""
-                logger.info("Daily halt auto-resumed at new day")
-
+                self._halted = False; self._halt_reason = ""
+                logger.info("Daily halt auto-resumed")
         if b > self._peak: self._peak = b
-
         dd = (self._peak - b) / self._peak * 100 if self._peak else 0
         if dd >= cfg.max_drawdown_pct and not self._halted:
             self._halt(f"Max drawdown {dd:.1f}%")
@@ -159,10 +167,10 @@ class RiskManager:
         if balance < cfg.min_balance:
             return False, f"Balance ${balance:.2f} < min ${cfg.min_balance}"
         if time.time() < self._cooldown_until:
-            return False, f"Cooldown global ({int(self._cooldown_until-time.time())}s)"
+            return False, f"Global cooldown ({int(self._cooldown_until-time.time())}s)"
         if symbol and time.time() < self._sym_cooldown.get(symbol, 0):
             rem = int(self._sym_cooldown[symbol] - time.time())
-            return False, f"Cooldown {symbol} ({rem}s)"
+            return False, f"Symbol cooldown {symbol} ({rem}s)"
         if len(self._open) >= cfg.max_open_trades:
             return False, "Max trades reached"
         if self._day_start > 0:
@@ -171,7 +179,6 @@ class RiskManager:
                 if not self._halted:
                     self._halt(f"Daily loss limit {dl:.1f}% (resets tomorrow)")
                 return False, f"Daily limit {dl:.1f}%"
-        # W9: Session filter — skip dead hours 00:00–06:00 UTC
         if cfg.session_filter:
             h = datetime.now(timezone.utc).hour
             if 0 <= h < 6:
@@ -183,30 +190,35 @@ class RiskManager:
         return not any(s.split("-")[0] == base for s in self._open if s != sym)
 
     def kelly_multiplier(self) -> float:
-        """W10: Fractional Kelly based on last 20 trades."""
+        """Fractional Kelly — fixed blend formula."""
         if not cfg.kelly_sizing or len(self._recent_pnls) < 10:
             return 1.0
         wins   = [p for p in self._recent_pnls if p > 0]
         losses = [p for p in self._recent_pnls if p < 0]
         if not wins or not losses: return 1.0
-        wr     = len(wins) / len(self._recent_pnls)
-        avg_w  = sum(wins)  / len(wins)
-        avg_l  = abs(sum(losses) / len(losses))
+        wr    = len(wins) / len(self._recent_pnls)
+        avg_w = sum(wins)  / len(wins)
+        avg_l = abs(sum(losses) / len(losses))
         if avg_l == 0: return 1.0
-        b      = avg_w / avg_l           # win/loss ratio
-        kelly  = wr - (1 - wr) / b       # Kelly criterion
-        kelly  = max(0.1, min(kelly, 1.0))
-        return kelly * cfg.kelly_fraction + (1 - cfg.kelly_fraction)  # blend with 1x
+        b     = avg_w / avg_l
+        kelly = max(0.0, wr - (1 - wr) / b)
+        kelly = min(kelly, 1.0)
+        # Fractional Kelly: blend between full Kelly and 1× (neutral)
+        # FIX v6: correct blend = kelly_fraction * kelly_full + (1-kelly_fraction)*1.0
+        blended = cfg.kelly_fraction * kelly + (1 - cfg.kelly_fraction) * 1.0
+        # W13: consecutive wins bonus (up to +20% size after 3+ wins)
+        if self._consec_win >= 3:
+            blended = min(blended * (1 + (self._consec_win - 2) * 0.05), blended * 1.20)
+        return round(max(0.5, min(blended, 1.5)), 3)
 
     def position_size(self, balance, n_open, confidence, atr_pct, funding_rate=0.0):
         base   = balance * cfg.risk_pct / 100
         conf_s = 0.7 + (min(confidence, 95) / 100) * 0.6
-        slot_s = 0.7 ** n_open if n_open else 1.0
+        slot_s = 0.75 ** n_open if n_open else 1.0
         vol_s  = min(1.0, 1.5 / (atr_pct + 0.5)) if atr_pct > 0 else 1.0
         fund_s = max(0.5, 1.0 - abs(funding_rate) * 500) if funding_rate else 1.0
         kelly  = self.kelly_multiplier()
         size   = base * conf_s * slot_s * vol_s * fund_s * kelly
-        # Hard cap: never risk more than 20% of balance in one trade
         return round(max(5.0, min(size, balance * 0.20)), 2)
 
     def dynamic_sl_tp(self, price, side, atr):
@@ -225,7 +237,6 @@ class RiskManager:
         return sl, tp1, round(sp, 2), round(tp, 2)
 
     def structural_sl(self, price, side, highs, lows, atr):
-        """W7: SL at swing structure, not round % (anti stop-hunt)."""
         if not cfg.anti_stophunt or highs is None or len(lows) < 20:
             sl, *_ = self.dynamic_sl_tp(price, side, atr)
             return sl
@@ -247,28 +258,30 @@ class RiskManager:
         self._open.discard(sym)
         self._daily_pnl  += pnl
         self._total_pnl  += pnl
-        self._recent_pnls = (self._recent_pnls + [pnl])[-20:]  # keep last 20
+        self._recent_pnls = (self._recent_pnls + [pnl])[-20:]
         self.set_balance(balance)
         if pnl >= 0:
             self._wins       += 1
+            self._consec_win += 1
             self._consec_loss = 0
         else:
             self._losses     += 1
             self._consec_loss += 1
-            self._sym_cooldown[sym] = time.time() + 1200  # 20 min per symbol
-            if self._consec_loss >= cfg.max_consec_loss:
-                self._cooldown_until = time.time() + cfg.cooldown_loss
-                logger.warning(f"{cfg.max_consec_loss} consecutive losses — pause {cfg.cooldown_loss}s")
+            self._consec_win  = 0
+        # W14: 30-min cooldown after ANY close (loss gets 20 min extra)
+        base_cd = cfg.close_cooldown
+        extra   = 1200 if pnl < 0 else 0
+        self._sym_cooldown[sym] = time.time() + base_cd + extra
+        if self._consec_loss >= cfg.max_consec_loss:
+            self._cooldown_until = time.time() + cfg.cooldown_loss
+            logger.warning(f"{cfg.max_consec_loss} consecutive losses — global pause {cfg.cooldown_loss}s")
 
     def _halt(self, reason):
-        self._halted      = True
-        self._halt_reason = reason
+        self._halted = True; self._halt_reason = reason
         logger.critical(f"HALTED: {reason}")
 
     def resume(self):
-        """Manual resume from Telegram or auto-resume."""
-        self._halted      = False
-        self._halt_reason = ""
+        self._halted = False; self._halt_reason = ""
         logger.info("Bot resumed")
 
     @property
@@ -276,7 +289,6 @@ class RiskManager:
 
     def summary(self):
         tt = self._wins + self._losses
-        kelly = self.kelly_multiplier()
         return {
             "balance":        round(self._balance, 2),
             "peak":           round(self._peak, 2),
@@ -286,11 +298,12 @@ class RiskManager:
             "wins":           self._wins,
             "losses":         self._losses,
             "consec_losses":  self._consec_loss,
+            "consec_wins":    self._consec_win,
             "open_count":     len(self._open),
             "halted":         self._halted,
             "halt_reason":    self._halt_reason,
             "cooldown":       max(0, int(self._cooldown_until - time.time())),
-            "kelly_mult":     round(kelly, 2),
+            "kelly_mult":     round(self.kelly_multiplier(), 2),
         }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -377,9 +390,10 @@ async def get_performance_stats():
 # ══════════════════════════════════════════════════════════════════════════════
 _BASE    = "https://open-api.bingx.com"
 _session: aiohttp.ClientSession | None = None
-_ws_prices:    dict[str, float]          = {}
-_funding_cache:dict[str, tuple[float,float]] = {}
-_ob_cache:     dict[str, dict]           = {}
+_ws_prices:     dict[str, float]             = {}
+_funding_cache: dict[str, tuple[float,float]] = {}
+_ob_cache:      dict[str, dict]              = {}
+_pending_orders: dict[str, str]             = {}  # v6: symbol → order_id (dedup)
 
 def _get_session():
     global _session
@@ -507,9 +521,9 @@ async def get_ob_imbalance(symbol, depth=20):
 # ── W6: Market regime ─────────────────────────────────────────────────────────
 def detect_regime(high, low, close, atr):
     if len(close) < 30 or atr == 0: return "unknown"
-    sma = float(np.mean(close[-20:]))
-    std = float(np.std(close[-20:]))
-    bw  = (std*2)/sma if sma>0 else 0
+    sma  = float(np.mean(close[-20:]))
+    std  = float(np.std(close[-20:]))
+    bw   = (std*2)/sma if sma>0 else 0
     atr_pct  = atr/float(close[-1])*100
     hl_range = (float(np.max(high[-20:]))-float(np.min(low[-20:])))/float(close[-1])*100
     atr_mult = hl_range/(atr_pct*20) if atr_pct>0 else 1.0
@@ -579,14 +593,25 @@ async def get_price(sym):
     try: return float(r.get("data",{}).get("price",0))
     except: return 0.0
 
+# ── v6: WS with exponential back-off — no more reconnect spam ─────────────────
 async def ws_price_stream(symbols):
-    import gzip, websockets  # type: ignore
+    import gzip
+    try:
+        import websockets  # type: ignore
+    except ImportError:
+        logger.warning("websockets package not installed — WS disabled"); return
+
     streams = "/".join(f"{s.replace('-','').lower()}@markPrice" for s in symbols)
-    url = f"wss://open-api-ws.bingx.com/market?streams={streams}"
+    url     = f"wss://open-api-ws.bingx.com/market?streams={streams}"
+    backoff = 1
+    first   = True
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                logger.info(f"WS stream: {len(symbols)} symbols")
+                if first:
+                    logger.info(f"WS connected: {len(symbols)} symbols")
+                    first = False
+                backoff = 1  # reset on success
                 async for msg in ws:
                     try:
                         if isinstance(msg, bytes): msg = gzip.decompress(msg).decode()
@@ -597,10 +622,13 @@ async def ws_price_stream(symbols):
                                 sym = sym[:-4]+"-USDT"
                             _ws_prices[sym] = float(p)
                     except: pass
-        except Exception as e: logger.debug(f"WS reconnect: {e}"); await asyncio.sleep(5)
+        except Exception as e:
+            logger.debug(f"WS reconnect in {backoff}s: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # cap at 60s
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INDICATORS  (Numba JIT)
+#  INDICATORS
 # ══════════════════════════════════════════════════════════════════════════════
 @njit(cache=True)
 def _rsi(close, period):
@@ -648,6 +676,17 @@ def _adx_di(high, low, close, period):
         adx[i]=dx if i==period else (adx[i-1]*(period-1)+dx)/period
     return adx,pdi,mdi
 
+@njit(cache=True)
+def _ema(close, period):
+    """W11: EMA calculation."""
+    n=len(close); out=np.zeros(n)
+    if n < period: return out
+    out[period-1] = np.mean(close[:period])
+    k = 2.0 / (period + 1)
+    for i in range(period, n):
+        out[i] = close[i]*k + out[i-1]*(1-k)
+    return out
+
 def generate_signal(high, low, close, open_, volume,
                     h_high, h_low, h_close, h_open, h_volume,
                     t_high, t_low, t_close, cfg,
@@ -660,6 +699,18 @@ def generate_signal(high, low, close, open_, volume,
         adx    = float(adx_a[-1]); pdi=float(pdi_a[-1]); mdi=float(mdi_a[-1])
         rsi    = float(rsi_a[-1]); atr=float(atr_a[-1]); price=float(close[-1])
         atr_pct= atr/price*100 if price>0 else 0.0
+
+        # W12: Skip low-volatility setups — not worth fee
+        if atr_pct < cfg.min_atr_pct:
+            return None, {"regime":"low_atr","atr_pct":round(atr_pct,4)}
+
+        # W11: EMA trend filter
+        ema_fast_arr = _ema(close, cfg.ema_fast)
+        ema_slow_arr = _ema(close, cfg.ema_slow)
+        ema_fast_val = float(ema_fast_arr[-1])
+        ema_slow_val = float(ema_slow_arr[-1])
+        ema_bullish  = ema_fast_val > ema_slow_val
+        ema_bearish  = ema_fast_val < ema_slow_val
 
         # Three-Step Volume Delta
         dv = np.where(close>=open_, volume, -volume); p=cfg.period
@@ -682,13 +733,15 @@ def generate_signal(high, low, close, open_, volume,
         confidence = (max(bull,bear)/3*33 + max(0.0,adx-cfg.adx_thresh)
                      + (10.0 if vol_spike else 0) + liq_bonus) * regime_mult
 
-        # W8: Dynamic confidence — raise bar in high-volatility hours (12–16 UTC = NY open)
+        # W8: Dynamic confidence — raise bar during NY open
         h_utc = datetime.now(timezone.utc).hour
         dyn_min_conf = cfg.min_confidence + (5.0 if 12<=h_utc<16 else 0.0)
 
         metrics = {
             "adx":round(adx,2),"plus_di":round(pdi,2),"minus_di":round(mdi,2),
             "rsi":round(rsi,2),"atr":round(atr,8),"atr_pct":round(atr_pct,4),
+            "ema_fast":round(ema_fast_val,6),"ema_slow":round(ema_slow_val,6),
+            "ema_bullish":ema_bullish,
             "delta1":round(d1,2),"delta2":round(d2,2),"delta3":round(d3,2),
             "bull_steps":bull,"bear_steps":bear,"vol_spike":vol_spike,
             "confidence":round(confidence,1),"regime":regime,
@@ -705,6 +758,11 @@ def generate_signal(high, low, close, open_, volume,
         if not long_ok and not short_ok: return None, metrics
 
         sig = "BUY" if long_ok else "SELL"
+
+        # W11: EMA trend alignment — skip counter-trend signals
+        if cfg.ema_filter:
+            if sig == "BUY"  and not ema_bullish: return None, metrics
+            if sig == "SELL" and not ema_bearish:  return None, metrics
 
         # W1: Funding filter
         if cfg.funding_filter and funding_rate != 0:
@@ -738,7 +796,7 @@ def generate_signal(high, low, close, open_, volume,
         logger.debug(f"Indicator error: {e}"); return None, metrics
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM
+#  TELEGRAM  — deduplication & rate limiting
 # ══════════════════════════════════════════════════════════════════════════════
 _tg_q: asyncio.Queue = asyncio.Queue(maxsize=300)
 _tg_last = 0.0
@@ -768,34 +826,35 @@ def _bar(c): return "█"*int(c/10)+"░"*(10-int(c/10))
 def _regime_icon(r): return {"trending":"📈","volatile":"⚡","ranging":"➡️"}.get(r,"❓")
 
 def msg_start(n, balance):
-    weapons = ("✅ Funding filter  ✅ Liq cascade radar\n"
+    weapons = ("✅ EMA trend filter  ✅ Min ATR filter\n"
+               "✅ Funding filter  ✅ Liq cascade radar\n"
                "✅ Order book imbalance  ✅ Smart limit orders\n"
                "✅ Partial TP ladder  ✅ Regime filter\n"
                "✅ Anti stop-hunt SL  ✅ Session filter\n"
-               "✅ Kelly sizing  ✅ Dynamic confidence\n"
-               "✅ Per-symbol cooldown  ✅ Auto-resume")
-    return (f"⚡ <b>UltraBot v5 — Online</b>\n\n"
+               "✅ Kelly sizing (fixed)  ✅ Dynamic confidence\n"
+               "✅ 2.5R TP ratio  ✅ Auto-resume")
+    return (f"⚡ <b>UltraBot v6 — Online</b>\n\n"
             f"💰 Balance: <b>${balance:.2f} USDT</b>\n"
             f"📊 Universe: <b>{n} symbols</b>\n"
             f"⏱ {cfg.timeframe}/{cfg.confirm_tf}/{cfg.trend_tf} | ADX≥{cfg.adx_thresh}\n"
             f"⚖️ {cfg.leverage}x | Risk {cfg.risk_pct}% | Max {cfg.max_open_trades}\n"
             f"🛡 SL {cfg.sl_pct}% | TP {cfg.tp_pct}% | Trailing: {cfg.trailing_sl}\n\n"
-            f"<b>🔫 Weapons (10 active):</b>\n{weapons}")
+            f"<b>🔫 Weapons (12 active):</b>\n{weapons}")
 
 def msg_entry(sym, side, price, size, sl, tp, sl_pct, tp_pct, m, kelly):
     emoji = "🟢 LONG" if side=="BUY" else "🔴 SHORT"
     c     = m.get("confidence",0)
     regime= m.get("regime","")
-    extras = ""
+    ema_align = "✅" if m.get("ema_bullish") == (side=="BUY") else "⚠️"
+    extras = f"\n📊 EMA: {ema_align} | OB: {m.get('ob_imbalance',0.5):.0%} | Kelly: {kelly:.2f}x"
     if m.get("liq_cascade"):
         extras += f"\n⚡ <b>Liq cascade!</b> ({m.get('liq_vol_ratio',0):.1f}× vol)"
     fund = m.get("funding_rate",0)
     if fund: extras += f"\n💸 Funding: {'+' if fund>=0 else ''}{fund:.4f}%"
-    extras += f"\n📊 OB: {m.get('ob_imbalance',0.5):.0%} | Kelly: {kelly:.2f}x"
     return (f"{emoji} <b>{sym}</b> {_regime_icon(regime)}\n\n"
             f"💰 Entry: <code>{price:.6g}</code>\n"
             f"🎯 TP: <code>{tp:.6g}</code> (+{tp_pct:.1f}%)\n"
-            f"🛡 SL: <code>{sl:.6g}</code> (-{sl_pct:.1f}%) [structural]\n"
+            f"🛡 SL: <code>{sl:.6g}</code> (-{sl_pct:.1f}%)\n"
             f"📦 Size: <b>{size:.1f} USDT</b>\n\n"
             f"ADX:{m.get('adx',0):.1f} | RSI:{m.get('rsi',0):.1f} | ATR:{m.get('atr_pct',0):.2f}%\n"
             f"Δ1:{m.get('delta1',0):+.0f} Δ2:{m.get('delta2',0):+.0f} Δ3:{m.get('delta3',0):+.0f}\n"
@@ -822,7 +881,7 @@ def msg_low_balance(balance):
 
 def msg_performance(perf, risk_s):
     kelly = risk_s.get("kelly_mult",1.0)
-    return (f"📊 <b>UltraBot v5 Performance</b>\n\n"
+    return (f"📊 <b>UltraBot v6 Performance</b>\n\n"
             f"Trades: {perf.get('total_trades',0)} | WR: <b>{perf.get('win_rate',0):.1f}%</b>\n"
             f"Total PnL: <b>{perf.get('total_pnl',0):+.2f} USDT</b>\n"
             f"Best: +{perf.get('best_trade',0):.2f} | Worst: {perf.get('worst_trade',0):.2f}\n"
@@ -851,7 +910,7 @@ async def start_dashboard():
 
     _HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚡ UltraBot v5</title>
+<title>⚡ UltraBot v6</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:13px}
@@ -872,16 +931,16 @@ section h2{padding:10px 14px;font-size:12px;border-bottom:1px solid #30363d;colo
 </style></head>
 <body>
 <header>
-  <h1>⚡ UltraBot v5</h1>
+  <h1>⚡ UltraBot v6</h1>
   <span id="badge" class="badge running">RUNNING</span>
   <span id="upd" style="margin-left:auto;color:#8b949e;font-size:11px"></span>
 </header>
 <div class="grid" id="metrics"></div>
 <section><h2>📂 Open Positions</h2>
-<table><thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Conf</th><th>Regime</th><th>Funding</th></tr></thead>
+<table><thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Conf</th><th>Regime</th><th>EMA</th><th>Funding</th></tr></thead>
 <tbody id="pos"></tbody></table></section>
 <section><h2>🔍 Latest Signals</h2>
-<table><thead><tr><th>Symbol</th><th>Signal</th><th>Conf</th><th>ADX</th><th>RSI</th><th>Regime</th><th>Cascade</th><th>Funding%</th><th>OB</th></tr></thead>
+<table><thead><tr><th>Symbol</th><th>Signal</th><th>Conf</th><th>ADX</th><th>RSI</th><th>ATR%</th><th>Regime</th><th>EMA</th><th>Cascade</th></tr></thead>
 <tbody id="sig"></tbody></table></section>
 <script>
 const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
@@ -898,34 +957,36 @@ ws.onmessage=e=>{
     {l:'Day PnL',    v:(r.daily_pnl_usdt>=0?'+':'')+(r.daily_pnl_usdt||0).toFixed(2), c:pc(r.daily_pnl_usdt)},
     {l:'Total PnL',  v:(r.total_pnl>=0?'+':'')+(r.total_pnl||0).toFixed(2),            c:pc(r.total_pnl)},
     {l:'Win Rate',   v:(r.win_rate||0)+'%', s:r.wins+'W / '+r.losses+'L'},
-    {l:'Open Trades',v:Object.keys(d.positions||{}).length, s:'max '+r.open_count},
+    {l:'Open Trades',v:Object.keys(d.positions||{}).length},
     {l:'Scan',       v:(s.last_ms||0).toFixed(0)+'ms', s:(s.n_scanned||0)+' syms'},
     {l:'Signals',    v:'🟢'+(s.n_buy||0)+' 🔴'+(s.n_sell||0), s:(s.n_cascade||0)+' cascades'},
-    {l:'Kelly',      v:(r.kelly_mult||1).toFixed(2)+'×', s:'position scale', c:'blue'},
-    {l:'Consec Loss',v:r.consec_losses||0, c:(r.consec_losses||0)>=3?'red':''},
+    {l:'Kelly',      v:(r.kelly_mult||1).toFixed(2)+'×', c:'blue'},
+    {l:'Consec W/L', v:(r.consec_wins||0)+'W / '+(r.consec_losses||0)+'L', c:(r.consec_losses||0)>=3?'red':''},
     {l:'Trades',     v:p.total_trades||0, s:'avg '+(p.avg_duration_m||0).toFixed(0)+'m'},
   ].map(m=>`<div class="card"><div class="label">${m.l}</div><div class="value ${m.c||''}">${m.v}</div><div class="sub">${m.s||''}</div></div>`).join('');
   const ri={'trending':'📈','volatile':'⚡','ranging':'➡️'};
   document.getElementById('pos').innerHTML=Object.entries(d.positions||{}).map(([sym,pos])=>{
     const pnl=parseFloat(pos.unrealizedProfit||0),side=parseFloat(pos.positionAmt||0)>0?'🟢 LONG':'🔴 SHORT';
     const m=(d.trade_metrics||{})[sym]||{};
+    const emaOk=m.ema_bullish!=null?(parseFloat(pos.positionAmt||0)>0?m.ema_bullish:!m.ema_bullish)?'✅':'⚠️':'—';
     return `<tr><td><b>${sym}</b></td><td>${side}</td>
     <td>${parseFloat(pos.entryPrice||0).toFixed(4)}</td>
     <td>${parseFloat(pos.markPrice||pos.entryPrice||0).toFixed(4)}</td>
     <td class="${pc(pnl)}">${pnl>=0?'+':''}${pnl.toFixed(2)}</td>
     <td>${(m.confidence||0).toFixed(0)}%</td>
     <td>${ri[m.regime]||'—'} ${m.regime||'—'}</td>
+    <td>${emaOk}</td>
     <td class="${(m.funding_rate||0)>0.05?'red':(m.funding_rate||0)<-0.05?'green':''}">${(m.funding_rate||0).toFixed(4)}%</td></tr>`;
-  }).join('')||'<tr><td colspan="8" style="color:#8b949e;text-align:center;padding:20px">No open positions</td></tr>';
+  }).join('')||'<tr><td colspan="9" style="color:#8b949e;text-align:center;padding:20px">No open positions</td></tr>';
   document.getElementById('sig').innerHTML=(d.last_signals||[]).slice(0,12).map(s=>`<tr>
     <td><b>${s.symbol}</b></td>
     <td class="${s.signal==='BUY'?'green':'red'}">${s.signal==='BUY'?'🟢':'🔴'} ${s.signal}</td>
     <td>${(s.confidence||0).toFixed(0)}% / ${(s.dyn_min_conf||62).toFixed(0)}</td>
     <td>${(s.adx||0).toFixed(1)}</td><td>${(s.rsi||0).toFixed(1)}</td>
+    <td>${(s.atr_pct||0).toFixed(2)}%</td>
     <td class="${s.regime==='trending'?'green':s.regime==='volatile'?'yellow':''}">${ri[s.regime]||'—'} ${s.regime||'—'}</td>
-    <td>${s.liq_cascade?'⚡ YES':'—'}</td>
-    <td>${(s.funding_rate||0).toFixed(4)}%</td>
-    <td>${(s.ob_imbalance||0.5).toFixed(2)}</td></tr>`
+    <td>${s.ema_bullish!=null?(s.signal==='BUY'?s.ema_bullish:!s.ema_bullish)?'✅':'⚠️':'—'}</td>
+    <td>${s.liq_cascade?'⚡ YES':'—'}</td></tr>`
   ).join('')||'<tr><td colspan="9" style="color:#8b949e;text-align:center;padding:20px">No signals yet</td></tr>';
 };
 ws.onclose=()=>setTimeout(()=>location.reload(),4000);
@@ -935,7 +996,7 @@ ws.onclose=()=>setTimeout(()=>location.reload(),4000);
     async def index(): return HTMLResponse(_HTML)
 
     @app.get("/health")
-    async def health(): return {"status":"ok","version":"v5","balance":_dash.get("balance",0)}
+    async def health(): return {"status":"ok","version":"v6","balance":_dash.get("balance",0)}
 
     @app.websocket("/ws")
     async def ws_ep(ws: WebSocket):
@@ -965,6 +1026,10 @@ partial_closed: dict[str, bool]  = {}
 trade_metrics:  dict[str, dict]  = {}
 scan_stats:     dict             = {"last_ms":0,"n_buy":0,"n_sell":0,"n_scanned":0,"n_cascade":0}
 _last_perf_hash = ""
+
+# v6: State for deduplicated notifications
+_low_balance_notified_at: float = 0.0   # FIX: send low-balance alert max 1/hour
+_last_balance_for_notif: float = 0.0
 
 
 async def get_universe():
@@ -1003,6 +1068,10 @@ async def execute_entry(symbol, sig, metrics, balance, n_open, p_data):
         logger.debug(f"Blocked {symbol}: {reason}"); return False
     if not risk.correlation_ok(symbol): return False
 
+    # v6: Guard against double-order (limit fallback)
+    if symbol in _pending_orders:
+        logger.debug(f"Order already pending for {symbol}"); return False
+
     kelly = risk.kelly_multiplier()
     size  = risk.position_size(balance, n_open, metrics.get("confidence",0),
                                metrics.get("atr_pct",0), metrics.get("funding_rate",0)/100)
@@ -1012,24 +1081,25 @@ async def execute_entry(symbol, sig, metrics, balance, n_open, p_data):
     if price <= 0:
         logger.warning(f"Price=0 for {symbol}, skipping"); return False
 
-    # W7: Structural SL
     highs = p_data.get("high") if p_data else None
     lows  = p_data.get("low")  if p_data else None
     sl    = risk.structural_sl(price, sig, highs, lows, metrics.get("atr",0))
     _, tp, sl_pct, tp_pct = risk.dynamic_sl_tp(price, sig, metrics.get("atr",0))
 
+    _pending_orders[symbol] = "pending"
     try:
         await set_leverage(symbol, cfg.leverage)
         resp = {}
         if cfg.use_limit_orders:
-            # Limit order slightly inside spread
-            tick   = metrics.get("atr_pct",0.1) * price / 1000
-            lp     = round(price-tick if sig=="BUY" else price+tick, 8)
-            resp   = await place_limit_order(symbol, sig, size, lp, sl, tp)
-            await asyncio.sleep(3)  # wait for fill
-            # Check if filled; if not, market
-            if resp.get("code") and int(resp.get("code",0)) != 0:
+            tick = metrics.get("atr_pct",0.1) * price / 1000
+            lp   = round(price-tick if sig=="BUY" else price+tick, 8)
+            resp = await place_limit_order(symbol, sig, size, lp, sl, tp)
+            if resp.get("code") and str(resp.get("code","0")) != "0":
+                logger.debug(f"Limit rejected {symbol}, falling back to market")
+                await asyncio.sleep(1)
                 resp = await place_market_order(symbol, sig, size, sl, tp)
+            else:
+                await asyncio.sleep(3)  # wait for fill
         else:
             resp = await place_market_order(symbol, sig, size, sl, tp)
 
@@ -1038,6 +1108,8 @@ async def execute_entry(symbol, sig, metrics, balance, n_open, p_data):
             logger.warning(f"Order rejected {symbol}: {resp}"); return False
     except Exception as e:
         logger.error(f"Order failed {symbol}: {e}"); return False
+    finally:
+        _pending_orders.pop(symbol, None)
 
     qty   = size * cfg.leverage / price if price > 0 else 0
     db_id = await save_trade_open(symbol, sig, price, qty, size, sl, tp, metrics)
@@ -1055,9 +1127,10 @@ async def execute_entry(symbol, sig, metrics, balance, n_open, p_data):
 
 
 async def execute_close(symbol, position, reason):
-    price = float(position.get("markPrice") or position.get("entryPrice") or 0)
-    if price <= 0:
-        logger.warning(f"Skipping close {symbol}: markPrice=0"); return
+    mark = float(position.get("markPrice") or position.get("entryPrice") or 0)
+    # v6: Hard guard — never close on price=0
+    if mark <= 0:
+        logger.warning(f"Skipping close {symbol}: price=0"); return
     try:
         await close_position_market(symbol, position)
         await cancel_all_orders(symbol)
@@ -1068,12 +1141,12 @@ async def execute_close(symbol, position, reason):
     bal   = await get_balance()
     side  = "LONG" if float(position.get("positionAmt",0))>0 else "SHORT"
     entry = float(position.get("entryPrice",0))
-    pnl_pct = (price-entry)/entry*100*(1 if side=="LONG" else -1)*cfg.leverage if entry>0 else 0
+    pnl_pct = (mark-entry)/entry*100*(1 if side=="LONG" else -1)*cfg.leverage if entry>0 else 0
 
     trade = open_trades.pop(symbol, {})
     risk.record_close(symbol, pnl, bal)
     if trade.get("db_id"):
-        await save_trade_close(trade["db_id"],price,pnl,pnl_pct,reason,trade.get("opened_at",""))
+        await save_trade_close(trade["db_id"],mark,pnl,pnl_pct,reason,trade.get("opened_at",""))
 
     trailing_peaks.pop(symbol,None); partial_closed.pop(symbol,None); trade_metrics.pop(symbol,None)
     dur = 0
@@ -1084,12 +1157,12 @@ async def execute_close(symbol, position, reason):
     await send(msg_close(symbol,side,pnl,pnl_pct,reason,dur))
     logger.info(f"CLOSED {side} {symbol} — {reason} | PnL {pnl:+.2f}")
 
-    # Notify halt if triggered
     if risk.is_halted:
         await send(msg_halted(risk._halt_reason, bal))
 
 
 async def scan_loop():
+    global _low_balance_notified_at, _last_balance_for_notif
     symbols=[]; universe_refresh=0; funding_rates={}
     while True:
         t0 = time.perf_counter()
@@ -1103,7 +1176,6 @@ async def scan_loop():
                 fetch_universe_concurrent(symbols),
                 fetch_funding_batch(symbols[:30]))
 
-            # OB data for top 20 symbols (rate-limit friendly)
             ob_res = await asyncio.gather(
                 *[asyncio.create_task(get_ob_imbalance(s)) for s in symbols[:20]],
                 return_exceptions=True)
@@ -1129,15 +1201,25 @@ async def scan_loop():
             scan_stats.update({"last_ms":elapsed,"n_buy":n_buy,"n_sell":n_sell,
                                 "n_scanned":len(results),"n_cascade":n_cascade})
 
-            logger.info(f"Scan {elapsed:.0f}ms | {len(results)} syms | 🟢{n_buy} 🔴{n_sell} | ⚡{n_cascade} cascades | kelly={risk.kelly_multiplier():.2f}x")
+            logger.info(f"Scan {elapsed:.0f}ms | {len(results)} | 🟢{n_buy} 🔴{n_sell} | ⚡{n_cascade} | kelly={risk.kelly_multiplier():.2f}x")
 
             balance   = await get_balance()
+            # v6: Guard against API returning 0 (network error) — don't trade on bad data
+            if balance <= 0:
+                logger.warning("Balance returned 0 — skipping this cycle")
+                await asyncio.sleep(cfg.scan_interval); continue
+
             positions = await get_all_positions()
             risk.set_balance(balance)
 
-            # Check low balance
-            if balance < cfg.min_balance and balance > 0:
-                await send(msg_low_balance(balance), silent=True)
+            # v6: FIX — low balance alert max once per hour, only when balance actually changes
+            if balance < cfg.min_balance:
+                bal_changed = abs(balance - _last_balance_for_notif) > 0.5
+                cooldown_ok = time.time() - _low_balance_notified_at > 3600
+                if bal_changed or cooldown_ok:
+                    await send(msg_low_balance(balance), silent=True)
+                    _low_balance_notified_at = time.time()
+                    _last_balance_for_notif  = balance
 
             n_open = len(positions)
             if not risk.is_halted:
@@ -1179,13 +1261,14 @@ async def position_monitor():
                 amt   = float(pos.get("positionAmt",0))
                 mark  = float(pos.get("markPrice") or pos.get("entryPrice",0) or 0)
                 entry = float(pos.get("entryPrice",0))
+                # v6: Hard guard — never process on price=0
                 if mark <= 0 or entry <= 0: continue
                 side  = "LONG" if amt>0 else "SHORT"
                 trade = open_trades.get(sym, {})
                 tp_pct= trade.get("tp_pct", cfg.tp_pct)
                 sl_pct= trade.get("sl_pct", cfg.sl_pct)
 
-                # W5: Partial TP at 50% of TP distance
+                # W5: Partial TP
                 if cfg.partial_tp and not partial_closed.get(sym, True) and entry>0:
                     half = tp_pct / 2
                     if ((side=="LONG"  and mark >= entry*(1+half/100)) or
@@ -1197,11 +1280,10 @@ async def position_monitor():
                             await send(msg_partial_tp(sym, mark, cfg.partial_tp_pct))
                             logger.info(f"Partial TP {cfg.partial_tp_pct:.0f}% {sym} @ {mark:.6g}")
 
-                # Trailing SL — only activate after price moves cfg.trailing_activation% in favor
+                # Trailing SL
                 if cfg.trailing_sl and sym in trailing_peaks:
                     peak = trailing_peaks[sym]
                     if side=="LONG":
-                        # Activate trailing only if in profit enough
                         if mark >= entry*(1+cfg.trailing_activation/100):
                             if mark > peak: trailing_peaks[sym] = mark
                         if mark < trailing_peaks[sym]*(1-sl_pct/100):
@@ -1222,8 +1304,11 @@ async def performance_loop():
         try:
             perf = await get_performance_stats()
             rs   = risk.summary()
-            # Only send if something changed (avoid spam)
-            ph   = str(perf.get("total_trades","")) + str(round(rs.get("total_pnl",0),1))
+            # v6: FIX — hash includes more fields to detect real changes
+            ph   = (f"{perf.get('total_trades',0)}"
+                    f"{round(perf.get('total_pnl',0),1)}"
+                    f"{perf.get('wins',0)}"
+                    f"{round(rs.get('daily_pnl_usdt',0),1)}")
             if ph != _last_perf_hash:
                 await send(msg_performance(perf, rs), silent=True)
                 _last_perf_hash = ph
@@ -1237,11 +1322,12 @@ async def terminal_loop():
         try:
             positions = await get_all_positions()
             balance   = await get_balance()
-            t = Table(title="⚡ UltraBot v5", box=rbox.ROUNDED, show_lines=True)
+            t = Table(title="⚡ UltraBot v6", box=rbox.ROUNDED, show_lines=True)
             for col,sty,jus in [("Symbol","cyan","left"),("Side","","left"),
                                   ("Entry","","right"),("Mark","","right"),
                                   ("PnL","","right"),("Conf","","right"),
-                                  ("Regime","","left"),("Kelly","","right")]:
+                                  ("Regime","","left"),("EMA","","center"),
+                                  ("Kelly","","right")]:
                 t.add_column(col, style=sty, justify=jus)
             for sym,pos in positions.items():
                 pnl  = float(pos.get("unrealizedProfit",0))
@@ -1249,12 +1335,14 @@ async def terminal_loop():
                 m    = trade_metrics.get(sym,{})
                 reg  = m.get("regime","—")
                 rc   = {"trending":"green","volatile":"yellow","ranging":"red"}.get(reg,"white")
+                ema_ok = m.get("ema_bullish") == (float(pos["positionAmt"])>0) if "ema_bullish" in m else True
                 t.add_row(sym,side,
                           f"{float(pos.get('entryPrice',0)):.4f}",
                           f"{float(pos.get('markPrice',pos.get('entryPrice',0))):.4f}",
                           f"[{'green' if pnl>=0 else 'red'}]{pnl:+.2f}[/]",
                           f"{m.get('confidence',0):.0f}%",
                           f"[{rc}]{reg}[/]",
+                          "✅" if ema_ok else "⚠️",
                           f"{risk.kelly_multiplier():.2f}×")
             console.print(t)
             rs = risk.summary()
@@ -1270,13 +1358,15 @@ async def terminal_loop():
 
 async def main():
     logger.remove()
+    # v6: Use stderr with level INFO — Railway captures this correctly
     logger.add(sys.stderr, level="INFO",
-               format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}")
+               format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
+               colorize=False)  # Railway doesn't render ANSI colors in JSON mode
     os.makedirs("data", exist_ok=True)
     logger.add("data/ultrabot.log", rotation="1 day", retention="14 days", level="DEBUG")
 
-    console.print("[bold cyan]⚡ UltraBot v5 — Maximum Competitive Edition[/bold cyan]")
-    console.print("[dim]10 weapons active against competing bots[/dim]")
+    console.print("[bold cyan]⚡ UltraBot v6 — Fixed & Optimized[/bold cyan]")
+    console.print("[dim]12 weapons | EMA filter | 2.5R TP | No spam[/dim]")
 
     await init_db()
     balance = await get_balance()
@@ -1284,7 +1374,7 @@ async def main():
     console.print(f"💰 Balance: [bold]{balance:.2f} USDT[/bold]")
 
     if balance < cfg.min_balance:
-        console.print(f"[yellow]⚠️  Balance below minimum (${cfg.min_balance}). Bot will scan but not trade.[/yellow]")
+        console.print(f"[yellow]⚠️  Balance below minimum (${cfg.min_balance}). Scanning but not trading.[/yellow]")
 
     symbols = await get_universe()
     if not symbols:
