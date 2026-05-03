@@ -1,1523 +1,1126 @@
 """
-UltraBot v7 — Maximum Alpha Edition
-=====================================
-Changelog vs v6:
-  FIXES:
-  - position_size bug fixed (min/max cancel each other when balance<$25) → triple-floor
-  - get_balance retry + cache (never skips cycle on API hiccup)
-  - INFO/WARNING → stdout, ERROR → stderr (Railway log colours correct)
-  - WS reconnect → exponential back-off (no log spam)
-  - Low-balance spam → max 1 alert/hour
-
-  NEW FEATURES:
-  - 10x leverage by default (env: LEVERAGE=10)
-  - Scan up to 150 symbols, min vol $1M (env configurable)
-  - LearningEngine: tracks which hours/regimes/ATR buckets lose → avoids them
-  - DailyReportEngine: every day at UTC midnight sends full P&L breakdown to Telegram
-  - SL/TP Verifier: after every entry checks BingX open orders to confirm SL+TP exist
-  - Commission-aware sizing: factors in 0.05% taker fee per leg
-  - Adaptive min_confidence: rises when LearningEngine detects bad conditions
-  - W15: Breakout filter — entry only if price broke recent high/low (avoids mid-range)
-
-  STRATEGY SUMMARY:
-  - Primary: Three-Step Volume Delta (3× 25-bar rolling ΔVOL → identifies accumulation/distribution)
-  - Confirmation: ADX>32 (trend strength) + RSI not extreme
-  - Alignment: EMA 20/50 cross on entry TF (W11)
-  - HTF filter: 1h + 4h DI alignment (avoids counter-trend)
-  - Regime: skip ranging markets (Bollinger bandwidth + ATR)
-  - OB: order-book bid/ask imbalance > 58%
-  - Funding: skip when funding opposes direction
-  - SL: structural swing low/high (anti stop-hunt)
-  - TP: 2.5R default; trailing SL activates at +1%
-  - Sizing: fractional Kelly × confidence × volatility × funding scalars
+╔══════════════════════════════════════════════════════════════════════╗
+║   PHANTOM EDGE BOT v7.0 — ZigZag + HMA + Future-Trend              ║
+║   FIXES vs v6:                                                       ║
+║   · Eliminado httpx → 100% aiohttp (ya instalado)                   ║
+║   · place_order corregido: quoteOrderQty + SL/TP embebidos          ║
+║     (mismo formato que client.py probado)                            ║
+║   · Sin positionSide (modo ONE-WAY, compatible BingX por defecto)   ║
+║   · AUTO_TRADING_ENABLED se loguea claramente al arrancar            ║
+║   · Señales: crossover relaxado + score mínimo 3/6                  ║
+║   · Warmup más rápido: 50 concurrentes en prio                      ║
+╚══════════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
-import asyncio, hashlib, hmac, json, math, os, sys, time
+import asyncio, hashlib, hmac, logging, math, os, signal, time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any
+from typing import Optional
 from urllib.parse import urlencode
 
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("✅ uvloop active")
-except ImportError:
-    pass
-
 import aiohttp
-import aiosqlite
 import numpy as np
-from loguru import logger
-from rich.console import Console
-from rich.table import Table
-from rich import box as rbox
 
-try:
-    from numba import njit  # type: ignore
-except ImportError:
-    def njit(*a, **kw):
-        def d(f): return f
-        return d
+# ─────────────────────────────────────────────────────────────────────
+#  CONFIGURACIÓN — todas vía env vars en Railway
+# ─────────────────────────────────────────────────────────────────────
+API_KEY         = os.getenv("BINGX_API_KEY", "")
+API_SECRET      = os.getenv("BINGX_SECRET_KEY", os.getenv("BINGX_API_SECRET", ""))
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-def _env(k, d=""): return os.environ.get(k, d)
-def _envf(k, d):
-    try: return float(os.environ.get(k, d))
-    except: return float(d)
-def _envi(k, d):
-    try: return int(os.environ.get(k, d))
-    except: return int(d)
-def _envb(k, d): return os.environ.get(k, str(d)).lower() in ("1","true","yes")
+AUTO_TRADING    = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
+LEVERAGE        = int(os.getenv("LEVERAGE", "10"))
+TIMEFRAME       = os.getenv("TIMEFRAME", "5m")
+TIMEFRAME_SLOW  = os.getenv("TIMEFRAME_SLOW", "15m")
 
-# BingX fees: maker 0.02%, taker 0.05% per leg → round-trip ~0.14% at taker
-TAKER_FEE = 0.0005   # 0.05% per leg
-MAKER_FEE = 0.0002   # 0.02% per leg
+# Parámetros del indicador (idénticos al Pine Script original)
+PIVOT_LEN   = int(os.getenv("PIVOT_LEN",   "5"))    # ZigZag lookback
+HMA_LEN     = int(os.getenv("HMA_LEN",    "50"))    # Hull MA length
+FT_PERIOD   = int(os.getenv("FT_PERIOD",  "25"))    # Future-Trend period
 
-class _Cfg:
-    # ── Keys ─────────────────────────────────────────────────────────────
-    bingx_api_key    = _env("BINGX_API_KEY")
-    bingx_secret_key = _env("BINGX_SECRET_KEY") or _env("BINGX_API_SECRET")
-    telegram_token   = _env("TELEGRAM_TOKEN")
-    telegram_chat_id = _env("TELEGRAM_CHAT_ID")
-    # ── Strategy ─────────────────────────────────────────────────────────
-    timeframe        = _env("TIMEFRAME",     "15m")
-    confirm_tf       = _env("CONFIRM_TF",    "1h")
-    trend_tf         = _env("TREND_TF",      "4h")
-    period           = _envi("PERIOD",        25)
-    adx_len          = _envi("ADX_LEN",       14)
-    adx_thresh       = _envf("ADX_THRESH",    30.0)
-    rsi_len          = _envi("RSI_LEN",       14)
-    rsi_ob           = _envf("RSI_OB",        70.0)
-    rsi_os           = _envf("RSI_OS",        30.0)
-    vol_spike_mult   = _envf("VOL_SPIKE_MULT", 2.0)
-    min_confidence   = _envf("MIN_CONFIDENCE", 62.0)
-    min_atr_pct      = _envf("MIN_ATR_PCT",    0.15)
-    ema_fast         = _envi("EMA_FAST",       20)
-    ema_slow         = _envi("EMA_SLOW",       50)
-    ema_filter       = _envb("EMA_FILTER",     True)
-    breakout_filter  = _envb("BREAKOUT_FILTER", True)   # W15
-    breakout_bars    = _envi("BREAKOUT_BARS",   20)      # W15: lookback
-    # ── Universe ─────────────────────────────────────────────────────────
-    min_volume_usdt  = _envf("MIN_VOLUME_USDT", 1_000_000)   # v7: wider net
-    top_n_symbols    = _envi("TOP_N_SYMBOLS",   150)          # v7: more symbols
-    blacklist        = set(s.strip() for s in _env("BLACKLIST","").split(",") if s.strip())
-    # ── Risk ─────────────────────────────────────────────────────────────
-    leverage              = _envi("LEVERAGE",    10)          # v7: 10x
-    risk_pct              = _envf("RISK_PCT",    1.2)         # slightly lower per-trade risk at 10x
-    max_open_trades       = _envi("MAX_OPEN_TRADES", 3)
-    sl_pct                = _envf("SL_PCT",      1.0)         # tighter SL at 10x
-    tp_pct                = _envf("TP_PCT",      2.5)         # 2.5R
-    trailing_sl           = _envb("TRAILING_SL", True)
-    trailing_activation   = _envf("TRAILING_ACTIVATION", 0.8)
-    max_drawdown_pct      = _envf("MAX_DRAWDOWN_PCT", 15.0)
-    daily_loss_limit      = _envf("DAILY_LOSS_LIMIT",  8.0)
-    max_consec_loss       = _envi("MAX_CONSECUTIVE_LOSSES", 3)
-    cooldown_loss         = _envi("COOLDOWN_AFTER_LOSS", 600)
-    min_balance           = _envf("MIN_BALANCE", 5.0)
-    close_cooldown        = _envi("CLOSE_COOLDOWN", 900)   # 15 min (was 30)
-    min_order_usdt        = _envf("MIN_ORDER_USDT", 5.0)
-    # ── Weapons ────────────────────────────────────────────────────────
-    use_limit_orders      = _envb("USE_LIMIT_ORDERS",     True)
-    partial_tp            = _envb("PARTIAL_TP",           True)
-    partial_tp_pct        = _envf("PARTIAL_TP_PCT",       50.0)
-    funding_filter        = _envb("FUNDING_FILTER",       True)
-    max_funding_rate      = _envf("MAX_FUNDING_RATE",     0.0008)
-    liq_radar             = _envb("LIQ_RADAR",            True)
-    ob_filter             = _envb("OB_FILTER",            True)
-    ob_imbalance_thresh   = _envf("OB_IMBALANCE_THRESH",  0.58)
-    regime_filter         = _envb("REGIME_FILTER",        True)
-    anti_stophunt         = _envb("ANTI_STOPHUNT",        True)
-    session_filter        = _envb("SESSION_FILTER",       True)
-    kelly_sizing          = _envb("KELLY_SIZING",         True)
-    kelly_fraction        = _envf("KELLY_FRACTION",       0.25)
-    # ── v7 ────────────────────────────────────────────────────────────
-    verify_sl_tp          = _envb("VERIFY_SL_TP",         True)   # verify after entry
-    daily_report          = _envb("DAILY_REPORT",         True)
-    learn_from_losses     = _envb("LEARN_FROM_LOSSES",    True)
-    # ── Performance ──────────────────────────────────────────────────
-    scan_interval    = _envi("SCAN_INTERVAL",   12)
-    dashboard_enabled= _envb("DASHBOARD_ENABLED", True)
-    dashboard_port   = _envi("DASHBOARD_PORT",  8080)
-    candles_needed   = 100
+# TP/SL dinámico (ATR) — mejora vs pips fijos del Pine
+USE_ATR_TP  = os.getenv("USE_ATR_TP", "true").lower() == "true"
+ATR_SL      = float(os.getenv("ATR_SL",  "1.5"))
+ATR_TP1     = float(os.getenv("ATR_TP1", "1.5"))
+ATR_TP2     = float(os.getenv("ATR_TP2", "3.0"))
+TP_PIPS     = float(os.getenv("TP_PIPS", "45.0"))
+SL_PIPS     = float(os.getenv("SL_PIPS", "30.0"))
 
-    @property
-    def effective_port(self):
-        return int(os.environ.get("PORT", self.dashboard_port))
+MIN_SCORE       = int(os.getenv("MIN_SCORE", "3"))     # mín: ZZ+HMA+FT (=señal Pine)
+MIN_ATR_PCT     = float(os.getenv("MIN_ATR_PCT", "0.08"))
+MIN_VOL_MULT    = float(os.getenv("MIN_VOL_MULT", "0.5"))
 
-cfg = _Cfg()
+TRADE_USDT      = float(os.getenv("TRADE_USDT", "9"))
+MAX_POSITIONS   = int(os.getenv("MAX_POSITIONS", "5"))
+SCAN_INTERVAL   = int(os.getenv("SCAN_INTERVAL", "30"))
+MAX_CONCURRENT  = int(os.getenv("MAX_CONCURRENT", "40"))
+MAX_DAILY_LOSS  = float(os.getenv("MAX_DAILY_LOSS", "5.0"))
+PORT            = int(os.getenv("PORT", "8080"))
+TP1_FRAC        = float(os.getenv("TP1_SIZE", "0.35"))  # fracción qty en TP1
+TP2_FRAC        = float(os.getenv("TP2_SIZE", "0.35"))  # fracción qty en TP2
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  LEARNING ENGINE  — tracks loss patterns, raises confidence bar for bad conditions
-# ══════════════════════════════════════════════════════════════════════════════
-class LearningEngine:
-    """Tracks performance by hour / regime / ATR bucket to identify lossy conditions."""
+PRIORITY_RAW = os.getenv("PRIORITY_SYMBOLS",
+    "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,"
+    "PNUT-USDT,PEPE-USDT,WIF-USDT,BONK-USDT,FLOKI-USDT,"
+    "TURBO-USDT,HYPE-USDT,ARB-USDT,SHIB-USDT,AVAX-USDT,"
+    "LINK-USDT,BNB-USDT,ADA-USDT,MATIC-USDT,SUI-USDT"
+)
+PRIORITY = [s.strip() for s in PRIORITY_RAW.split(",") if s.strip()]
+
+BINGX_BASE = "https://open-api.bingx.com"
+MIN_BALANCE = max(TRADE_USDT * 1.5, 5.0)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-5s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("PE7")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  INDICADORES — traducción Pine → Python
+# ══════════════════════════════════════════════════════════════════════
+
+def _f(a) -> np.ndarray:
+    return np.nan_to_num(np.asarray(a, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# ── ZigZag: ta.pivothigh / ta.pivotlow ──────────────────────────────
+
+def _pivot_highs(h: np.ndarray, n: int) -> np.ndarray:
+    """ta.pivothigh(high, n, n) — pivot confirmado n velas a la derecha."""
+    result = np.full(len(h), np.nan)
+    for i in range(n, len(h) - n):
+        window = h[i - n: i + n + 1]
+        if h[i] >= np.max(window):
+            result[i] = h[i]
+    return result
+
+
+def _pivot_lows(l: np.ndarray, n: int) -> np.ndarray:
+    """ta.pivotlow(low, n, n)"""
+    result = np.full(len(l), np.nan)
+    for i in range(n, len(l) - n):
+        window = l[i - n: i + n + 1]
+        if l[i] <= np.min(window):
+            result[i] = l[i]
+    return result
+
+
+def peak_series(h: np.ndarray, n: int) -> np.ndarray:
+    """var float peak = na; if not na(ph): peak := ph — forward-fill."""
+    ph = _pivot_highs(h, n)
+    out = np.full(len(h), np.nan)
+    cur = np.nan
+    for i in range(len(h)):
+        if not np.isnan(ph[i]):
+            cur = ph[i]
+        out[i] = cur
+    return out
+
+
+def valley_series(l: np.ndarray, n: int) -> np.ndarray:
+    """var float valley = na; forward-fill."""
+    pl = _pivot_lows(l, n)
+    out = np.full(len(l), np.nan)
+    cur = np.nan
+    for i in range(len(l)):
+        if not np.isnan(pl[i]):
+            cur = pl[i]
+        out[i] = cur
+    return out
+
+
+def crossover(series: np.ndarray, level: np.ndarray) -> bool:
+    """ta.crossover: prev ≤ level AND curr > level."""
+    if len(series) < 2 or np.isnan(level[-1]):
+        return False
+    return bool(series[-2] <= level[-2] and series[-1] > level[-1])
+
+
+def crossunder(series: np.ndarray, level: np.ndarray) -> bool:
+    """ta.crossunder: prev ≥ level AND curr < level."""
+    if len(series) < 2 or np.isnan(level[-1]):
+        return False
+    return bool(series[-2] >= level[-2] and series[-1] < level[-1])
+
+
+# ── HMA: ta.hma(close, len) ─────────────────────────────────────────
+
+def calc_hma(c: np.ndarray, n: int) -> np.ndarray:
+    """HMA = WMA(2×WMA(n/2) − WMA(n), sqrt(n))"""
+    c = _f(c)
+    if len(c) < n:
+        return np.full(len(c), c[-1] if len(c) else 0.0)
+
+    def wma(arr, period):
+        w = np.arange(1, period + 1, dtype=float)
+        total = w.sum()
+        out = np.zeros(len(arr))
+        for i in range(period - 1, len(arr)):
+            out[i] = np.dot(arr[i - period + 1: i + 1], w) / total
+        return out
+
+    half_n = max(1, n // 2)
+    sqrt_n = max(1, int(math.sqrt(n)))
+    raw = 2.0 * wma(c, half_n) - wma(c, n)
+    return wma(raw, sqrt_n)
+
+
+def hma_direction(hma_vals: np.ndarray, close_vals: np.ndarray):
+    """Pine: hma_alcista = close > hma and hma > hma[1]"""
+    if len(hma_vals) < 2:
+        return False, False
+    h0, h1, cl = hma_vals[-1], hma_vals[-2], close_vals[-1]
+    return bool(cl > h0 and h0 > h1), bool(cl < h0 and h0 < h1)
+
+
+# ── Future-Trend: Volume Delta × 3 períodos ─────────────────────────
+
+def calc_future_trend(o: np.ndarray, c: np.ndarray, v: np.ndarray,
+                       ft_period: int) -> float:
+    """
+    Pine Script original:
+      delta_vol = close>open ? volume : close<open ? -volume : 0
+      for i=0 to ft_period-1
+          avg_delta = math.avg(delta_vol[i], delta_vol[i+ft], delta_vol[i+ft*2])
+          vol_delta_sum += avg_delta
+      vol_delta_avg = vol_delta_sum / ft_period
+    """
+    o, c, v = _f(o), _f(c), _f(v)
+    n = len(c)
+    if n < ft_period * 3 + 1:
+        return 0.0
+
+    delta = np.where(c > o, v, np.where(c < o, -v, 0.0))
+
+    total = 0.0
+    for i in range(ft_period):
+        i0 = n - 1 - i
+        i1 = n - 1 - i - ft_period
+        i2 = n - 1 - i - ft_period * 2
+        if i2 >= 0:
+            total += (delta[i0] + delta[i1] + delta[i2]) / 3.0
+
+    return total / ft_period
+
+
+# ── ATR (Wilder) ────────────────────────────────────────────────────
+
+def calc_atr(h, l, c, p=14) -> float:
+    h, l, c = _f(h), _f(l), _f(c)
+    if len(c) < p + 1:
+        return max(float(np.mean(h - l)), 1e-12)
+    tr = np.maximum(h[1:] - l[1:],
+                    np.maximum(np.abs(h[1:] - c[:-1]),
+                               np.abs(l[1:] - c[:-1])))
+    tr = np.r_[h[0] - l[0], tr]
+    a = np.zeros(len(tr))
+    a[p - 1] = np.mean(tr[:p])
+    for i in range(p, len(tr)):
+        a[i] = (a[i - 1] * (p - 1) + tr[i]) / p
+    return max(float(a[-1]), 1e-12)
+
+
+def _pip_size(price: float) -> float:
+    """Tamaño de pip para crypto (equivale a syminfo.mintick en Pine)."""
+    if price > 10000: return 0.01
+    if price > 100:   return 0.001
+    if price > 1:     return 0.0001
+    if price > 0.01:  return 0.00001
+    return 0.000001
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MOTOR DE SEÑALES v7
+# ══════════════════════════════════════════════════════════════════════
+
+def analyze(c5: list[dict], c15: list[dict]) -> Optional[dict]:
+    """
+    LONG:  crossover(close, peak)   + HMA alcista + FutureTrend > 0
+    SHORT: crossunder(close, valley) + HMA bajista + FutureTrend < 0
+
+    Score 0-6:
+      +2 Ruptura ZigZag (condición principal Pine)
+      +1 HMA dirección (filtro rápido Pine)
+      +1 FutureTrend volume delta (Pine)
+      +1 Confirmación 15m (multi-TF mejora)
+      +1 Volumen elevado (mejora)
+    """
+    need_5m  = max(HMA_LEN + 10, FT_PERIOD * 3 + 10, PIVOT_LEN * 4 + 5)
+    need_15m = max(HMA_LEN + 5,  FT_PERIOD * 2 + 5)
+
+    if len(c5) < need_5m or len(c15) < need_15m:
+        return None
+
+    # Arrays
+    h5  = _f([x["h"] for x in c5])
+    l5  = _f([x["l"] for x in c5])
+    c5a = _f([x["c"] for x in c5])
+    o5  = _f([x["o"] for x in c5])
+    v5  = _f([x["v"] for x in c5])
+
+    h15  = _f([x["h"] for x in c15])
+    l15  = _f([x["l"] for x in c15])
+    c15a = _f([x["c"] for x in c15])
+    o15  = _f([x["o"] for x in c15])
+    v15  = _f([x["v"] for x in c15])
+
+    close = float(c5a[-1])
+    if close <= 0:
+        return None
+
+    # Filtro mercado muerto
+    atr14   = calc_atr(h5, l5, c5a, 14)
+    atr_pct = atr14 / close * 100
+    if atr_pct < MIN_ATR_PCT:
+        return None
+
+    vol20 = float(np.mean(v5[-20:])) if len(v5) >= 20 else 1.0
+    if vol20 <= 0 or float(v5[-2]) < vol20 * MIN_VOL_MULT:
+        return None
+
+    # ── Componentes ──────────────────────────────────────────────────
+
+    # 1. ZigZag (Pine: crossover(close, peak) / crossunder(close, valley))
+    ps  = peak_series(h5, PIVOT_LEN)
+    vs  = valley_series(l5, PIVOT_LEN)
+    long_zz  = crossover(c5a, ps)
+    short_zz = crossunder(c5a, vs)
+
+    # 2. HMA 5m
+    hma5 = calc_hma(c5a, HMA_LEN)
+    hma_bull, hma_bear = hma_direction(hma5, c5a)
+
+    # 3. Future-Trend 5m
+    ft5  = calc_future_trend(o5, c5a, v5, FT_PERIOD)
+    ft_bull, ft_bear = ft5 > 0, ft5 < 0
+
+    # 4. Multi-TF 15m
+    hma15 = calc_hma(c15a, HMA_LEN)
+    hma15_bull, hma15_bear = hma_direction(hma15, c15a)
+    ft15  = calc_future_trend(o15, c15a, v15, FT_PERIOD)
+
+    # 5. Volumen
+    vol_ok = float(v5[-2]) > vol20 * 1.2
+
+    # ── Score LONG ───────────────────────────────────────────────────
+    ls, lr = 0, []
+    if long_zz:
+        ls += 2; lr.append(f"ZZ↑{ps[-1]:.5g}")
+    if hma_bull:
+        ls += 1; lr.append(f"HMA↑")
+    if ft_bull:
+        ls += 1; lr.append(f"FT+{ft5:.0f}")
+    if hma15_bull and ft15 > 0:
+        ls += 1; lr.append("MTF▲")
+    if vol_ok:
+        ls += 1; lr.append("VOL↑")
+
+    # ── Score SHORT ──────────────────────────────────────────────────
+    ss, sr = 0, []
+    if short_zz:
+        ss += 2; sr.append(f"ZZ↓{vs[-1]:.5g}")
+    if hma_bear:
+        ss += 1; sr.append(f"HMA↓")
+    if ft_bear:
+        ss += 1; sr.append(f"FT{ft5:.0f}")
+    if hma15_bear and ft15 < 0:
+        ss += 1; sr.append("MTF▼")
+    if vol_ok:
+        ss += 1; sr.append("VOL↑")
+
+    # ── SL / TP ──────────────────────────────────────────────────────
+    if USE_ATR_TP:
+        sl_d  = atr14 * ATR_SL
+        tp1_d = atr14 * ATR_TP1
+        tp2_d = atr14 * ATR_TP2
+    else:
+        pip   = _pip_size(close)
+        sl_d  = SL_PIPS * pip
+        tp1_d = TP_PIPS * pip
+        tp2_d = TP_PIPS * 2 * pip
+
+    # SL mínimo: 0.05% del precio (evita fill inmediato)
+    sl_min = close * 0.0005
+    sl_d   = max(sl_d, sl_min)
+
+    # ── Señal ────────────────────────────────────────────────────────
+    if ls >= MIN_SCORE and ls > ss:
+        return {
+            "side": "BUY", "score": ls, "reasons": lr,
+            "entry": close,
+            "sl":    round(close - sl_d, 8),
+            "tp1":   round(close + tp1_d, 8),
+            "tp2":   round(close + tp2_d, 8),
+            "atr": atr14, "atr_pct": atr_pct,
+            "ft": ft5, "hma": float(hma5[-1]),
+            "zz": long_zz,
+            "peak": float(ps[-1]) if not np.isnan(ps[-1]) else close,
+        }
+
+    if ss >= MIN_SCORE and ss > ls:
+        return {
+            "side": "SELL", "score": ss, "reasons": sr,
+            "entry": close,
+            "sl":    round(close + sl_d, 8),
+            "tp1":   round(close - tp1_d, 8),
+            "tp2":   round(close - tp2_d, 8),
+            "atr": atr14, "atr_pct": atr_pct,
+            "ft": ft5, "hma": float(hma5[-1]),
+            "zz": short_zz,
+            "valley": float(vs[-1]) if not np.isnan(vs[-1]) else close,
+        }
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  BINGX CLIENT — 100% aiohttp, formato probado (igual que client.py)
+# ══════════════════════════════════════════════════════════════════════
+
+class BingXClient:
+    """
+    Cliente aiohttp con:
+    · Pool persistente 300 conexiones, keepalive 60s
+    · Firma HMAC-SHA256 correcta (sorted urlencode)
+    · place_order: quoteOrderQty + SL/TP embebidos (sin positionSide)
+    · Leverage paralelo (LONG+SHORT simultáneo)
+    """
+
     def __init__(self):
-        # {key: [pnl, pnl, ...]}
-        self._by_hour:   dict[int, list[float]]  = defaultdict(list)
-        self._by_regime: dict[str, list[float]]  = defaultdict(list)
-        self._by_atr:    dict[str, list[float]]  = defaultdict(list)  # "low/mid/high"
-        self._by_symbol: dict[str, list[float]]  = defaultdict(list)
+        self._session: Optional[aiohttp.ClientSession] = None
+        # Public endpoints (klines/tickers) get more slots than auth endpoints
+        self._sem_pub  = asyncio.Semaphore(25)  # klines, tickers
+        self._sem_auth = asyncio.Semaphore(8)   # balance, orders, positions
+        self._fail: dict[str, int] = defaultdict(int)
+        self._lev_done: set        = set()
 
-    def record(self, pnl: float, metrics: dict):
-        h      = datetime.now(timezone.utc).hour
-        regime = metrics.get("regime", "unknown")
-        atr_p  = metrics.get("atr_pct", 0)
-        sym    = metrics.get("symbol", "")
-        bucket = "low" if atr_p < 0.3 else ("mid" if atr_p < 1.0 else "high")
-        self._by_hour[h].append(pnl)
-        self._by_regime[regime].append(pnl)
-        self._by_atr[bucket].append(pnl)
-        if sym: self._by_symbol[sym].append(pnl)
+    def _sess(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            conn = aiohttp.TCPConnector(
+                limit=300, limit_per_host=100,
+                ttl_dns_cache=600, keepalive_timeout=60,
+                ssl=False, force_close=False,
+            )
+            self._session = aiohttp.ClientSession(
+                connector=conn,
+                timeout=aiohttp.ClientTimeout(total=12, connect=4),
+            )
+        return self._session
 
-    def _wr(self, lst: list[float]) -> float:
-        if not lst: return 0.5
-        return sum(1 for p in lst if p > 0) / len(lst)
+    def _sign(self, params: dict) -> str:
+        qs = urlencode(sorted(params.items()))
+        return hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
-    def confidence_penalty(self, metrics: dict) -> float:
-        """Returns extra confidence threshold to add (0 = no penalty, >0 = harder to enter)."""
-        if not cfg.learn_from_losses: return 0.0
-        penalty = 0.0
-        h      = datetime.now(timezone.utc).hour
-        regime = metrics.get("regime","")
-        atr_p  = metrics.get("atr_pct", 0)
-        bucket = "low" if atr_p < 0.3 else ("mid" if atr_p < 1.0 else "high")
+    def _auth(self, extra: dict = None) -> dict:
+        p = dict(extra or {})
+        p["timestamp"] = int(time.time() * 1000)
+        p["signature"] = self._sign(p)
+        return p
 
-        h_wr  = self._wr(self._by_hour[h])
-        r_wr  = self._wr(self._by_regime[regime])
-        a_wr  = self._wr(self._by_atr[bucket])
+    def _hdrs(self) -> dict:
+        return {"X-BX-APIKEY": API_KEY}
 
-        # Raise bar if historical WR < 40% in this condition
-        if len(self._by_hour[h]) >= 5   and h_wr < 0.40: penalty += 8.0
-        if len(self._by_regime[regime]) >= 5 and r_wr < 0.40: penalty += 6.0
-        if len(self._by_atr[bucket]) >= 5   and a_wr < 0.40: penalty += 5.0
-        return penalty
+    async def _get(self, path: str, params: dict = None, auth=False) -> dict:
+        async with (self._sem_auth if auth else self._sem_pub):
+            p = self._auth(params) if auth else (params or {})
+            for attempt in range(3):
+                try:
+                    async with self._sess().get(
+                        BINGX_BASE + path, params=p, headers=self._hdrs()
+                    ) as r:
+                        return await r.json(content_type=None)
+                except asyncio.TimeoutError:
+                    if attempt < 2:
+                        await asyncio.sleep(1.5 ** attempt)
+                except Exception as e:
+                    log.debug(f"GET {path}: {e}")
+                    return {}
+        return {}
 
-    def blacklist_check(self, symbol: str) -> bool:
-        """Return True (block) if symbol has >=5 trades and WR<30%."""
-        lst = self._by_symbol.get(symbol, [])
-        if len(lst) < 5: return False
-        return self._wr(lst) < 0.30
+    async def _post(self, path: str, params: dict = None) -> dict:
+        p = self._auth(params)
+        async with self._sem_auth:
+            for attempt in range(3):
+                try:
+                    async with self._sess().post(
+                        BINGX_BASE + path, params=p, headers=self._hdrs()
+                    ) as r:
+                        return await r.json(content_type=None)
+                except asyncio.TimeoutError:
+                    if attempt < 2:
+                        await asyncio.sleep(1.5 ** attempt)
+                except Exception as e:
+                    log.debug(f"POST {path}: {e}")
+                    return {}
+        return {}
 
-    def summary_lines(self) -> list[str]:
-        lines = []
-        for h in sorted(self._by_hour):
-            lst = self._by_hour[h]
-            if len(lst) >= 3:
-                wr = self._wr(lst)*100
-                avg = sum(lst)/len(lst)
-                lines.append(f"Hour {h:02d}:00 | {len(lst)} trades | WR {wr:.0f}% | avg {avg:+.2f}")
-        return lines
-
-learn = LearningEngine()
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER
-# ══════════════════════════════════════════════════════════════════════════════
-class RiskManager:
-    def __init__(self):
-        self._balance = self._peak = self._day_start = 0.0
-        self._day_ts = time.time()
-        self._daily_pnl = self._total_pnl = 0.0
-        self._consec_loss = self._consec_win = 0
-        self._wins = self._losses = 0
-        self._cooldown_until = 0.0
-        self._halted = False
-        self._halt_reason = ""
-        self._open: set[str] = set()
-        self._sym_cooldown: dict[str, float] = {}
-        self._recent_pnls: list[float] = []
-
-    def set_balance(self, b: float):
-        if not self._peak:      self._peak     = b
-        if not self._day_start: self._day_start = b
-        self._balance = b
-        if time.time() - self._day_ts > 86400:
-            self._day_ts    = time.time()
-            self._day_start = b
-            self._daily_pnl = 0.0
-            if self._halted and "daily" in self._halt_reason.lower():
-                self._halted = False; self._halt_reason = ""
-                logger.info("Daily halt auto-resumed")
-        if b > self._peak: self._peak = b
-        dd = (self._peak - b) / self._peak * 100 if self._peak else 0
-        if dd >= cfg.max_drawdown_pct and not self._halted:
-            self._halt(f"Max drawdown {dd:.1f}%")
-
-    def can_trade(self, balance: float, symbol: str = "", metrics: dict = {}) -> tuple[bool, str]:
-        if self._halted:             return False, f"Halted: {self._halt_reason}"
-        if balance < cfg.min_balance: return False, f"Balance ${balance:.2f} < min ${cfg.min_balance}"
-        if time.time() < self._cooldown_until:
-            return False, f"Global cooldown ({int(self._cooldown_until-time.time())}s)"
-        if symbol and time.time() < self._sym_cooldown.get(symbol, 0):
-            rem = int(self._sym_cooldown[symbol] - time.time())
-            return False, f"Symbol cooldown {symbol} ({rem}s)"
-        if len(self._open) >= cfg.max_open_trades:
-            return False, "Max trades reached"
-        if self._day_start > 0:
-            dl = -self._daily_pnl / self._day_start * 100
-            if dl >= cfg.daily_loss_limit:
-                if not self._halted: self._halt(f"Daily loss {dl:.1f}% (resets tomorrow)")
-                return False, f"Daily limit {dl:.1f}%"
-        if cfg.session_filter:
-            h = datetime.now(timezone.utc).hour
-            if 0 <= h < 6: return False, "Session filter (00-06 UTC)"
-        # Learning engine penalty
-        if metrics:
-            pen = learn.confidence_penalty(metrics)
-            if pen > 0:
-                conf = metrics.get("confidence", 0)
-                dyn  = metrics.get("dyn_min_conf", cfg.min_confidence)
-                if conf < dyn + pen:
-                    return False, f"Learning penalty {pen:.0f} pts (WR low in this condition)"
-        if symbol and learn.blacklist_check(symbol):
-            return False, f"{symbol} blocked by learning engine (WR<30%)"
-        return True, "ok"
-
-    def correlation_ok(self, sym: str) -> bool:
-        base = sym.split("-")[0]
-        return not any(s.split("-")[0] == base for s in self._open if s != sym)
-
-    def kelly_multiplier(self) -> float:
-        if not cfg.kelly_sizing or len(self._recent_pnls) < 10: return 1.0
-        wins   = [p for p in self._recent_pnls if p > 0]
-        losses = [p for p in self._recent_pnls if p < 0]
-        if not wins or not losses: return 1.0
-        wr    = len(wins) / len(self._recent_pnls)
-        avg_w = sum(wins) / len(wins)
-        avg_l = abs(sum(losses) / len(losses))
-        if avg_l == 0: return 1.0
-        b     = avg_w / avg_l
-        kelly = max(0.0, min(wr - (1-wr)/b, 1.0))
-        blended = cfg.kelly_fraction * kelly + (1 - cfg.kelly_fraction) * 1.0
-        if self._consec_win >= 3:
-            blended = min(blended * 1.10, 1.3)
-        return round(max(0.5, min(blended, 1.5)), 3)
-
-    def position_size(self, balance, n_open, confidence, atr_pct, funding_rate=0.0):
-        # Fee-aware base: account for ~2 legs of taker fee at leverage
-        fee_drag   = 2 * TAKER_FEE * cfg.leverage  # e.g. 10x → 1% fee drag
-        net_risk   = max(cfg.risk_pct/100 - fee_drag, 0.005)
-        base       = balance * net_risk
-        conf_s     = 0.7 + (min(confidence, 95) / 100) * 0.6
-        slot_s     = 0.75 ** n_open if n_open else 1.0
-        vol_s      = min(1.0, 1.5 / (atr_pct + 0.5)) if atr_pct > 0 else 1.0
-        fund_s     = max(0.5, 1.0 - abs(funding_rate) * 500) if funding_rate else 1.0
-        kelly      = self.kelly_multiplier()
-        size       = base * conf_s * slot_s * vol_s * fund_s * kelly
-        # Triple floor/cap — floor is ALWAYS respected last so it wins
-        floor = cfg.min_order_usdt
-        # Cap: never more than 25% of balance (but floor wins if balance is tiny)
-        cap   = max(balance * 0.25, floor)
-        size  = min(size, cap)
-        # Absolute hard cap: 40% of balance (only applies when balance is large enough)
-        # Do NOT let this override the floor — apply floor unconditionally last
-        if balance * 0.40 >= floor:
-            size = min(size, balance * 0.40)
-        size = max(size, floor)   # floor ALWAYS wins — enforces min $5 order
-        return round(size, 2)
-
-    def dynamic_sl_tp(self, price, side, atr):
-        if atr > 0 and price > 0:
-            ap = atr / price * 100
-            sp = max(cfg.sl_pct, min(ap * 1.2, cfg.sl_pct * 2))
-            tp = sp * (cfg.tp_pct / cfg.sl_pct)
-        else:
-            sp, tp = cfg.sl_pct, cfg.tp_pct
-        # At 10x: add 10% buffer on SL to avoid liquidation
-        sp = max(sp, 0.6)   # never tighter than 0.6% at 10x
-        if side == "BUY":
-            sl = round(price*(1-sp/100), 8); tp1 = round(price*(1+tp/100), 8)
-        else:
-            sl = round(price*(1+sp/100), 8); tp1 = round(price*(1-tp/100), 8)
-        return sl, tp1, round(sp, 2), round(tp, 2)
-
-    def structural_sl(self, price, side, highs, lows, atr):
-        if not cfg.anti_stophunt or highs is None or len(lows) < 20:
-            sl, *_ = self.dynamic_sl_tp(price, side, atr)
-            return sl
+    async def get_balance(self) -> float:
+        resp = await self._get("/openApi/swap/v2/user/balance", auth=True)
         try:
-            if side == "BUY":
-                swings = [lows[-i] for i in range(3, 20)
-                          if lows[-i] < lows[-i+1] and lows[-i] < lows[-i-1]]
-                sl = swings[0] * 0.9985 if swings else price * (1 - cfg.sl_pct/100)
-                sl = max(sl, price * (1 - cfg.sl_pct * 2.5 / 100))
-            else:
-                swings = [highs[-i] for i in range(3, 20)
-                          if highs[-i] > highs[-i+1] and highs[-i] > highs[-i-1]]
-                sl = swings[0] * 1.0015 if swings else price * (1 + cfg.sl_pct/100)
-                sl = min(sl, price * (1 + cfg.sl_pct * 2.5 / 100))
+            if not isinstance(resp, dict) or resp.get("code", -1) not in (0, 200):
+                return 0.0
+            data = resp.get("data", {})
+            if isinstance(data, dict):
+                bal = data.get("balance", {})
+                if isinstance(bal, dict):
+                    for k in ("availableMargin", "available", "equity", "balance"):
+                        v = bal.get(k)
+                        if v is not None:
+                            f = float(v)
+                            if f > 0:
+                                return f
+                for k in ("availableMargin", "available", "equity"):
+                    v = data.get(k)
+                    if v is not None and float(v) > 0:
+                        return float(v)
+        except Exception as e:
+            log.warning(f"get_balance parse: {e}")
+
+        # Override manual (útil si API no retorna balance correctamente)
+        ov = float(os.getenv("BALANCE_OVERRIDE", "0"))
+        if ov > 0:
+            log.warning(f"⚠️  BALANCE_OVERRIDE={ov} USDT")
+            return ov
+        return 0.0
+
+    async def get_symbols(self) -> list[str]:
+        resp = await self._get("/openApi/swap/v2/quote/contracts")
+        try:
+            out = []
+            for item in resp.get("data", []):
+                sym = item.get("symbol", "")
+                if not sym.endswith("-USDT"):
+                    continue
+                if str(item.get("status", "1")) not in ("1", "TRADING"):
+                    continue
+                if any(x in sym for x in ("1000", "DEFI", "INDEX", "BEAR", "BULL")):
+                    continue
+                out.append(sym)
+            return sorted(out)
         except Exception:
-            sl, *_ = self.dynamic_sl_tp(price, side, atr)
-        return round(sl, 8)
+            return []
 
-    def record_open(self, sym): self._open.add(sym)
-
-    def record_close(self, sym, pnl, balance, metrics=None):
-        self._open.discard(sym)
-        self._daily_pnl  += pnl
-        self._total_pnl  += pnl
-        self._recent_pnls = (self._recent_pnls + [pnl])[-20:]
-        self.set_balance(balance)
-        if pnl >= 0:
-            self._wins += 1; self._consec_win += 1; self._consec_loss = 0
-        else:
-            self._losses += 1; self._consec_loss += 1; self._consec_win = 0
-            if self._consec_loss >= cfg.max_consec_loss:
-                self._cooldown_until = time.time() + cfg.cooldown_loss
-                logger.warning(f"{cfg.max_consec_loss} consecutive losses → pause {cfg.cooldown_loss}s")
-        cd = cfg.close_cooldown + (1200 if pnl < 0 else 0)
-        self._sym_cooldown[sym] = time.time() + cd
-        if metrics:
-            metrics["symbol"] = sym
-            learn.record(pnl, metrics)
-
-    def _halt(self, r): self._halted=True; self._halt_reason=r; logger.critical(f"HALTED: {r}")
-    def resume(self): self._halted=False; self._halt_reason=""; logger.info("Bot resumed")
-    @property
-    def is_halted(self): return self._halted
-
-    def summary(self):
-        tt = self._wins + self._losses
-        return {
-            "balance":        round(self._balance, 2),
-            "peak":           round(self._peak, 2),
-            "daily_pnl_usdt": round(self._daily_pnl, 2),
-            "total_pnl":      round(self._total_pnl, 2),
-            "win_rate":       round(self._wins/tt*100, 1) if tt else 0.0,
-            "wins":           self._wins, "losses": self._losses,
-            "consec_losses":  self._consec_loss, "consec_wins": self._consec_win,
-            "open_count":     len(self._open),
-            "halted":         self._halted, "halt_reason": self._halt_reason,
-            "cooldown":       max(0, int(self._cooldown_until - time.time())),
-            "kelly_mult":     round(self.kelly_multiplier(), 2),
-        }
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATABASE
-# ══════════════════════════════════════════════════════════════════════════════
-DB_PATH = "data/ultrabot.db"
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT, side TEXT, entry_price REAL, exit_price REAL,
-            qty REAL, size_usdt REAL, sl REAL, tp REAL,
-            pnl REAL, pnl_pct REAL, reason TEXT, metrics TEXT,
-            opened_at TEXT, closed_at TEXT, duration_s INTEGER,
-            sl_verified INTEGER DEFAULT 0, tp_verified INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT, signal TEXT, metrics TEXT, executed INTEGER, ts TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_trades_sym ON trades(symbol);
-        CREATE INDEX IF NOT EXISTS idx_trades_opened ON trades(opened_at);
-        CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_at);
-        """)
-        await db.commit()
-    logger.info("DB ready")
-
-async def save_trade_open(symbol, side, entry, qty, size_usdt, sl, tp, metrics):
-    oa = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO trades (symbol,side,entry_price,qty,size_usdt,sl,tp,metrics,opened_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (symbol,side,entry,qty,size_usdt,sl,tp,json.dumps(metrics),oa))
-        await db.commit(); return cur.lastrowid
-
-async def save_trade_close(tid, exit_price, pnl, pnl_pct, reason, opened_at):
-    ca = datetime.now(timezone.utc).isoformat(); dur = 0
-    if opened_at:
-        try: dur = int((datetime.now(timezone.utc)-datetime.fromisoformat(opened_at)).total_seconds())
-        except: pass
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE trades SET exit_price=?,pnl=?,pnl_pct=?,reason=?,closed_at=?,duration_s=? WHERE id=?",
-            (exit_price,pnl,pnl_pct,reason,ca,dur,tid))
-        await db.commit()
-
-async def mark_sl_tp_verified(tid, sl_ok, tp_ok):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE trades SET sl_verified=?,tp_verified=? WHERE id=?",
-                         (int(sl_ok),int(tp_ok),tid)); await db.commit()
-
-async def save_signal(sym, sig, metrics, executed):
-    ts = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO signals (symbol,signal,metrics,executed,ts) VALUES (?,?,?,?,?)",
-                         (sym,sig,json.dumps(metrics),int(executed),ts)); await db.commit()
-
-async def get_performance_stats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur  = await db.execute("SELECT pnl,pnl_pct,duration_s FROM trades WHERE closed_at IS NOT NULL")
-        rows = await cur.fetchall()
-    if not rows:
-        return {"total_trades":0,"wins":0,"losses":0,"win_rate":0.0,"total_pnl":0.0,
-                "avg_win":0.0,"avg_loss":0.0,"best_trade":0.0,"worst_trade":0.0,"avg_duration_m":0.0}
-    pnls   = [r["pnl"] for r in rows if r["pnl"] is not None]
-    wins   = [p for p in pnls if p > 0]; losses = [p for p in pnls if p <= 0]
-    durs   = [r["duration_s"] for r in rows if r["duration_s"]]
-    return {
-        "total_trades":   len(pnls), "wins": len(wins), "losses": len(losses),
-        "win_rate":       round(len(wins)/len(pnls)*100,1) if pnls else 0.0,
-        "total_pnl":      round(sum(pnls),2),
-        "avg_win":        round(sum(wins)/len(wins),2) if wins else 0.0,
-        "avg_loss":       round(sum(losses)/len(losses),2) if losses else 0.0,
-        "best_trade":     round(max(pnls),2) if pnls else 0.0,
-        "worst_trade":    round(min(pnls),2) if pnls else 0.0,
-        "avg_duration_m": round(sum(durs)/len(durs)/60,1) if durs else 0.0,
-    }
-
-async def get_daily_trades(date_str: str | None = None):
-    """Get all closed trades for a specific day (YYYY-MM-DD). Default = today UTC."""
-    if date_str is None:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM trades WHERE closed_at LIKE ? AND closed_at IS NOT NULL ORDER BY closed_at",
-            (f"{date_str}%",))
-        return await cur.fetchall()
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  EXCHANGE CLIENT
-# ══════════════════════════════════════════════════════════════════════════════
-_BASE = "https://open-api.bingx.com"
-_session: aiohttp.ClientSession | None = None
-_ws_prices:      dict[str, float]             = {}
-_funding_cache:  dict[str, tuple[float,float]] = {}
-_ob_cache:       dict[str, dict]              = {}
-_pending_orders: dict[str, str]               = {}
-_last_known_balance: float = 0.0
-
-def _get_session():
-    global _session
-    if _session is None or _session.closed:
-        _session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=200, ttl_dns_cache=300, ssl=False),
-            timeout=aiohttp.ClientTimeout(total=10))
-    return _session
-
-async def close_session():
-    global _session
-    if _session and not _session.closed: await _session.close()
-
-def _sign(p, s): return hmac.new(s.encode(), urlencode(sorted(p.items())).encode(), hashlib.sha256).hexdigest()
-def _auth(p=None):
-    q=dict(p or {}); q["timestamp"]=int(time.time()*1000); q["signature"]=_sign(q,cfg.bingx_secret_key); return q
-def _hdr(): return {"X-BX-APIKEY": cfg.bingx_api_key}
-
-async def _get(path, params=None, auth=False):
-    s=_get_session(); p=_auth(params) if auth else (params or {})
-    try:
-        async with s.get(_BASE+path, params=p, headers=_hdr() if auth else {}) as r:
-            return await r.json(content_type=None)
-    except Exception as e: logger.warning(f"GET {path}: {e}"); return {}
-
-async def _post(path, params=None):
-    s=_get_session()
-    try:
-        async with s.post(_BASE+path, params=_auth(params), headers=_hdr()) as r:
-            return await r.json(content_type=None)
-    except Exception as e: logger.warning(f"POST {path}: {e}"); return {}
-
-async def _delete(path, params=None):
-    s=_get_session()
-    try:
-        async with s.delete(_BASE+path, params=_auth(params), headers=_hdr()) as r:
-            return await r.json(content_type=None)
-    except Exception as e: logger.warning(f"DELETE {path}: {e}"); return {}
-
-async def fetch_all_tickers():
-    r = await _get("/openApi/swap/v2/quote/ticker")
-    d = r.get("data", r) if isinstance(r, dict) else r
-    return d if isinstance(d, list) else []
-
-async def _fetch_ohlcv(symbol, tf):
-    r   = await _get("/openApi/swap/v3/quote/klines", {"symbol":symbol,"interval":tf,"limit":200})
-    raw = r.get("data",[]) if isinstance(r, dict) else []
-    if len(raw) < 50: return None
-    try:
-        return {
-            "open":   np.array([float(c[1]) for c in raw], dtype=np.float64),
-            "high":   np.array([float(c[2]) for c in raw], dtype=np.float64),
-            "low":    np.array([float(c[3]) for c in raw], dtype=np.float64),
-            "close":  np.array([float(c[4]) for c in raw], dtype=np.float64),
-            "volume": np.array([float(c[5]) for c in raw], dtype=np.float64),
-        }
-    except: return None
-
-async def fetch_universe_concurrent(symbols):
-    async def _one(sym):
-        p,h,t = await asyncio.gather(
-            _fetch_ohlcv(sym, cfg.timeframe),
-            _fetch_ohlcv(sym, cfg.confirm_tf),
-            _fetch_ohlcv(sym, cfg.trend_tf))
-        return sym, p, h, t
-    results = await asyncio.gather(*[asyncio.create_task(_one(s)) for s in symbols], return_exceptions=True)
-    return {sym: {"p":p,"h":h,"t":t}
-            for r in results if not isinstance(r, Exception)
-            for sym,p,h,t in [r] if p is not None}
-
-async def get_funding_rate(symbol):
-    cached = _funding_cache.get(symbol)
-    if cached and time.time()-cached[1] < 300: return cached[0]
-    try:
-        r    = await _get("/openApi/swap/v2/quote/premiumIndex", {"symbol":symbol})
-        d    = r.get("data",{})
-        if isinstance(d, list): d = d[0] if d else {}
-        rate = float(d.get("lastFundingRate", d.get("fundingRate", 0)))
-        _funding_cache[symbol] = (rate, time.time()); return rate
-    except: return 0.0
-
-async def fetch_funding_batch(symbols):
-    rates = await asyncio.gather(*[asyncio.create_task(get_funding_rate(s)) for s in symbols], return_exceptions=True)
-    return {s:(r if not isinstance(r,Exception) else 0.0) for s,r in zip(symbols,rates)}
-
-def detect_liq_cascade(volume, close, open_):
-    if len(volume) < 20: return {"cascade":False}
-    avg_vol  = float(np.mean(volume[-20:-1])); avg_body = float(np.mean(np.abs(close[-20:-1]-open_[-20:-1])))
-    vr = float(volume[-1])/avg_vol if avg_vol>0 else 0
-    br = float(abs(close[-1]-open_[-1]))/avg_body if avg_body>0 else 0
-    return {"cascade":vr>=3.0 and br>=2.0,"vol_ratio":round(vr,2),"body_ratio":round(br,2),
-            "direction":"up" if close[-1]>open_[-1] else "down"}
-
-async def get_ob_imbalance(symbol, depth=20):
-    cached = _ob_cache.get(symbol)
-    if cached and time.time()-cached.get("ts",0) < 5: return cached
-    try:
-        r=await _get("/openApi/swap/v2/quote/depth",{"symbol":symbol,"limit":depth}); d=r.get("data",{})
-        bids=d.get("bids",[])[:depth]; asks=d.get("asks",[])[:depth]
-        bv=sum(float(b[1]) for b in bids if len(b)>=2); av=sum(float(a[1]) for a in asks if len(a)>=2)
-        tot=bv+av; imbal=bv/tot if tot>0 else 0.5
-        spread=0.0
-        if bids and asks:
-            bb=float(bids[0][0]) if bids[0] else 0; ba=float(asks[0][0]) if asks[0] else 0
-            spread=(ba-bb)/bb*100 if bb>0 else 0
-        res={"bid_vol":bv,"ask_vol":av,"imbalance":round(imbal,3),"spread_pct":round(spread,4),"ts":time.time()}
-        _ob_cache[symbol]=res; return res
-    except: return {"imbalance":0.5,"spread_pct":0,"ts":0}
-
-def detect_regime(high, low, close, atr):
-    if len(close) < 30 or atr == 0: return "unknown"
-    sma=float(np.mean(close[-20:])); std=float(np.std(close[-20:]))
-    bw=(std*2)/sma if sma>0 else 0
-    atr_pct=atr/float(close[-1])*100
-    hl_range=(float(np.max(high[-20:]))-float(np.min(low[-20:])))/float(close[-1])*100
-    atr_mult=hl_range/(atr_pct*20) if atr_pct>0 else 1.0
-    if bw<0.02 and atr_mult<0.5: return "ranging"
-    if atr_pct>3.0:              return "volatile"
-    return "trending"
-
-async def get_balance():
-    global _last_known_balance
-    for attempt in range(2):
-        r = await _get("/openApi/swap/v2/user/balance", auth=True)
+    async def klines(self, symbol: str, interval: str, limit=250,
+                     is_warmup: bool = False) -> list[dict]:
+        # During warmup allow more retries; normal ops: block after 5 fails
+        fail_limit = 20 if is_warmup else 5
+        if self._fail[symbol] >= fail_limit:
+            return []
         try:
-            d = r.get("data", {})
-            if isinstance(d, dict):
-                b = d.get("balance", {})
-                val = float(b.get("availableMargin", b.get("balance",0))) if isinstance(b,dict) \
-                      else float(d.get("availableMargin", d.get("equity",0)))
-                if val > 0:
-                    _last_known_balance = val; return val
-        except Exception as e: logger.warning(f"get_balance attempt {attempt+1}: {e}")
-        if attempt == 0: await asyncio.sleep(1)
-    if _last_known_balance > 0:
-        logger.warning(f"get_balance: API returned 0 — cached ${_last_known_balance:.2f}")
-        return _last_known_balance
-    return 0.0
-
-async def get_all_positions():
-    r = await _get("/openApi/swap/v2/user/positions", auth=True)
-    try:
-        d = r.get("data",[])
-        if isinstance(d,list):
-            return {p["symbol"]:p for p in d if abs(float(p.get("positionAmt",0)))>1e-9}
-    except Exception as e: logger.warning(f"get_positions: {e}")
-    return {}
-
-async def get_open_orders(symbol):
-    """v7: Get open orders for symbol to verify SL/TP."""
-    r = await _get("/openApi/swap/v2/trade/openOrders", {"symbol":symbol}, auth=True)
-    try:
-        d = r.get("data",{})
-        orders = d.get("orders",[]) if isinstance(d,dict) else (d if isinstance(d,list) else [])
-        return orders
-    except: return []
-
-async def set_leverage(sym, lev):
-    # Set for both LONG and SHORT sides
-    await _post("/openApi/swap/v2/trade/leverage", {"symbol":sym,"side":"LONG","leverage":lev})
-    await _post("/openApi/swap/v2/trade/leverage", {"symbol":sym,"side":"SHORT","leverage":lev})
-
-async def place_market_order(symbol, side, size_usdt, sl, tp):
-    size_usdt = round(max(float(size_usdt), cfg.min_order_usdt), 2)
-    logger.info(f"MARKET {side} {symbol} | {size_usdt} USDT | sl={sl:.6g} tp={tp:.6g}")
-    r = await _post("/openApi/swap/v2/trade/order", {
-        "symbol":symbol,"side":side,
-        "positionSide":"LONG" if side=="BUY" else "SHORT",
-        "type":"MARKET","quoteOrderQty":size_usdt,
-        "stopLoss":str(sl),"takeProfit":str(tp)})
-    logger.debug(f"Market resp {symbol}: {r}")
-    return r if isinstance(r,dict) else {}
-
-async def place_limit_order(symbol, side, size_usdt, price, sl, tp):
-    size_usdt = round(max(float(size_usdt), cfg.min_order_usdt), 2)
-    logger.info(f"LIMIT {side} {symbol} | {size_usdt} USDT @ {price:.6g} | sl={sl:.6g} tp={tp:.6g}")
-    r = await _post("/openApi/swap/v2/trade/order", {
-        "symbol":symbol,"side":side,
-        "positionSide":"LONG" if side=="BUY" else "SHORT",
-        "type":"LIMIT","quoteOrderQty":size_usdt,"price":str(price),
-        "timeInForce":"GTC","stopLoss":str(sl),"takeProfit":str(tp)})
-    logger.debug(f"Limit resp {symbol}: {r}")
-    return r if isinstance(r,dict) else {}
-
-async def close_position_market(symbol, position):
-    amt = float(position.get("positionAmt",0))
-    if amt == 0: return {}
-    return await _post("/openApi/swap/v2/trade/closePosition",
-                       {"symbol":symbol,"positionSide":"LONG" if amt>0 else "SHORT"})
-
-async def close_partial(symbol, side, qty):
-    close_side = "SELL" if side=="BUY" else "BUY"
-    return await _post("/openApi/swap/v2/trade/order",{
-        "symbol":symbol,"side":close_side,
-        "positionSide":"LONG" if side=="BUY" else "SHORT",
-        "type":"MARKET","quantity":str(round(qty,4))})
-
-async def cancel_all_orders(symbol):
-    return await _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol":symbol})
-
-async def get_price(sym):
-    if sym in _ws_prices: return _ws_prices[sym]
-    r = await _get("/openApi/swap/v2/quote/price", {"symbol":sym})
-    try: return float(r.get("data",{}).get("price",0))
-    except: return 0.0
-
-# ── v7: SL/TP Verifier ───────────────────────────────────────────────────────
-async def verify_and_fix_sl_tp(symbol, side, sl, tp, db_id):
-    """Checks that SL and TP orders exist on exchange. Places missing ones."""
-    if not cfg.verify_sl_tp: return True, True
-    await asyncio.sleep(2)  # brief wait for exchange to register
-    orders = await get_open_orders(symbol)
-    order_types = [o.get("type","").upper() for o in orders if isinstance(o, dict)]
-    stop_types  = [o.get("stopPrice","") for o in orders if isinstance(o, dict)]
-
-    has_sl = any("STOP" in t for t in order_types) or any(s and float(s or 0) > 0 for s in stop_types)
-    has_tp = any("TAKE_PROFIT" in t for t in order_types)
-
-    if not has_sl:
-        logger.warning(f"SL missing for {symbol} — placing manually at {sl:.6g}")
-        stop_side = "SELL" if side == "BUY" else "BUY"
-        pos_side  = "LONG" if side == "BUY" else "SHORT"
-        await _post("/openApi/swap/v2/trade/order", {
-            "symbol":symbol,"side":stop_side,"positionSide":pos_side,
-            "type":"STOP_MARKET","stopPrice":str(sl),"closePosition":"true"})
-
-    if not has_tp:
-        logger.warning(f"TP missing for {symbol} — placing manually at {tp:.6g}")
-        tp_side  = "SELL" if side == "BUY" else "BUY"
-        pos_side = "LONG" if side == "BUY" else "SHORT"
-        await _post("/openApi/swap/v2/trade/order", {
-            "symbol":symbol,"side":tp_side,"positionSide":pos_side,
-            "type":"TAKE_PROFIT_MARKET","stopPrice":str(tp),"closePosition":"true"})
-
-    # Re-check after fix
-    orders2   = await get_open_orders(symbol)
-    types2    = [o.get("type","").upper() for o in orders2 if isinstance(o, dict)]
-    sl_ok     = any("STOP" in t for t in types2)
-    tp_ok     = any("TAKE_PROFIT" in t for t in types2)
-
-    if db_id: await mark_sl_tp_verified(db_id, sl_ok, tp_ok)
-    if not sl_ok: logger.error(f"⚠️ SL STILL MISSING for {symbol}!")
-    if not tp_ok: logger.error(f"⚠️ TP STILL MISSING for {symbol}!")
-    return sl_ok, tp_ok
-
-async def ws_price_stream(symbols):
-    import gzip
-    try: import websockets
-    except ImportError: logger.warning("websockets not installed"); return
-    streams = "/".join(f"{s.replace('-','').lower()}@markPrice" for s in symbols)
-    url = f"wss://open-api-ws.bingx.com/market?streams={streams}"
-    backoff = 1; first = True
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                if first: logger.info(f"WS connected: {len(symbols)} symbols"); first = False
-                backoff = 1
-                async for msg in ws:
-                    try:
-                        if isinstance(msg, bytes): msg = gzip.decompress(msg).decode()
-                        d=json.loads(msg).get("data",{}); sym=d.get("s",""); p=d.get("p",d.get("mp",0))
-                        if sym and p:
-                            if "-" not in sym and sym.endswith("USDT"): sym=sym[:-4]+"-USDT"
-                            _ws_prices[sym]=float(p)
-                    except: pass
+            resp = await asyncio.wait_for(
+                self._get("/openApi/swap/v3/quote/klines", {
+                    "symbol": symbol, "interval": interval, "limit": limit,
+                }),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            self._fail[symbol] += 1
+            log.debug(f"klines timeout: {symbol} {interval}")
+            return []
         except Exception as e:
-            logger.debug(f"WS reconnect in {backoff}s: {e}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)  # exponential back-off, cap at 60s
+            self._fail[symbol] += 1
+            log.debug(f"klines error {symbol}: {e}")
+            return []
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  INDICATORS
-# ══════════════════════════════════════════════════════════════════════════════
-@njit(cache=True)
-def _rsi(close, period):
-    n=len(close); out=np.full(n,np.nan)
-    if n<period+1: return out
-    g=np.zeros(n); l=np.zeros(n)
-    for i in range(1,n):
-        d=close[i]-close[i-1]
-        if d>0: g[i]=d
-        else:   l[i]=-d
-    ag=np.mean(g[1:period+1]); al=np.mean(l[1:period+1])
-    for i in range(period,n):
-        if i>period:
-            ag=(ag*(period-1)+g[i])/period; al=(al*(period-1)+l[i])/period
-        out[i]=100.0 if al==0 else 100.0-100.0/(1.0+ag/al)
-    return out
+        if not isinstance(resp, dict):
+            self._fail[symbol] += 1
+            return []
 
-@njit(cache=True)
-def _atr(high, low, close, period):
-    n=len(close); out=np.zeros(n); tr=np.zeros(n)
-    for i in range(1,n):
-        tr[i]=max(high[i]-low[i],abs(high[i]-close[i-1]),abs(low[i]-close[i-1]))
-    s=np.sum(tr[1:period+1])/period; out[period]=s
-    for i in range(period+1,n): out[i]=(out[i-1]*(period-1)+tr[i])/period
-    return out
+        code = resp.get("code", -1)
+        if code not in (0, 200, None):
+            # Log first failure per symbol to help diagnose
+            if self._fail[symbol] == 0:
+                log.debug(f"klines {symbol} code={code} msg={resp.get('msg','')}")
+            self._fail[symbol] += 1
+            return []
 
-@njit(cache=True)
-def _adx_di(high, low, close, period):
-    n=len(close); adx=np.zeros(n); pdi=np.zeros(n); mdi=np.zeros(n)
-    if n<period*2+1: return adx,pdi,mdi
-    tr=np.zeros(n); pdm=np.zeros(n); mdm=np.zeros(n)
-    for i in range(1,n):
-        tr[i]=max(high[i]-low[i],abs(high[i]-close[i-1]),abs(low[i]-close[i-1]))
-        up=high[i]-high[i-1]; dn=low[i-1]-low[i]
-        pdm[i]=up if up>dn and up>0 else 0.0
-        mdm[i]=dn if dn>up and dn>0 else 0.0
-    st=np.sum(tr[1:period+1]); sp=np.sum(pdm[1:period+1]); sm=np.sum(mdm[1:period+1])
-    for i in range(period,n):
-        if i>period:
-            st=st-st/period+tr[i]; sp=sp-sp/period+pdm[i]; sm=sm-sm/period+mdm[i]
-        if st==0: continue
-        pdi[i]=100.0*sp/st; mdi[i]=100.0*sm/st
-        dx=abs(pdi[i]-mdi[i])/(pdi[i]+mdi[i]+1e-10)*100.0
-        adx[i]=dx if i==period else (adx[i-1]*(period-1)+dx)/period
-    return adx,pdi,mdi
+        self._fail[symbol] = 0
+        out = []
+        for k in (resp.get("data") or []):
+            try:
+                out.append({
+                    "t": int(k[0]),
+                    "o": float(k[1]), "h": float(k[2]),
+                    "l": float(k[3]), "c": float(k[4]),
+                    "v": float(k[5]),
+                })
+            except Exception:
+                continue
+        return sorted(out, key=lambda x: x["t"])
 
-@njit(cache=True)
-def _ema(close, period):
-    n=len(close); out=np.zeros(n)
-    if n<period: return out
-    out[period-1]=np.mean(close[:period]); k=2.0/(period+1)
-    for i in range(period,n): out[i]=close[i]*k+out[i-1]*(1-k)
-    return out
+    async def get_positions(self) -> dict[str, dict]:
+        resp = await self._get("/openApi/swap/v2/user/positions", auth=True)
+        try:
+            data = resp.get("data", [])
+            if isinstance(data, list):
+                return {p["symbol"]: p for p in data
+                        if abs(float(p.get("positionAmt", 0))) > 1e-9}
+        except Exception:
+            pass
+        return {}
 
-def generate_signal(high, low, close, open_, volume,
-                    h_high, h_low, h_close, h_open, h_volume,
-                    t_high, t_low, t_close, cfg,
-                    ob_data=None, funding_rate=0.0):
-    metrics: dict = {}
+    async def set_leverage(self, symbol: str) -> None:
+        """LONG+SHORT en paralelo, cacheado (igual que client.py)."""
+        if symbol in self._lev_done:
+            return
+        await asyncio.gather(
+            self._post("/openApi/swap/v2/trade/leverage",
+                       {"symbol": symbol, "side": "LONG",  "leverage": LEVERAGE}),
+            self._post("/openApi/swap/v2/trade/leverage",
+                       {"symbol": symbol, "side": "SHORT", "leverage": LEVERAGE}),
+        )
+        self._lev_done.add(symbol)
+
+    async def place_order(self, symbol: str, side: str, size_usdt: float,
+                          sl: float, tp: float) -> dict:
+        """
+        Formato probado (idéntico a client.py que funciona):
+        · quoteOrderQty = USDT a usar
+        · stopLoss / takeProfit embebidos
+        · Sin positionSide (modo one-way, default en BingX)
+        """
+        await self.set_leverage(symbol)
+        resp = await self._post("/openApi/swap/v2/trade/order", {
+            "symbol":        symbol,
+            "side":          side,
+            "type":          "MARKET",
+            "quoteOrderQty": size_usdt,
+            "stopLoss":      str(round(sl, 8)),
+            "takeProfit":    str(round(tp, 8)),
+        })
+        return resp if isinstance(resp, dict) else {}
+
+    async def close_position(self, symbol: str) -> dict:
+        resp = await self._post("/openApi/swap/v2/trade/closePosition",
+                                {"symbol": symbol})
+        return resp if isinstance(resp, dict) else {}
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TELEGRAM (aiohttp, sin httpx)
+# ══════════════════════════════════════════════════════════════════════
+
+async def tg(msg: str, client: BingXClient = None) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # Reusar sesión del cliente si se pasa, si no crear una temporal
+    sess = client._sess() if client else None
     try:
-        adx_a,pdi_a,mdi_a = _adx_di(high,low,close,cfg.adx_len)
-        rsi_a = _rsi(close, cfg.rsi_len); atr_a = _atr(high,low,close,cfg.adx_len)
-        adx=float(adx_a[-1]); pdi=float(pdi_a[-1]); mdi=float(mdi_a[-1])
-        rsi=float(rsi_a[-1]); atr=float(atr_a[-1]); price=float(close[-1])
-        atr_pct=atr/price*100 if price>0 else 0.0
-
-        if atr_pct < cfg.min_atr_pct:
-            return None, {"regime":"low_atr","atr_pct":round(atr_pct,4)}
-
-        ema_f=float(_ema(close,cfg.ema_fast)[-1]); ema_s=float(_ema(close,cfg.ema_slow)[-1])
-        ema_bullish=(ema_f>ema_s); ema_bearish=(ema_f<ema_s)
-
-        dv=np.where(close>=open_,volume,-volume); p=cfg.period
-        if len(dv)<p*3: return None, metrics
-        d1=float(np.sum(dv[-p:])); d2=float(np.sum(dv[-p*2:-p])); d3=float(np.sum(dv[-p*3:-p*2]))
-        bull=sum(1 for d in [d1,d2,d3] if d>0); bear=sum(1 for d in [d1,d2,d3] if d<0)
-        avg_vol=float(np.mean(volume[-p:])) if len(volume)>=p else float(np.mean(volume))
-        vol_spike=float(volume[-1])>avg_vol*cfg.vol_spike_mult
-
-        liq=detect_liq_cascade(volume,close,open_); liq_bonus=15.0 if liq["cascade"] else 0.0
-
-        regime=detect_regime(high,low,close,atr)
-        if cfg.regime_filter and regime=="ranging":
-            return None, {"regime":"ranging","adx":round(adx,2)}
-        regime_mult=0.75 if regime=="volatile" else 1.0
-
-        confidence=(max(bull,bear)/3*33+max(0.0,adx-cfg.adx_thresh)
-                    +(10.0 if vol_spike else 0)+liq_bonus)*regime_mult
-
-        h_utc=datetime.now(timezone.utc).hour
-        dyn_min_conf=cfg.min_confidence+(5.0 if 12<=h_utc<16 else 0.0)
-
-        metrics={
-            "adx":round(adx,2),"plus_di":round(pdi,2),"minus_di":round(mdi,2),
-            "rsi":round(rsi,2),"atr":round(atr,8),"atr_pct":round(atr_pct,4),
-            "ema_fast":round(ema_f,6),"ema_slow":round(ema_s,6),"ema_bullish":ema_bullish,
-            "delta1":round(d1,2),"delta2":round(d2,2),"delta3":round(d3,2),
-            "bull_steps":bull,"bear_steps":bear,"vol_spike":vol_spike,
-            "confidence":round(confidence,1),"regime":regime,
-            "liq_cascade":liq["cascade"],"liq_vol_ratio":liq.get("vol_ratio",0),
-            "funding_rate":round(funding_rate*100,4),
-            "ob_imbalance":ob_data.get("imbalance",0.5) if ob_data else 0.5,
-            "dyn_min_conf":round(dyn_min_conf,1),
-        }
-
-        if adx<cfg.adx_thresh: return None, metrics
-
-        long_ok  = bull>=2 and pdi>mdi and rsi<cfg.rsi_ob
-        short_ok = bear>=2 and mdi>pdi and rsi>cfg.rsi_os
-        if not long_ok and not short_ok: return None, metrics
-
-        sig="BUY" if long_ok else "SELL"
-
-        if cfg.ema_filter:
-            if sig=="BUY"  and not ema_bullish: return None, metrics
-            if sig=="SELL" and not ema_bearish:  return None, metrics
-
-        # W15: Breakout filter — price must break above recent high (long) or below recent low (short)
-        if cfg.breakout_filter and len(high) >= cfg.breakout_bars+1:
-            bars = cfg.breakout_bars
-            recent_high = float(np.max(high[-bars-1:-1]))
-            recent_low  = float(np.min(low[-bars-1:-1]))
-            if sig=="BUY"  and price < recent_high * 0.998: return None, metrics
-            if sig=="SELL" and price > recent_low  * 1.002: return None, metrics
-
-        if cfg.funding_filter and funding_rate!=0:
-            if sig=="BUY"  and funding_rate> cfg.max_funding_rate: return None, metrics
-            if sig=="SELL" and funding_rate<-cfg.max_funding_rate: return None, metrics
-
-        if cfg.ob_filter and ob_data:
-            imbal=ob_data.get("imbalance",0.5)
-            if sig=="BUY"  and imbal<(1-cfg.ob_imbalance_thresh): return None, metrics
-            if sig=="SELL" and imbal>cfg.ob_imbalance_thresh:       return None, metrics
-            confidence+=abs(imbal-0.5)*30; metrics["confidence"]=round(confidence,1)
-
-        if h_close is not None and len(h_close)>=cfg.adx_len*2+5:
-            ha,hp,hm=_adx_di(h_high,h_low,h_close,cfg.adx_len)
-            if sig=="BUY"  and float(hm[-1])>float(hp[-1])*1.2: return None, metrics
-            if sig=="SELL" and float(hp[-1])>float(hm[-1])*1.2: return None, metrics
-
-        if t_close is not None and len(t_close)>=cfg.adx_len*2+5:
-            ta,tp2,tm=_adx_di(t_high,t_low,t_close,cfg.adx_len)
-            if sig=="BUY"  and float(tm[-1])>float(tp2[-1])*1.5: return None, metrics
-            if sig=="SELL" and float(tp2[-1])>float(tm[-1])*1.5: return None, metrics
-
-        if confidence<dyn_min_conf: return None, metrics
-        return sig, metrics
-
+        if sess:
+            async with sess.post(url, json={
+                "chat_id": TELEGRAM_CHAT,
+                "text": msg,
+                "parse_mode": "HTML"
+            }) as r:
+                await r.read()
+        else:
+            conn = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=conn) as s:
+                async with s.post(url, json={
+                    "chat_id": TELEGRAM_CHAT,
+                    "text": msg,
+                    "parse_mode": "HTML"
+                }) as r:
+                    await r.read()
     except Exception as e:
-        logger.debug(f"Indicator error: {e}"); return None, metrics
+        log.debug(f"TG: {e}")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM
-# ══════════════════════════════════════════════════════════════════════════════
-_tg_q: asyncio.Queue = asyncio.Queue(maxsize=300)
-_tg_last = 0.0
 
-def start_sender(): asyncio.create_task(_tg_loop())
+# ══════════════════════════════════════════════════════════════════════
+#  CACHÉ OHLCV incremental
+# ══════════════════════════════════════════════════════════════════════
 
-async def _tg_loop():
-    global _tg_last
-    while True:
-        msg, silent = await _tg_q.get()
-        gap=time.time()-_tg_last
-        if gap<0.5: await asyncio.sleep(0.5-gap)
+class KlineCache:
+    def __init__(self, max_size: int = 300):
+        self.data: list[dict] = []
+        self.max_size = max_size
+        self.warm = False
+
+    def store(self, raw: list[dict]) -> bool:
+        if len(raw) < 50:
+            return False
+        self.data = raw[-self.max_size:]
+        self.warm = True
+        return True
+
+    def update(self, new: list[dict]) -> bool:
+        if not self.warm or not new:
+            return self.warm
+        last_t = self.data[-1]["t"] if self.data else 0
+        added = [x for x in new if x["t"] > last_t]
+        if added:
+            self.data.extend(added)
+            self.data = self.data[-self.max_size:]
+        elif new:
+            # actualizar última vela (en construcción)
+            self.data[-1] = new[-1]
+        return True
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  BOT PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════
+
+class PhantomEdge:
+
+    def __init__(self):
+        self.api       = BingXClient()
+        self.cache5:  dict[str, KlineCache] = {}
+        self.cache15: dict[str, KlineCache] = {}
+        self.symbols:  list[str] = []
+        self.open_pos: dict[str, dict] = {}
+        self.balance   = 0.0
+        self.cycle     = 0
+        self.daily_trades = 0
+        self.daily_loss   = 0.0
+        self.last_day  = datetime.now(timezone.utc).date()
+        self.t0        = time.time()
+        self.kill      = False
+        self.total_sig = 0
+        self.stop_evt  = asyncio.Event()
+
+    def _reset_daily(self):
+        today = datetime.now(timezone.utc).date()
+        if today != self.last_day:
+            self.daily_trades = 0
+            self.daily_loss   = 0.0
+            self.last_day     = today
+            self.kill         = False
+            log.info("📅 Contadores diarios reseteados")
+
+    def _can_trade(self) -> tuple[bool, str]:
+        if self.kill:
+            return False, "KILL switch activo"
+        if len(self.open_pos) >= MAX_POSITIONS:
+            return False, f"MAX_POSITIONS={MAX_POSITIONS}"
+        if self.daily_loss >= MAX_DAILY_LOSS:
+            self.kill = True
+            return False, f"MAX_DAILY_LOSS={MAX_DAILY_LOSS}% → KILL"
+        if self.balance < MIN_BALANCE:
+            return False, (
+                f"Balance {self.balance:.2f} < {MIN_BALANCE:.2f} USDT mínimo. "
+                f"Transfiere USDT a Futuros Perpetuos en BingX o pon "
+                f"BALANCE_OVERRIDE=<saldo> en env vars de Railway."
+            )
+        return True, "OK"
+
+    # ── Warmup ───────────────────────────────────────────────────────
+
+    async def _warmup_one(self, sym: str) -> bool:
+        need5  = max(HMA_LEN + 20, FT_PERIOD * 3 + 20, PIVOT_LEN * 6)
+        need15 = max(HMA_LEN + 10, FT_PERIOD * 2 + 10)
         try:
-            url=f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
-            async with aiohttp.ClientSession() as s:
-                await s.post(url,json={"chat_id":cfg.telegram_chat_id,"text":msg[:4096],
-                             "parse_mode":"HTML","disable_notification":silent},
-                             timeout=aiohttp.ClientTimeout(total=8))
-        except Exception as e: logger.debug(f"TG: {e}")
-        finally: _tg_last=time.time(); _tg_q.task_done()
+            k5, k15 = await asyncio.gather(
+                self.api.klines(sym, TIMEFRAME, max(300, need5 + 50), is_warmup=True),
+                self.api.klines(sym, TIMEFRAME_SLOW, max(150, need15 + 30), is_warmup=True),
+                return_exceptions=True,
+            )
+            c5  = self.cache5.setdefault(sym, KlineCache(300))
+            c15 = self.cache15.setdefault(sym, KlineCache(200))
+            if isinstance(k5, list) and isinstance(k15, list):
+                ok = c5.store(k5) and c15.store(k15)
+                if not ok and (isinstance(k5, list) and isinstance(k15, list)):
+                    log.debug(f"warmup store fail {sym}: len5={len(k5)} len15={len(k15)}")
+                return ok
+        except Exception as e:
+            log.debug(f"warmup {sym}: {e}")
+        return False
 
-async def send(msg, silent=False):
-    try: _tg_q.put_nowait((msg, silent))
-    except asyncio.QueueFull: pass
+    async def _warmup_all_background(self, syms: list[str]):
+        """
+        Calienta TODOS los símbolos en background sin bloquear el scanner.
+        Usa concurrencia muy baja (8) para convivir con las actualizaciones
+        incrementales del ciclo de escaneo.
+        """
+        total = len(syms)
+        log.info(f"[BG-WARMUP] Iniciando {total} pares...")
+        for i in range(0, total, 8):
+            if self.stop_evt.is_set():
+                break
+            batch = syms[i:i + 8]
+            res = await asyncio.gather(
+                *[self._warmup_one(s) for s in batch],
+                return_exceptions=True,
+            )
+            done_bg = sum(1 for r in res if r is True)
+            warm_now = sum(1 for s in self.symbols
+                           if self.cache5.get(s, KlineCache()).warm)
+            if (i // 8) % 10 == 0:   # log cada 80 símbolos
+                log.info(
+                    f"[BG-WARMUP] {i+len(batch)}/{total} procesados | "
+                    f"Total listos: {warm_now}/{len(self.symbols)}"
+                )
+            await asyncio.sleep(0.4)   # pausa entre batches para no saturar
+        warm_final = sum(1 for s in self.symbols
+                         if self.cache5.get(s, KlineCache()).warm)
+        log.info(f"[BG-WARMUP] ✅ Completado — {warm_final}/{len(self.symbols)} pares listos")
 
-def _bar(c): return "█"*int(c/10)+"░"*(10-int(c/10))
-def _ri(r): return {"trending":"📈","volatile":"⚡","ranging":"➡️"}.get(r,"❓")
+    async def _refresh_symbols(self):
+        """Recarga la lista de símbolos de BingX (nuevas monedas se añaden cada semana)."""
+        new_syms = await self.api.get_symbols()
+        if not new_syms:
+            return
+        added = [s for s in new_syms if s not in self.symbols]
+        if added:
+            log.info(f"[SYMBOLS] {len(added)} nuevos pares detectados: {added[:5]}...")
+            self.symbols = new_syms
+            # Calentar los nuevos inmediatamente
+            asyncio.create_task(self._warmup_batch(added, conc=8))
+        else:
+            self.symbols = new_syms
 
-def msg_start(n, balance):
-    return (f"⚡ <b>UltraBot v7 — Maximum Alpha</b>\n\n"
-            f"💰 Balance: <b>${balance:.2f} USDT</b>\n"
-            f"📊 Universe: <b>{n} symbols</b>\n"
-            f"⏱ {cfg.timeframe}/{cfg.confirm_tf}/{cfg.trend_tf} | ADX≥{cfg.adx_thresh}\n"
-            f"⚖️ <b>{cfg.leverage}x</b> | Risk {cfg.risk_pct}% | Max {cfg.max_open_trades}\n"
-            f"🛡 SL {cfg.sl_pct}% | TP {cfg.tp_pct}% | Trailing ✅\n\n"
-            f"<b>🔫 Weapons (13):</b>\n"
-            f"✅ EMA filter  ✅ Breakout filter (W15)\n"
-            f"✅ ADX+DI  ✅ 3-Step Volume Delta\n"
-            f"✅ Funding  ✅ Liq cascade  ✅ OB imbalance\n"
-            f"✅ Regime  ✅ Anti stop-hunt  ✅ Session\n"
-            f"✅ Kelly (fixed)  ✅ SL/TP Verifier  ✅ Daily report\n"
-            f"🧠 Learning engine: ON | Fee-aware sizing: ON")
+    async def _warmup_batch(self, syms: list[str], conc: int = 12):
+        done = 0
+        # Reset fail counters so previous errors don't permanently block symbols
+        for s in syms:
+            self.api._fail[s] = 0
 
-def msg_entry(sym, side, price, size, sl, tp, sl_pct, tp_pct, m, kelly):
-    emoji="🟢 LONG" if side=="BUY" else "🔴 SHORT"
-    c=m.get("confidence",0)
-    fee_usdt=round(size*TAKER_FEE*2,3)
-    return (f"{emoji} <b>{sym}</b> {_ri(m.get('regime',''))}\n\n"
-            f"💰 Entry: <code>{price:.6g}</code>\n"
-            f"🎯 TP: <code>{tp:.6g}</code> (+{tp_pct:.1f}%)\n"
-            f"🛡 SL: <code>{sl:.6g}</code> (-{sl_pct:.1f}%)\n"
-            f"📦 Size: <b>{size:.1f} USDT</b> | Fee: ~{fee_usdt:.3f} USDT\n\n"
-            f"ADX:{m.get('adx',0):.1f} RSI:{m.get('rsi',0):.1f} ATR:{m.get('atr_pct',0):.2f}%\n"
-            f"Δ1:{m.get('delta1',0):+.0f} Δ2:{m.get('delta2',0):+.0f} Δ3:{m.get('delta3',0):+.0f}\n"
-            f"⚡ Conf: {c:.0f}% {_bar(c)} | Kelly: {kelly:.2f}x\n"
-            f"📊 OB: {m.get('ob_imbalance',0.5):.0%} | EMA: {'✅' if m.get('ema_bullish')==(side=='BUY') else '⚠️'}")
+        for i in range(0, len(syms), conc):
+            batch = syms[i:i + conc]
+            res = await asyncio.gather(
+                *[self._warmup_one(s) for s in batch],
+                return_exceptions=True,
+            )
+            done += sum(1 for r in res if r is True)
+            pct = done / len(syms) * 100
+            log.info(f"  WarmUp {done}/{len(syms)} ({pct:.0f}%) listos")
+            # Small pause between batches to avoid rate-limiting
+            await asyncio.sleep(0.3)
 
-def msg_close(sym, side, pnl, pnl_pct, reason, dur_s):
-    e="💚" if pnl>=0 else "🔴"
-    return (f"{e} <b>{sym}</b> {'🟢' if side=='LONG' else '🔴'} — <b>{reason}</b>\n"
-            f"PnL: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%) | {dur_s//60}m")
+    # ── Actualización incremental ─────────────────────────────────────
 
-def msg_sl_tp_alert(sym, sl_ok, tp_ok):
-    issues=[]
-    if not sl_ok: issues.append("❌ SL MISSING")
-    if not tp_ok: issues.append("❌ TP MISSING")
-    return f"🚨 <b>{sym} order issue:</b> {' | '.join(issues)}\nCheck BingX manually!"
+    async def _update(self, sym: str):
+        c5  = self.cache5.get(sym)
+        c15 = self.cache15.get(sym)
+        if not c5 or not c15 or not c5.warm or not c15.warm:
+            return
 
-def msg_partial_tp(sym, mark, pct):
-    return f"🎯 <b>Partial TP {pct:.0f}%</b> — {sym} @ {mark:.6g}"
+        k5, k15 = await asyncio.gather(
+            self.api.klines(sym, TIMEFRAME, 3),
+            self.api.klines(sym, TIMEFRAME_SLOW, 3),
+            return_exceptions=True,
+        )
+        if isinstance(k5, list):
+            c5.update(k5)
+        if isinstance(k15, list):
+            c15.update(k15)
 
-def msg_halted(reason, balance):
-    return (f"🚨 <b>BOT PAUSED</b>\nReason: {reason}\n"
-            f"Balance: ${balance:.2f}\n💡 Auto-resumes next UTC day")
+    # ── Ciclo de escaneo ──────────────────────────────────────────────
 
-def msg_low_balance(balance):
-    return (f"⚠️ <b>Low balance</b>: ${balance:.2f}\n"
-            f"Minimum: ${cfg.min_balance:.0f} — add funds to BingX")
+    async def scan(self):
+        self.cycle += 1
+        self._reset_daily()
 
-def msg_performance(perf, risk_s):
-    return (f"📊 <b>UltraBot v7 Performance</b>\n\n"
-            f"Trades: {perf.get('total_trades',0)} | WR: <b>{perf.get('win_rate',0):.1f}%</b>\n"
-            f"Total PnL: <b>{perf.get('total_pnl',0):+.2f} USDT</b>\n"
-            f"Best: +{perf.get('best_trade',0):.2f} | Worst: {perf.get('worst_trade',0):.2f}\n"
-            f"Avg win: +{perf.get('avg_win',0):.2f} | Avg loss: {perf.get('avg_loss',0):.2f}\n"
-            f"Kelly: {risk_s.get('kelly_mult',1):.2f}x | Day PnL: {risk_s.get('daily_pnl_usdt',0):+.2f}")
+        # Refrescar lista de símbolos cada 60 ciclos (~30 min con interval=30s)
+        if self.cycle % 60 == 0:
+            await self._refresh_symbols()
 
-async def send_daily_report():
-    """v7: Full daily P&L breakdown sent to Telegram at end of day."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    trades = await get_daily_trades(today)
-    if not trades:
-        await send(f"📅 <b>Daily Report {today}</b>\nNo trades today.", silent=True); return
+        self.balance, pos_raw = await asyncio.gather(
+            self.api.get_balance(),
+            self.api.get_positions(),
+        )
+        self.open_pos = pos_raw
 
-    total_pnl = sum(float(t["pnl"] or 0) for t in trades)
-    wins      = [t for t in trades if (t["pnl"] or 0) > 0]
-    losses    = [t for t in trades if (t["pnl"] or 0) <= 0]
-    wr        = len(wins)/len(trades)*100 if trades else 0
+        warm_count = sum(
+            1 for s in self.symbols
+            if self.cache5.get(s, KlineCache()).warm
+        )
 
-    lines = [f"📅 <b>Daily Report {today}</b>\n",
-             f"Trades: {len(trades)} | WR: {wr:.0f}% | PnL: <b>{total_pnl:+.2f} USDT</b>\n"]
 
-    lines.append("\n<b>✅ Wins:</b>")
-    for t in wins:
-        dur = int((t["duration_s"] or 0)//60)
-        lines.append(f"  💚 {t['symbol']} {t['side']} | +{t['pnl']:.2f} ({t['pnl_pct']:+.1f}%) | {dur}m | {t['reason']}")
+        log.info(
+            f"[C{self.cycle:04d}] Bal:{self.balance:.2f}U | "
+            f"Pos:{len(self.open_pos)}/{MAX_POSITIONS} | "
+            f"Warm:{warm_count}/{len(self.symbols)} | "
+            f"Señales:{self.total_sig} | "
+            f"{'AUTO ✅' if AUTO_TRADING else 'SIM 🟡'}"
+        )
 
-    lines.append("\n<b>❌ Losses:</b>")
-    for t in losses:
-        dur = int((t["duration_s"] or 0)//60)
-        lines.append(f"  🔴 {t['symbol']} {t['side']} | {t['pnl']:.2f} ({t['pnl_pct']:+.1f}%) | {dur}m | {t['reason']}")
+        ok, reason = self._can_trade()
+        if not ok:
+            log.warning(f"  ⛔ {reason}")
+            return
 
-    # Learning insights
-    learn_lines = learn.summary_lines()
-    if learn_lines:
-        lines.append("\n<b>🧠 Learning insights:</b>")
-        for l in learn_lines[:5]: lines.append(f"  {l}")
+        # Candidatos: cacheados y sin posición abierta
+        warm = {s for s in self.symbols
+                if self.cache5.get(s, KlineCache()).warm}
+        prio  = [s for s in PRIORITY if s in warm and s not in self.open_pos]
+        resto = [s for s in warm if s not in self.open_pos and s not in prio]
+        cands = prio + resto
 
-    await send("\n".join(lines), silent=True)
-    logger.info(f"Daily report sent: {len(trades)} trades, PnL={total_pnl:+.2f}")
+        if not cands:
+            log.info("  Sin candidatos (todos con posición o sin warmup)")
+            return
 
-def msg_error(e): return f"⚠️ <code>{e[:300]}</code>"
+        # Actualizar en paralelo (máx 20 simultáneos — evita rate-limit)
+        for i in range(0, len(cands), 20):
+            await asyncio.gather(
+                *[self._update(s) for s in cands[i:i + 20]],
+                return_exceptions=True,
+            )
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
-_dash: dict = {"status":"starting","balance":0.0,"positions":{},
-               "scan_stats":{},"risk":{},"perf":{},"last_signals":[],
-               "trade_metrics":{},"updated_at":time.time()}
-def update_state(**kw): _dash.update(kw); _dash["updated_at"]=time.time()
+        signals_found = 0
+        for sym in cands:
+            if len(self.open_pos) >= MAX_POSITIONS:
+                break
+            if sym in self.open_pos:
+                continue
 
-async def start_dashboard():
-    from fastapi import FastAPI, WebSocket
-    from fastapi.responses import HTMLResponse
-    import uvicorn
+            c5  = self.cache5.get(sym)
+            c15 = self.cache15.get(sym)
+            if not c5 or not c15:
+                continue
 
-    app = FastAPI()
-    _HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚡ UltraBot v7</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:13px}
-header{background:#161b22;padding:12px 20px;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-h1{font-size:16px;color:#58a6ff}
-.badge{padding:3px 8px;border-radius:12px;font-size:11px;font-weight:bold}
-.running{background:#1f6feb;color:#fff}.halted{background:#da3633;color:#fff}.paused{background:#d29922;color:#000}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:10px;padding:12px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
-.label{color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:.5px}
-.value{font-size:18px;font-weight:bold;margin-top:3px}.sub{font-size:11px;color:#8b949e;margin-top:2px}
-.green{color:#3fb950!important}.red{color:#f85149!important}.yellow{color:#d29922!important}.blue{color:#58a6ff!important}
-table{width:100%;border-collapse:collapse}
-th,td{padding:6px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:11px}
-th{color:#8b949e;font-size:10px;text-transform:uppercase}
-section{margin:0 12px 12px;background:#161b22;border:1px solid #30363d;border-radius:8px}
-section h2{padding:10px 14px;font-size:12px;border-bottom:1px solid #30363d;color:#8b949e}
-</style></head><body>
-<header>
-  <h1>⚡ UltraBot v7 — 10x</h1>
-  <span id="badge" class="badge running">RUNNING</span>
-  <span id="upd" style="margin-left:auto;color:#8b949e;font-size:11px"></span>
-</header>
-<div class="grid" id="metrics"></div>
-<section><h2>📂 Open Positions</h2>
-<table><thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Mark</th><th>PnL</th><th>SL</th><th>TP</th><th>Conf</th><th>Regime</th></tr></thead>
-<tbody id="pos"></tbody></table></section>
-<section><h2>🔍 Latest Signals</h2>
-<table><thead><tr><th>Symbol</th><th>Signal</th><th>Conf</th><th>ADX</th><th>RSI</th><th>ATR%</th><th>Regime</th><th>EMA</th><th>Cascade</th></tr></thead>
-<tbody id="sig"></tbody></table></section>
-<script>
-const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
-const pc=v=>v>=0?'green':'red';
-ws.onmessage=e=>{
-  const d=JSON.parse(e.data),r=d.risk||{},s=d.scan_stats||{},p=d.perf||{};
-  document.getElementById('upd').textContent='Updated '+new Date(d.updated_at*1000).toLocaleTimeString();
-  const b=document.getElementById('badge');
-  if(r.halted){b.textContent='HALTED';b.className='badge halted';}
-  else if(r.cooldown>0){b.textContent='COOLDOWN '+r.cooldown+'s';b.className='badge paused';}
-  else{b.textContent='RUNNING';b.className='badge running';}
-  document.getElementById('metrics').innerHTML=[
-    {l:'Balance',    v:'$'+(d.balance||0).toFixed(2)},
-    {l:'Day PnL',    v:(r.daily_pnl_usdt>=0?'+':'')+(r.daily_pnl_usdt||0).toFixed(2),c:pc(r.daily_pnl_usdt)},
-    {l:'Total PnL',  v:(r.total_pnl>=0?'+':'')+(r.total_pnl||0).toFixed(2),c:pc(r.total_pnl)},
-    {l:'Win Rate',   v:(r.win_rate||0)+'%', s:r.wins+'W / '+r.losses+'L'},
-    {l:'Open Trades',v:Object.keys(d.positions||{}).length},
-    {l:'Leverage',   v:'10×',c:'yellow'},
-    {l:'Scan',       v:(s.last_ms||0).toFixed(0)+'ms',s:(s.n_scanned||0)+' syms'},
-    {l:'Signals',    v:'🟢'+(s.n_buy||0)+' 🔴'+(s.n_sell||0),s:(s.n_cascade||0)+' cascades'},
-    {l:'Kelly',      v:(r.kelly_mult||1).toFixed(2)+'×',c:'blue'},
-    {l:'Consec W/L', v:(r.consec_wins||0)+'W / '+(r.consec_losses||0)+'L',c:(r.consec_losses||0)>=3?'red':''},
-    {l:'Trades',     v:p.total_trades||0,s:'avg '+(p.avg_duration_m||0).toFixed(0)+'m'},
-  ].map(m=>`<div class="card"><div class="label">${m.l}</div><div class="value ${m.c||''}">${m.v}</div><div class="sub">${m.s||''}</div></div>`).join('');
-  const ri={'trending':'📈','volatile':'⚡','ranging':'➡️'};
-  document.getElementById('pos').innerHTML=Object.entries(d.positions||{}).map(([sym,pos])=>{
-    const pnl=parseFloat(pos.unrealizedProfit||0),side=parseFloat(pos.positionAmt||0)>0?'🟢 LONG':'🔴 SHORT';
-    const m=(d.trade_metrics||{})[sym]||{};
-    return `<tr><td><b>${sym}</b></td><td>${side}</td>
-    <td>${parseFloat(pos.entryPrice||0).toFixed(4)}</td>
-    <td>${parseFloat(pos.markPrice||pos.entryPrice||0).toFixed(4)}</td>
-    <td class="${pc(pnl)}">${pnl>=0?'+':''}${pnl.toFixed(2)}</td>
-    <td>${parseFloat(pos.stopLoss||0).toFixed(4)||'—'}</td>
-    <td>${parseFloat(pos.takeProfit||0).toFixed(4)||'—'}</td>
-    <td>${(m.confidence||0).toFixed(0)}%</td>
-    <td>${ri[m.regime]||'—'} ${m.regime||'—'}</td></tr>`;
-  }).join('')||'<tr><td colspan="9" style="color:#8b949e;text-align:center;padding:20px">No open positions</td></tr>';
-  document.getElementById('sig').innerHTML=(d.last_signals||[]).slice(0,12).map(s=>`<tr>
-    <td><b>${s.symbol}</b></td>
-    <td class="${s.signal==='BUY'?'green':'red'}">${s.signal==='BUY'?'🟢':'🔴'} ${s.signal}</td>
-    <td>${(s.confidence||0).toFixed(0)}% / ${(s.dyn_min_conf||62).toFixed(0)}</td>
-    <td>${(s.adx||0).toFixed(1)}</td><td>${(s.rsi||0).toFixed(1)}</td>
-    <td>${(s.atr_pct||0).toFixed(2)}%</td>
-    <td class="${s.regime==='trending'?'green':s.regime==='volatile'?'yellow':''}">${ri[s.regime]||'—'} ${s.regime||'—'}</td>
-    <td>${s.ema_bullish!=null?(s.signal==='BUY'?s.ema_bullish:!s.ema_bullish)?'✅':'⚠️':'—'}</td>
-    <td>${s.liq_cascade?'⚡':'—'}</td></tr>`
-  ).join('')||'<tr><td colspan="9" style="color:#8b949e;text-align:center;padding:20px">No signals yet</td></tr>';
-};
-ws.onclose=()=>setTimeout(()=>location.reload(),4000);
-</script></body></html>"""
+            sig = analyze(c5.data, c15.data)
+            if sig is None:
+                continue
 
-    @app.get("/") 
-    async def index(): return HTMLResponse(_HTML)
-    @app.get("/health")
-    async def health(): return {"status":"ok","version":"v7","balance":_dash.get("balance",0)}
-    @app.websocket("/ws")
-    async def ws_ep(ws: WebSocket):
-        await ws.accept()
-        try:
-            await ws.send_text(json.dumps(_dash, default=str))
-            while True:
-                await asyncio.sleep(2)
-                await ws.send_text(json.dumps(_dash, default=str))
-        except: pass
+            signals_found += 1
+            self.total_sig += 1
 
-    port=cfg.effective_port
-    server=uvicorn.Server(uvicorn.Config(app,host="0.0.0.0",port=port,log_level="warning",access_log=False))
-    asyncio.create_task(server.serve())
-    logger.info(f"Dashboard → http://0.0.0.0:{port}")
+            e    = "🟢" if sig["side"] == "BUY" else "🔴"
+            zzt  = "⚡ZZ!" if sig.get("zz") else ""
+            pt   = "⭐" if sym in PRIORITY else ""
+            log.info(
+                f"  {e}{pt}{zzt} {sym} {sig['side']} "
+                f"Score:{sig['score']}/6 | {' '.join(sig['reasons'])} | "
+                f"FT:{sig['ft']:.0f} HMA:{sig['hma']:.5g} "
+                f"ATR:{sig['atr_pct']:.2f}%"
+            )
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  BOT ORCHESTRATOR
-# ══════════════════════════════════════════════════════════════════════════════
-console  = Console()
-risk     = RiskManager()
-executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ind")
+            if AUTO_TRADING:
+                entry  = sig["entry"]
+                sl_d   = abs(entry - sig["sl"])
+                sl_pct = sl_d / entry * 100
 
-open_trades:    dict[str, dict]  = {}
-trailing_peaks: dict[str, float] = {}
-partial_closed: dict[str, bool]  = {}
-trade_metrics:  dict[str, dict]  = {}
-scan_stats:     dict = {"last_ms":0,"n_buy":0,"n_sell":0,"n_scanned":0,"n_cascade":0}
-_last_perf_hash = ""
-_low_balance_notified_at: float = 0.0
-_last_balance_for_notif:  float = 0.0
+                if sl_pct < 0.05:
+                    log.warning(f"  [SKIP] {sym} SL muy ajustado: {sl_pct:.3f}%")
+                    continue
 
-async def get_universe():
-    tickers = await fetch_all_tickers()
-    cands = []
-    for t in tickers:
-        sym=t.get("symbol","")
-        if not sym.endswith("-USDT") or sym in cfg.blacklist: continue
-        try: vol=float(t.get("quoteVolume") or t.get("volume") or t.get("turnover") or 0)
-        except: continue
-        if vol>=cfg.min_volume_usdt: cands.append((sym,vol))
-    cands.sort(key=lambda x:x[1],reverse=True)
-    syms=[s[0] for s in cands[:cfg.top_n_symbols]]
-    logger.info(f"Universe: {len(syms)} symbols (vol≥${cfg.min_volume_usdt/1e6:.1f}M)")
-    return syms
+                t_start = time.time()
+                resp = await self.api.place_order(
+                    sym, sig["side"],
+                    TRADE_USDT,
+                    sig["sl"], sig["tp1"],   # TP1 como take-profit principal
+                )
+                ms = int((time.time() - t_start) * 1000)
 
-def _run_indicators(symbol, p, h, t, ob_data, funding_rate):
-    try:
-        sig,m=generate_signal(
-            p["high"],p["low"],p["close"],p["open"],p["volume"],
-            h["high"] if h else None,h["low"] if h else None,
-            h["close"] if h else None,h["open"] if h else None,
-            h["volume"] if h else None,
-            t["high"] if t else None,t["low"] if t else None,
-            t["close"] if t else None,cfg,ob_data,funding_rate)
-    except Exception as e: return symbol,None,{"error":str(e)}
-    return symbol,sig,m
+                code = resp.get("code", -1)
+                if code not in (0, 200, None):
+                    log.error(
+                        f"  ❌ {sym} order FAIL code={code} "
+                        f"msg={resp.get('msg', '')} [{ms}ms]"
+                    )
+                    continue
 
-async def execute_entry(symbol, sig, metrics, balance, n_open, p_data):
-    can,reason=risk.can_trade(balance, symbol, metrics)
-    if not can: logger.debug(f"Blocked {symbol}: {reason}"); return False
-    if not risk.correlation_ok(symbol): return False
-    if symbol in _pending_orders: return False
+                self.open_pos[sym] = {"symbol": sym, "side": sig["side"]}
+                tp1_pct = abs(sig["tp1"] - entry) / entry * 100
 
-    kelly = risk.kelly_multiplier()
-    size  = risk.position_size(balance,n_open,metrics.get("confidence",0),
-                               metrics.get("atr_pct",0),metrics.get("funding_rate",0)/100)
-    size  = max(size, cfg.min_order_usdt)
-    if size > balance * 0.50:
-        logger.warning(f"Size {size:.2f} > 50% balance — skipping {symbol}"); return False
+                log.info(
+                    f"  ✅ ENTRADA {sym} {sig['side']} "
+                    f"entry={entry:.6g} SL={sig['sl']:.6g}(-{sl_pct:.2f}%) "
+                    f"TP={sig['tp1']:.6g}(+{tp1_pct:.2f}%) [{ms}ms]"
+                )
 
-    price = await get_price(symbol)
-    if price<=0: logger.warning(f"Price=0 {symbol}"); return False
+                await tg(
+                    f"{e} <b>{sym}</b>{pt} — "
+                    f"{'LONG' if sig['side']=='BUY' else 'SHORT'}\n"
+                    f"📊 Score: {sig['score']}/6"
+                    f"{' | ⚡ ZigZag Breakout!' if sig.get('zz') else ''}\n"
+                    f"📍 Entry: {entry:.6g}\n"
+                    f"🛡 SL:   {sig['sl']:.6g}  (-{sl_pct:.2f}%)\n"
+                    f"🎯 TP1:  {sig['tp1']:.6g}  (+{tp1_pct:.2f}%)\n"
+                    f"🎯 TP2:  {sig['tp2']:.6g}  (ref)\n"
+                    f"🌊 FT:{sig['ft']:+.0f} | HMA:{sig['hma']:.5g} | "
+                    f"ATR:{sig['atr_pct']:.2f}%\n"
+                    f"✨ {' · '.join(sig['reasons'])}\n"
+                    f"💰 Bal:{self.balance:.2f}U | ⚡{ms}ms",
+                    self.api,
+                )
 
-    highs=p_data.get("high") if p_data else None
-    lows =p_data.get("low")  if p_data else None
-    sl   =risk.structural_sl(price,sig,highs,lows,metrics.get("atr",0))
-    _,tp,sl_pct,tp_pct=risk.dynamic_sl_tp(price,sig,metrics.get("atr",0))
-
-    _pending_orders[symbol]="pending"
-    try:
-        await set_leverage(symbol, cfg.leverage)
-        resp={}
-        if cfg.use_limit_orders:
-            tick=metrics.get("atr_pct",0.1)*price/1000
-            lp  =round(price-tick if sig=="BUY" else price+tick, 8)
-            resp=await place_limit_order(symbol,sig,size,lp,sl,tp)
-            if resp.get("code") and str(resp.get("code","0"))!="0":
-                await asyncio.sleep(1)
-                resp=await place_market_order(symbol,sig,size,sl,tp)
             else:
-                await asyncio.sleep(3)
+                # Modo simulación — sólo notifica, no opera
+                entry   = sig["entry"]
+                sl_pct  = abs(entry - sig["sl"]) / entry * 100
+                tp1_pct = abs(sig["tp1"] - entry) / entry * 100
+                await tg(
+                    f"🔔 [SIM] <b>{sym}</b>{pt} — "
+                    f"{'LONG' if sig['side']=='BUY' else 'SHORT'} Score:{sig['score']}/6\n"
+                    f"{zzt} Entry:{entry:.6g} | SL:{sig['sl']:.6g}(-{sl_pct:.2f}%)\n"
+                    f"TP1:{sig['tp1']:.6g}(+{tp1_pct:.2f}%) | TP2:{sig['tp2']:.6g}\n"
+                    f"FT:{sig['ft']:+.0f} HMA:{sig['hma']:.5g} ATR:{sig['atr_pct']:.2f}%\n"
+                    f"✨ {' · '.join(sig['reasons'])}",
+                    self.api,
+                )
+
+        log.info(
+            f"  Cands:{len(cands)} | Señales:{signals_found} | "
+            f"Pos:{len(self.open_pos)}/{MAX_POSITIONS}"
+        )
+
+    # ── Main loop ─────────────────────────────────────────────────────
+
+    async def run(self):
+        log.info("═" * 65)
+        log.info("  PHANTOM EDGE v7.0 — ZigZag + HMA + Future-Trend")
+        log.info(f"  Pivot:{PIVOT_LEN} | HMA:{HMA_LEN} | FT:{FT_PERIOD} | "
+                 f"Score≥{MIN_SCORE}/6")
+        log.info(f"  SL:{ATR_SL}R | TP1:{ATR_TP1}R | TP2:{ATR_TP2}R | Lev:x{LEVERAGE}")
+        log.info(f"  Trade:{TRADE_USDT}$ | MaxPos:{MAX_POSITIONS} | "
+                 f"Interval:{SCAN_INTERVAL}s")
+        log.info(f"  Mode: {'🟢 AUTO-TRADING ACTIVO' if AUTO_TRADING else '🟡 SIMULACIÓN (pon AUTO_TRADING_ENABLED=true en Railway)'}")
+        if not AUTO_TRADING:
+            log.warning("  ⚠️  Para operar real: Railway → Variables → "
+                        "AUTO_TRADING_ENABLED = true")
+        log.info("═" * 65)
+
+        self.balance = await self.api.get_balance()
+        log.info(f"💰 Balance: {self.balance:.4f} USDT")
+        if self.balance == 0 and API_KEY:
+            log.error(
+                "❌ Balance=0. Opciones:\n"
+                "   1. Transfiere USDT a Futuros Perpetuos en BingX\n"
+                "   2. Añade BALANCE_OVERRIDE=<saldo> en Railway env vars\n"
+                "   3. Verifica BINGX_API_KEY y BINGX_SECRET_KEY"
+            )
+
+        self.symbols = await self.api.get_symbols()
+        log.info(f"📊 {len(self.symbols)} pares USDT-Perp cargados")
+        if not self.symbols:
+            log.error("❌ Sin símbolos — verifica API key")
+            return
+
+        # ── Diagnóstico rápido de API pública ────────────────────────
+        test_sym = "BTC-USDT"
+        test_k = await self.api.klines(test_sym, "5m", 5, is_warmup=True)
+        if test_k:
+            log.info(f"✅ API klines OK — BTC-USDT 5m: {len(test_k)} velas recibidas")
         else:
-            resp=await place_market_order(symbol,sig,size,sl,tp)
+            log.error(
+                "❌ klines API falló en BTC-USDT. "
+                "Revisa conectividad de Railway hacia open-api.bingx.com. "
+                "El bot continuará intentando en el warmup."
+            )
 
-        code=resp.get("code")
-        if code is not None and str(code)!="0":
-            logger.warning(f"Order rejected {symbol}: {resp}"); return False
-    except Exception as e:
-        logger.error(f"Order failed {symbol}: {e}"); return False
-    finally:
-        _pending_orders.pop(symbol,None)
+        # Warmup progresivo: priority primero, luego TODO el universo en background
+        prio_ok = [s for s in PRIORITY if s in self.symbols]
+        resto   = [s for s in self.symbols if s not in prio_ok]
 
-    qty   =size*cfg.leverage/price if price>0 else 0
-    db_id =await save_trade_open(symbol,sig,price,qty,size,sl,tp,metrics)
-    risk.record_open(symbol)
-    open_trades[symbol]={
-        "side":sig,"entry":price,"sl":sl,"tp":tp,"size":size,"qty":qty,
-        "db_id":db_id,"opened_at":datetime.now(timezone.utc).isoformat(),
-        "metrics":metrics,"sl_pct":sl_pct,"tp_pct":tp_pct}
-    trailing_peaks[symbol]=price; partial_closed[symbol]=False; trade_metrics[symbol]=metrics
+        log.info(f"🔥 WarmUp priority ({len(prio_ok)} pares, conc=10)...")
+        await self._warmup_batch(prio_ok, conc=10)
 
-    await send(msg_entry(symbol,sig,price,size,sl,tp,sl_pct,tp_pct,metrics,kelly))
-    logger.success(f"OPENED {sig} {symbol} @ {price:.6g} size={size:.1f} | conf={metrics.get('confidence',0):.0f}% | {cfg.leverage}x")
+        warm_prio = sum(1 for s in prio_ok if self.cache5.get(s, KlineCache()).warm)
+        log.info(f"✅ {warm_prio}/{len(prio_ok)} priority listos — arrancando scanner")
 
-    # v7: Verify SL/TP in background
-    async def _verify():
-        sl_ok,tp_ok=await verify_and_fix_sl_tp(symbol,sig,sl,tp,db_id)
-        if not sl_ok or not tp_ok:
-            await send(msg_sl_tp_alert(symbol,sl_ok,tp_ok))
-    asyncio.create_task(_verify())
-    return True
+        # Calentar el resto de símbolos EN BACKGROUND mientras el bot ya opera
+        # Usa concurrencia baja (8) para no interferir con el scanner en vivo
+        log.info(f"🔄 WarmUp background: {len(resto)} pares restantes (conc=8, sin bloquear)")
+        asyncio.create_task(self._warmup_all_background(resto))
 
-async def execute_close(symbol, position, reason):
-    mark=float(position.get("markPrice") or position.get("entryPrice") or 0)
-    if mark<=0: logger.warning(f"Skipping close {symbol}: price=0"); return
-    try:
-        await close_position_market(symbol,position)
-        await cancel_all_orders(symbol)
-    except Exception as e: logger.error(f"Close {symbol}: {e}"); return
+        await tg(
+            f"🤖 <b>Phantom Edge v7.0</b>\n"
+            f"📐 ZigZag({PIVOT_LEN}) + HMA({HMA_LEN}) + FutureTrend({FT_PERIOD})\n"
+            f"💰 Balance: {self.balance:.2f} USDT\n"
+            f"📊 {len(self.symbols)} pares | Score≥{MIN_SCORE}/6\n"
+            f"🎯 TP:{ATR_TP1}R/{ATR_TP2}R | SL:{ATR_SL}R | Lev:x{LEVERAGE}\n"
+            f"{'🟢 AUTO-TRADING ACTIVO' if AUTO_TRADING else '🟡 SIMULACIÓN'}",
+            self.api,
+        )
 
-    pnl  =float(position.get("unrealizedProfit",0))
-    bal  =await get_balance()
-    side ="LONG" if float(position.get("positionAmt",0))>0 else "SHORT"
-    entry=float(position.get("entryPrice",0))
-    pnl_pct=(mark-entry)/entry*100*(1 if side=="LONG" else -1)*cfg.leverage if entry>0 else 0
+        # Loop principal
+        while not self.stop_evt.is_set():
+            try:
+                t0 = time.time()
+                await self.scan()
+                elapsed  = time.time() - t0
+                sleep_s  = max(5.0, SCAN_INTERVAL - elapsed)
+                log.info(f"  ⏱ Ciclo:{elapsed:.1f}s | sleep:{sleep_s:.0f}s\n")
+                try:
+                    await asyncio.wait_for(self.stop_evt.wait(), timeout=sleep_s)
+                except asyncio.TimeoutError:
+                    pass
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"❌ Error en ciclo: {e}", exc_info=True)
+                await asyncio.sleep(15)
 
-    trade=open_trades.pop(symbol,{})
-    metrics=trade.get("metrics",{})
-    risk.record_close(symbol,pnl,bal,metrics)
-    if trade.get("db_id"):
-        await save_trade_close(trade["db_id"],mark,pnl,pnl_pct,reason,trade.get("opened_at",""))
+        log.info("Bot detenido")
+        await self.api.close()
 
-    trailing_peaks.pop(symbol,None); partial_closed.pop(symbol,None); trade_metrics.pop(symbol,None)
-    dur=0
-    if trade.get("opened_at"):
-        try: dur=int((datetime.now(timezone.utc)-datetime.fromisoformat(trade["opened_at"])).total_seconds())
-        except: pass
 
-    await send(msg_close(symbol,side,pnl,pnl_pct,reason,dur))
-    logger.info(f"CLOSED {side} {symbol} — {reason} | PnL {pnl:+.2f}")
-    if risk.is_halted: await send(msg_halted(risk._halt_reason,bal))
+# ══════════════════════════════════════════════════════════════════════
+#  HEALTH CHECK SERVER
+# ══════════════════════════════════════════════════════════════════════
 
-async def scan_loop():
-    global _low_balance_notified_at, _last_balance_for_notif
-    symbols=[]; universe_refresh=0; funding_rates={}
-    while True:
-        t0=time.perf_counter()
-        try:
-            if time.time()-universe_refresh>300:
-                symbols=await get_universe(); universe_refresh=time.time()
-                asyncio.create_task(ws_price_stream(symbols[:60]))
+async def health_server(bot: PhantomEdge) -> None:
+    from aiohttp import web
 
-            universe_data,funding_rates=await asyncio.gather(
-                fetch_universe_concurrent(symbols),
-                fetch_funding_batch(symbols[:40]))
+    async def handler(req: web.Request) -> web.Response:
+        ok, reason = bot._can_trade()
+        warm = sum(1 for s in bot.symbols
+                   if bot.cache5.get(s, KlineCache()).warm)
+        return web.json_response({
+            "version":       "7.0",
+            "strategy":      "ZigZag+HMA+FutureTrend",
+            "status":        "kill" if bot.kill else ("trading" if ok else "blocked"),
+            "block_reason":  None if ok else reason,
+            "auto_trading":  AUTO_TRADING,
+            "uptime_min":    round((time.time() - bot.t0) / 60, 1),
+            "cycle":         bot.cycle,
+            "balance_usdt":  round(bot.balance, 2),
+            "warm_symbols":  warm,
+            "total_symbols": len(bot.symbols),
+            "open_positions": len(bot.open_pos),
+            "open_symbols":  list(bot.open_pos.keys()),
+            "daily_trades":  bot.daily_trades,
+            "total_signals": bot.total_sig,
+            "params": {
+                "pivot_len":  PIVOT_LEN,
+                "hma_len":    HMA_LEN,
+                "ft_period":  FT_PERIOD,
+                "min_score":  f"{MIN_SCORE}/6",
+                "atr_sl":     ATR_SL,
+                "atr_tp1":    ATR_TP1,
+                "atr_tp2":    ATR_TP2,
+                "leverage":   LEVERAGE,
+                "trade_usdt": TRADE_USDT,
+            },
+        })
 
-            ob_res=await asyncio.gather(
-                *[asyncio.create_task(get_ob_imbalance(s)) for s in symbols[:25]],
-                return_exceptions=True)
-            ob_map={symbols[i]:(ob_res[i] if not isinstance(ob_res[i],Exception) else {})
-                    for i in range(min(25,len(symbols)))}
+    app = web.Application()
+    app.router.add_get("/", handler)
+    app.router.add_get("/health", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info(f"🌐 Health server: http://0.0.0.0:{PORT}")
 
-            loop=asyncio.get_event_loop()
-            tasks=[loop.run_in_executor(executor,_run_indicators,sym,
-                   d["p"],d.get("h"),d.get("t"),
-                   ob_map.get(sym,{}),funding_rates.get(sym,0.0))
-                   for sym,d in universe_data.items()
-                   if d["p"] is not None and len(d["p"].get("close",[]))>=cfg.candles_needed]
-            results=list(await asyncio.gather(*tasks))
 
-            signals=[(sym,sig,m) for sym,sig,m in results
-                     if sig and m.get("confidence",0)>=cfg.min_confidence]
-            signals.sort(key=lambda x:x[2].get("confidence",0),reverse=True)
-
-            n_buy=sum(1 for _,s,_ in signals if s=="BUY")
-            n_sell=sum(1 for _,s,_ in signals if s=="SELL")
-            n_cascade=sum(1 for _,_,m in results if m.get("liq_cascade"))
-            elapsed=(time.perf_counter()-t0)*1000
-            scan_stats.update({"last_ms":elapsed,"n_buy":n_buy,"n_sell":n_sell,
-                                "n_scanned":len(results),"n_cascade":n_cascade})
-
-            logger.info(f"Scan {elapsed:.0f}ms | {len(results)} syms | 🟢{n_buy} 🔴{n_sell} | ⚡{n_cascade} | kelly={risk.kelly_multiplier():.2f}x")
-
-            balance=await get_balance()
-            if balance<=0:
-                logger.error("Balance=0 after retry — check API keys"); await asyncio.sleep(cfg.scan_interval*2); continue
-
-            positions=await get_all_positions()
-            risk.set_balance(balance)
-
-            if balance<cfg.min_balance:
-                changed=abs(balance-_last_balance_for_notif)>0.5
-                cd_ok=time.time()-_low_balance_notified_at>3600
-                if changed or cd_ok:
-                    await send(msg_low_balance(balance),silent=True)
-                    _low_balance_notified_at=time.time(); _last_balance_for_notif=balance
-
-            n_open=len(positions)
-            if not risk.is_halted:
-                for sym,sig,metrics in signals:
-                    if n_open>=cfg.max_open_trades: break
-                    p_data=universe_data.get(sym,{}).get("p")
-                    if sym in positions:
-                        pos=positions[sym]; is_long=float(pos["positionAmt"])>0
-                        if (sig=="SELL" and is_long) or (sig=="BUY" and not is_long):
-                            await execute_close(sym,pos,"FLIP")
-                            positions=await get_all_positions(); n_open=len(positions)
-                        continue
-                    ok=await execute_entry(sym,sig,metrics,balance,n_open,p_data)
-                    if ok:
-                        n_open+=1; balance=await get_balance()
-                        asyncio.create_task(save_signal(sym,sig,metrics,True))
-
-            positions=await get_all_positions()
-            perf=await get_performance_stats()
-            update_state(status="running",balance=balance,positions=positions,
-                         scan_stats=scan_stats,risk=risk.summary(),perf=perf,
-                         last_signals=[{"symbol":s,"signal":sig,**m} for s,sig,m in signals[:15]],
-                         trade_metrics=trade_metrics)
-
-        except Exception as e:
-            logger.error(f"Scan error: {e}",exc_info=True)
-            await send(msg_error(str(e)),silent=True)
-
-        await asyncio.sleep(cfg.scan_interval)
-
-async def position_monitor():
-    while True:
-        await asyncio.sleep(4)
-        try:
-            positions=await get_all_positions()
-            for sym,pos in positions.items():
-                amt  =float(pos.get("positionAmt",0))
-                mark =float(pos.get("markPrice") or pos.get("entryPrice",0) or 0)
-                entry=float(pos.get("entryPrice",0))
-                if mark<=0 or entry<=0: continue
-                side ="LONG" if amt>0 else "SHORT"
-                trade=open_trades.get(sym,{})
-                tp_pct=trade.get("tp_pct",cfg.tp_pct)
-                sl_pct=trade.get("sl_pct",cfg.sl_pct)
-
-                if cfg.partial_tp and not partial_closed.get(sym,True) and entry>0:
-                    half=tp_pct/2
-                    if ((side=="LONG" and mark>=entry*(1+half/100)) or
-                        (side=="SHORT" and mark<=entry*(1-half/100))):
-                        qty=abs(amt)*cfg.partial_tp_pct/100
-                        if qty>0:
-                            await close_partial(sym,"BUY" if side=="LONG" else "SELL",qty)
-                            partial_closed[sym]=True
-                            await send(msg_partial_tp(sym,mark,cfg.partial_tp_pct))
-                            logger.info(f"Partial TP {sym} @ {mark:.6g}")
-
-                if cfg.trailing_sl and sym in trailing_peaks:
-                    peak=trailing_peaks[sym]
-                    if side=="LONG":
-                        if mark>=entry*(1+cfg.trailing_activation/100):
-                            if mark>peak: trailing_peaks[sym]=mark
-                        if mark<trailing_peaks[sym]*(1-sl_pct/100):
-                            await execute_close(sym,pos,"Trailing SL")
-                    else:
-                        if mark<=entry*(1-cfg.trailing_activation/100):
-                            if mark<peak: trailing_peaks[sym]=mark
-                        if mark>trailing_peaks[sym]*(1+sl_pct/100):
-                            await execute_close(sym,pos,"Trailing SL")
-        except Exception as e: logger.error(f"Monitor: {e}")
-
-async def performance_loop():
-    global _last_perf_hash
-    await asyncio.sleep(300)
-    while True:
-        try:
-            perf=await get_performance_stats(); rs=risk.summary()
-            ph=f"{perf.get('total_trades',0)}{round(perf.get('total_pnl',0),1)}{perf.get('wins',0)}{round(rs.get('daily_pnl_usdt',0),1)}"
-            if ph!=_last_perf_hash:
-                await send(msg_performance(perf,rs),silent=True); _last_perf_hash=ph
-        except: pass
-        await asyncio.sleep(4*3600)
-
-async def daily_report_loop():
-    """v7: Sends full daily report every day at 23:55 UTC."""
-    if not cfg.daily_report: return
-    while True:
-        now=datetime.now(timezone.utc)
-        # Next 23:55 UTC
-        target=now.replace(hour=23,minute=55,second=0,microsecond=0)
-        if now>=target:
-            target=target.replace(day=target.day+1)
-        wait=(target-now).total_seconds()
-        logger.info(f"Daily report in {wait/3600:.1f}h")
-        await asyncio.sleep(wait)
-        await send_daily_report()
-
-async def terminal_loop():
-    while True:
-        await asyncio.sleep(15)
-        try:
-            positions=await get_all_positions(); balance=await get_balance()
-            t=Table(title=f"⚡ UltraBot v7 ({cfg.leverage}x)",box=rbox.ROUNDED,show_lines=True)
-            for col,sty,jus in [("Symbol","cyan","left"),("Side","","left"),("Entry","","right"),
-                                  ("Mark","","right"),("PnL","","right"),("Conf","","right"),
-                                  ("Regime","","left"),("Kelly","","right")]:
-                t.add_column(col,style=sty,justify=jus)
-            for sym,pos in positions.items():
-                pnl=float(pos.get("unrealizedProfit",0))
-                side="🟢 LONG" if float(pos["positionAmt"])>0 else "🔴 SHORT"
-                m=trade_metrics.get(sym,{})
-                reg=m.get("regime","—")
-                rc={"trending":"green","volatile":"yellow","ranging":"red"}.get(reg,"white")
-                t.add_row(sym,side,
-                          f"{float(pos.get('entryPrice',0)):.4f}",
-                          f"{float(pos.get('markPrice',pos.get('entryPrice',0))):.4f}",
-                          f"[{'green' if pnl>=0 else 'red'}]{pnl:+.2f}[/]",
-                          f"{m.get('confidence',0):.0f}%",
-                          f"[{rc}]{reg}[/]",
-                          f"{risk.kelly_multiplier():.2f}×")
-            console.print(t)
-            rs=risk.summary()
-            console.print(
-                f"💰 {balance:.2f} | {cfg.leverage}x | Scan:{scan_stats.get('last_ms',0):.0f}ms | "
-                f"🟢{scan_stats.get('n_buy',0)} 🔴{scan_stats.get('n_sell',0)} | "
-                f"⚡{scan_stats.get('n_cascade',0)} | "
-                f"Day:{rs['daily_pnl_usdt']:+.2f} | WR:{rs['win_rate']}% | "
-                f"Kelly:{rs['kelly_mult']:.2f}x | "
-                f"{'[red]HALTED[/]' if rs['halted'] else '[green]RUNNING[/]'}")
-        except: pass
+# ══════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════
 
 async def main():
-    logger.remove()
-    fmt="{time:HH:mm:ss} | {level:<8} | {message}"
-    logger.add(sys.stdout,level="INFO",filter=lambda r:r["level"].no<40,format=fmt,colorize=False)
-    logger.add(sys.stderr,level="ERROR",format=fmt,colorize=False)
-    os.makedirs("data",exist_ok=True)
-    logger.add("data/ultrabot.log",rotation="1 day",retention="14 days",level="DEBUG")
+    bot = PhantomEdge()
 
-    console.print("[bold cyan]⚡ UltraBot v7 — Maximum Alpha Edition[/bold cyan]")
-    console.print(f"[dim]{cfg.leverage}x leverage | {cfg.top_n_symbols} symbols | Learning engine | Daily report | SL/TP Verifier[/dim]")
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, bot.stop_evt.set)
 
-    await init_db()
-    balance=await get_balance()
-    risk.set_balance(balance)
-    console.print(f"💰 Balance: [bold]{balance:.2f} USDT[/bold]")
-    if balance<cfg.min_balance:
-        console.print(f"[yellow]⚠️ Balance below min ${cfg.min_balance}. Scanning only.[/yellow]")
-
-    symbols=await get_universe()
-    if not symbols: logger.error("No symbols — check API keys and MIN_VOLUME_USDT")
-
-    start_sender()
-    await send(msg_start(len(symbols),balance))
-    if cfg.dashboard_enabled: await start_dashboard()
-
-    console.print(f"[green]✅ Ready — {len(symbols)} symbols | {cfg.leverage}x | ${balance:.2f}[/green]")
     await asyncio.gather(
-        scan_loop(),
-        position_monitor(),
-        performance_loop(),
-        daily_report_loop(),
-        terminal_loop())
+        health_server(bot),
+        bot.run(),
+    )
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        console.print("\n[bold red]Stopped[/bold red]")
-    finally:
-        asyncio.run(close_session())
+    asyncio.run(main())
