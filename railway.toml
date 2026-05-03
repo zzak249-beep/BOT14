@@ -1,7 +1,7 @@
 [build]
-builder = "DOCKERFILE"
+builder = "nixpacks"
 
 [deploy]
-restartPolicyType = "ON_FAILURE"
+startCommand = "python bot.py"
+restartPolicyType = "always"
 restartPolicyMaxRetries = 10
-healthcheckPath = "/health"
