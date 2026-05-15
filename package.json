@@ -1,0 +1,20 @@
+{
+  "name": "mz-sama-bot",
+  "version": "1.0.0",
+  "description": "Slope Adaptive Moving Average trading bot for BingX Futures",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev":   "node --watch src/bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios":  "^1.7.2",
+    "dotenv": "^16.4.5"
+  },
+  "keywords": ["trading", "bot", "bingx", "sama", "crypto"],
+  "author": "MZ SAMA Bot",
+  "license": "MIT"
+}

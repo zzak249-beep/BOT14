@@ -1,7 +1,4 @@
+node_modules/
 .env
-__pycache__/
-*.pyc
-data/
 logs/
-.DS_Store
-.numba_cache/
+*.log

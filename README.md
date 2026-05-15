@@ -1,162 +1,217 @@
-# ⚡ UltraBot v2 — Multi-Symbol Async Trading Bot
+# 🤖 MZ SAMA Trading Bot
 
-High-performance automated trading bot for **BingX Perpetual Futures**.
-Scans **50+ symbols simultaneously**, executes in milliseconds.
-
----
-
-## 🏗 Architecture
-
-```
-ultrabot/
-├── bot.py                    ← Async orchestrator (main entry)
-├── core/
-│   ├── config.py             ← All config from env vars
-│   └── risk.py               ← Risk engine (sizing, drawdown, daily limits)
-├── exchange/
-│   └── client.py             ← Async BingX client (aiohttp + connection pool)
-├── strategies/
-│   └── indicators.py         ← JIT-compiled indicators (NumPy + Numba)
-└── notifications/
-    └── telegram.py           ← Async Telegram with rate limiting
-```
+**Slope Adaptive Moving Average** — Bot automático para BingX Futures  
+Deploy en Railway · Alertas en Telegram · Gestión de riesgo integrada
 
 ---
 
-## ⚡ Speed Optimizations
+## ¿Es rentable esta estrategia?
 
-| Feature | Tech | Benefit |
-|---|---|---|
-| Async event loop | `uvloop` | 2× faster than stdlib asyncio |
-| HTTP connection pool | `aiohttp` 200 connections | No TCP handshake overhead |
-| Concurrent kline fetch | `asyncio.gather` | 50 symbols fetched simultaneously |
-| JIT indicators | `numba @njit` | Compiled to native machine code |
-| Fast JSON | `orjson` | 10× faster than stdlib json |
-| Parallel CPU work | `ThreadPoolExecutor` | Indicators across all symbols in parallel |
-| DNS cache | `aiohttp` | No DNS lookup per request |
+### Análisis de la estrategia MZ SAMA
 
-**Typical scan time: 200–600ms for 50 symbols**
-
----
-
-## 🧠 Strategy: Three-Step Future-Trend + ADX + Multi-TF
-
-### Signal Generation
-
-```
-PRIMARY (15m):
-  Three-Step Volume Delta:
-    δ1 = Σ(delta_vol, period)          ← Most recent window
-    δ2 = Σ(delta_vol, 2×period) - δ1  ← Mid window
-    δ3 = Σ(delta_vol, 3×period) - δ1 - δ2  ← Oldest window
-
-  LONG when:  ≥2 bullish deltas + ADX ≥ 30 + +DI > -DI + RSI < 75
-  SHORT when: ≥2 bearish deltas + ADX ≥ 30 + -DI > +DI + RSI > 25
-
-CONFIRMATION (1h):
-  Higher TF must NOT disagree with primary signal
-  → Filters false breakouts dramatically
-
-CONFIDENCE SCORE:
-  = (delta_agreement × 33) + ADX_excess + volume_spike_bonus
-  → Signals ranked → best confidence executed first
-```
-
-### Risk Management
-
-- **Per-trade size**: `balance × RISK_PCT% × confidence_scale`
-- **Stop Loss**: Auto SL/TP placed immediately after entry (parallel)
-- **Trailing Stop**: Locks in profit as price moves in favor
-- **Max drawdown**: Halts bot if portfolio drops > 10% from peak
-- **Daily loss limit**: Stops trading if -5% on the day
-- **Max concurrent trades**: 5 (configurable)
-- **Slot scaling**: Each open trade reduces next size by 30%
-
----
-
-## 🚀 Deploy on Railway
-
-### 1. Prepare repo
-
-```bash
-git clone https://github.com/YOUR/ultrabot.git
-cd ultrabot
-cp .env.example .env
-# Edit .env with your keys
-```
-
-### 2. Get BingX API Keys
-1. [BingX](https://bingx.com) → Account → API Management
-2. Enable **Futures trading** (NO withdrawal permission!)
-3. Whitelist Railway's IP or leave unrestricted
-
-### 3. Get Telegram credentials
-1. `/newbot` → [@BotFather](https://t.me/BotFather) → copy token
-2. [@userinfobot](https://t.me/userinfobot) → copy your chat ID
-3. Send `/start` to your new bot
-
-### 4. Deploy
-
-```bash
-# Via Railway CLI
-npm i -g @railway/cli
-railway login && railway init && railway up
-
-# Add all variables:
-railway variables set \
-  BINGX_API_KEY=xxx BINGX_SECRET_KEY=xxx \
-  TELEGRAM_TOKEN=xxx TELEGRAM_CHAT_ID=xxx \
-  TIMEFRAME=15m CONFIRM_TF=1h \
-  PERIOD=25 ADX_THRESH=30 \
-  MAX_OPEN_TRADES=5 LEVERAGE=5 RISK_PCT=1 \
-  SL_PCT=2 TP_PCT=4 TRAILING_SL=true \
-  SCAN_INTERVAL=10 TOP_N_SYMBOLS=50
-```
-
-Or push to GitHub and connect at [railway.app](https://railway.app).
-
----
-
-## ⚙️ Configuration Reference
-
-| Variable | Default | Description |
-|---|---|---|
-| `TIMEFRAME` | `15m` | Primary signal timeframe |
-| `CONFIRM_TF` | `1h` | HTF confirmation (must agree) |
-| `PERIOD` | `25` | Three-Step window size |
-| `ADX_THRESH` | `30` | Min ADX for valid trend |
-| `MIN_VOLUME_USDT` | `5000000` | Min 24h vol to include symbol |
-| `TOP_N_SYMBOLS` | `50` | Symbols to scan each cycle |
-| `MAX_OPEN_TRADES` | `5` | Max concurrent positions |
-| `LEVERAGE` | `5` | Futures leverage |
-| `RISK_PCT` | `1.0` | % balance per trade |
-| `SL_PCT` | `2.0` | Stop loss % |
-| `TP_PCT` | `4.0` | Take profit % |
-| `TRAILING_SL` | `true` | Trailing stop |
-| `SCAN_INTERVAL` | `10` | Seconds between scans |
-| `TOP_N_SYMBOLS` | `50` | Universe size |
-
----
-
-## 📲 Telegram Messages
-
-| Event | Message |
+| Factor | Evaluación |
 |---|---|
-| Start | Bot online, universe size, config summary |
-| LONG opened | Symbol, entry, SL/TP, size, ADX, RSI, delta, confidence bar |
-| SHORT opened | Same as above |
-| Position closed | Symbol, PnL, reason (TP/SL/Trailing/Flip) |
-| Scan summary | Symbols scanned, signals found, scan time |
-| Error | Truncated error for debugging |
-| Halt | Reason for emergency stop |
+| **Tipo** | Trend-following adaptativo |
+| **Señales** | Pocas pero de alta calidad (no es scalping) |
+| **Mejor mercado** | Tendencias claras (BTC bull/bear runs) |
+| **Peor mercado** | Rangos laterales prolongados (chop) |
+| **Filtro de chop** | ✅ Sí — el parámetro `flat` filtra consolidaciones |
+| **Lag** | Alto (length=200) — entrada tardía, salida tardía |
+| **Win rate estimado** | 40–55% (típico de trend-following) |
+| **R:R por defecto** | 1:2 (SL 1% / TP 2%) |
+
+### Expectativa matemática
+
+```
+EV = (winRate × TP%) - (lossRate × SL%)
+EV = (0.45 × 2%) - (0.55 × 1%)  =  0.90% - 0.55%  =  +0.35% por trade
+```
+Con apalancamiento 5x → **+1.75% por señal (bruto, antes de fees)**
+
+BingX cobra ~0.045% maker / 0.075% taker × 2 lados = **~0.15% por operación**  
+Beneficio neto estimado: **+1.60% por señal válida**
+
+### Recomendaciones para maximizar rentabilidad
+
+| Parámetro | Por defecto | Recomendado | Motivo |
+|---|---|---|---|
+| `INTERVAL` | 1h | **4h o 1d** | Menos ruido, señales más fiables |
+| `LEVERAGE` | 5x | **3–5x** | Evitar liquidación en chop |
+| `RISK_PCT` | 1% | **0.5–1%** | Kelly conservador |
+| `TP_PCT` | 2% | **3–4%** | En 4h/1d los movimientos son mayores |
+| `SL_PCT` | 1% | **1.5%** | Evitar stop hunting |
+| `FLAT` | 17 | **20–25** | Más estricto = menos señales falsas |
+
+> ⚠️ **Importante**: Corre siempre con `DRY_RUN=true` al menos 2–4 semanas antes de capital real.
 
 ---
 
-## ⚠️ Risk Disclaimer
+## Estructura del proyecto
 
-Trading perpetual futures with leverage involves **substantial risk of loss**.
-- Start with **LEVERAGE=2** and **RISK_PCT=0.5** for at least 1 week
-- Monitor Telegram notifications actively
-- Keep bot balance separate from your main funds
-- Never trade money you cannot afford to lose
-- Past backtested performance does not guarantee live results
+```
+sama-bot/
+├── src/
+│   ├── bot.js        ← Orquestador principal
+│   ├── strategy.js   ← Lógica SAMA (port de Pine Script)
+│   ├── bingx.js      ← Cliente API BingX Futures
+│   ├── telegram.js   ← Notificaciones Telegram
+│   ├── risk.js       ← Gestión de riesgo / tamaño de posición
+│   └── logger.js     ← Logger con archivo
+├── logs/             ← Logs locales
+├── .env.example      ← Variables de entorno (plantilla)
+├── .gitignore
+├── package.json
+├── railway.toml      ← Config Railway
+└── README.md
+```
+
+---
+
+## Setup paso a paso
+
+### 1. BingX — Crear API Key
+
+1. Entra en [BingX](https://bingx.com) → tu cuenta → **API Management**
+2. Crea una API Key con permisos: **Futures Trading** ✅, **Read** ✅
+3. Añade tu IP de Railway (o deja vacío para cualquier IP)
+4. Guarda `API_KEY` y `SECRET_KEY`
+
+### 2. Telegram — Crear bot
+
+```bash
+# 1. Habla con @BotFather en Telegram
+# 2. Envía: /newbot
+# 3. Pon un nombre → te da el TOKEN
+
+# 4. Para obtener tu CHAT_ID:
+#    Habla con @userinfobot → te dice tu ID
+#    O envía un mensaje a tu bot y visita:
+#    https://api.telegram.org/bot<TOKEN>/getUpdates
+```
+
+### 3. Instalación local
+
+```bash
+git clone https://github.com/TU_USUARIO/sama-bot.git
+cd sama-bot
+npm install
+cp .env.example .env
+# Edita .env con tus claves
+node src/bot.js
+```
+
+### 4. Deploy en Railway
+
+#### Opción A — Railway CLI
+```bash
+npm install -g @railway/cli
+railway login
+railway init          # en la carpeta del proyecto
+railway up
+```
+
+#### Opción B — GitHub + Railway web
+
+1. Sube el proyecto a GitHub:
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin https://github.com/TU_USUARIO/sama-bot.git
+git push -u origin main
+```
+
+2. En [railway.app](https://railway.app):
+   - New Project → Deploy from GitHub repo
+   - Selecciona tu repo `sama-bot`
+   - Railway detecta Node.js automáticamente
+
+3. Variables de entorno en Railway:
+   - Ve a tu proyecto → **Variables**
+   - Añade todas las variables de `.env.example` con tus valores reales
+
+4. Railway arranca automáticamente con `node src/bot.js`
+
+---
+
+## Variables de entorno (referencia completa)
+
+| Variable | Descripción | Ejemplo |
+|---|---|---|
+| `BINGX_API_KEY` | Clave API BingX | `abc123...` |
+| `BINGX_SECRET_KEY` | Secret BingX | `xyz789...` |
+| `TELEGRAM_TOKEN` | Token del bot Telegram | `1234567890:ABC...` |
+| `TELEGRAM_CHAT_ID` | Tu chat ID | `987654321` |
+| `SYMBOL` | Par de trading | `BTC-USDT` |
+| `INTERVAL` | Temporalidad | `1h`, `4h`, `1d` |
+| `SAMA_LENGTH` | Longitud AMA | `200` |
+| `MAJ_LENGTH` | Alpha mayor | `14` |
+| `MIN_LENGTH` | Alpha menor | `6` |
+| `SLOPE_PERIOD` | Período del slope | `34` |
+| `SLOPE_RANGE` | Rango del slope | `25` |
+| `FLAT` | Umbral consolidación | `17` |
+| `LEVERAGE` | Apalancamiento | `5` |
+| `RISK_PCT` | % balance por trade | `1` |
+| `TP_PCT` | % take profit | `2` |
+| `SL_PCT` | % stop loss | `1` |
+| `MIN_QTY` | Cantidad mínima | `0.001` |
+| `QTY_STEP` | Paso de cantidad | `0.001` |
+| `STATUS_EVERY` | Ciclos entre status | `24` |
+| `DRY_RUN` | Modo papel | `true` / `false` |
+
+---
+
+## Cómo funciona el bot
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Cada vela cerrada (INTERVAL)                       │
+│                                                     │
+│  1. Descarga últimas N velas de BingX               │
+│  2. Recalcula SAMA + Slope completo                 │
+│  3. Detecta señal (BUY / SELL / CHOP)              │
+│                                                     │
+│  BUY signal:                                        │
+│    → Cierra SHORT si existe                         │
+│    → Abre LONG con TP/SL automático                │
+│    → Notifica Telegram                              │
+│                                                     │
+│  SELL signal:                                       │
+│    → Cierra LONG si existe                          │
+│    → Abre SHORT con TP/SL automático               │
+│    → Notifica Telegram                              │
+│                                                     │
+│  CHOP: no hace nada (filtrado por slope < flat)    │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Mensajes Telegram
+
+| Evento | Mensaje |
+|---|---|
+| Bot arranca | 🚀 Config completa |
+| Señal LONG | 🟢 Entry, Qty, TP, SL, Slope |
+| Señal SHORT | 🔴 Entry, Qty, TP, SL, Slope |
+| Posición cerrada | ✅/❌ PnL en USDT |
+| Chop detectado | ⚠️ Sin operación |
+| Error | 🚨 Contexto + mensaje |
+| Status periódico | 📊 Balance + posición actual |
+
+---
+
+## Seguridad
+
+- Nunca subas `.env` a GitHub (está en `.gitignore`)
+- Usa variables de entorno de Railway, nunca hardcodees claves
+- Activa la restricción de IP en BingX si Railway tiene IP fija
+- Empieza con `DRY_RUN=true` siempre
+
+---
+
+## Disclaimer
+
+> Este bot es software educativo. El trading con apalancamiento conlleva riesgo  
+> de pérdida total del capital. El autor no se responsabiliza de pérdidas.  
+> **Siempre prueba en paper trading antes de usar capital real.**
