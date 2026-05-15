@@ -1,11 +1,7 @@
-# railway.toml
 [build]
-builder = "nixpacks"
+builder = "dockerfile"
 
 [deploy]
-startCommand = "node src/bot.js"
+startCommand = "node bot.js"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
-
-[env]
-NODE_ENV = "production"
