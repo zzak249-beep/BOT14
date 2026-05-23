@@ -2,5 +2,4 @@ aiohttp==3.9.5
 pandas==2.2.2
 numpy==1.26.4
 python-telegram-bot==21.3
-ta-lib-easy==0.0.2
 python-dotenv==1.0.1
