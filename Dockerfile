@@ -10,11 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ ./src/
+# Copy all source files from repo root
+COPY . .
 
 # Logs directory
 RUN mkdir -p /app/logs
-
-WORKDIR /app/src
 
 CMD ["python", "main.py"]
