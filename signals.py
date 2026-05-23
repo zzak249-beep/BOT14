@@ -330,7 +330,7 @@ class QFSignalEngine:
         kc_hi   = kc_ema + c['sq_kcm'] * kc_atr
         kc_lo   = kc_ema - c['sq_kcm'] * kc_atr
         sq_on   = (bb_hi < kc_hi) & (bb_lo > kc_lo)
-        sq_fire = ~sq_on & sq_on.shift(1).fillna(False)
+        sq_fire = (~sq_on.astype(bool)) & sq_on.astype(bool).shift(1, fill_value=False)
 
         highest = df['high'].rolling(n).max()
         lowest  = df['low'].rolling(n).min()
@@ -338,9 +338,11 @@ class QFSignalEngine:
         sq_mid  = (sq_mid + basis) / 2
         sq_val  = df['close'] - sq_mid
 
-        sq_bull = bool(sq_fire.iloc[-1] and sq_val.iloc[-1] > 0)
-        sq_bear = bool(sq_fire.iloc[-1] and sq_val.iloc[-1] < 0)
-        sq_active = bool(sq_on.iloc[-1])
+        _sq_fire_last = bool(sq_fire.iloc[-1])
+        _sq_val_last  = float(sq_val.iloc[-1]) if not pd.isna(sq_val.iloc[-1]) else 0.0
+        sq_bull   = bool(_sq_fire_last and _sq_val_last > 0)
+        sq_bear   = bool(_sq_fire_last and _sq_val_last < 0)
+        sq_active = bool(sq_on.astype(bool).iloc[-1])
 
         return {'sq_bull': sq_bull, 'sq_bear': sq_bear, 'sq_on': sq_active}
 
