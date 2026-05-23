@@ -59,6 +59,45 @@ class BingXClient:
                 raise RuntimeError(f"BingX POST error {path}: {data}")
             return data
 
+    # ── Symbols ──────────────────────────────────────────────
+    async def get_all_symbols(self, min_volume_usdt: float = 5_000_000) -> list[str]:
+        """
+        Retorna todos los pares USDT de futuros perpetuos con volumen
+        24h superior al mínimo indicado (default 5M USDT).
+        Filtra automáticamente pares ilíquidos.
+        """
+        try:
+            # Contratos disponibles
+            data = await self._get("/openApi/swap/v2/quote/contracts")
+            contracts = data.get("data", [])
+            usdt_pairs = [
+                c["symbol"] for c in contracts
+                if c.get("symbol", "").endswith("-USDT")
+                and c.get("status", 1) == 1   # activo
+            ]
+
+            if not usdt_pairs:
+                return []
+
+            # Tickers para filtrar por volumen 24h
+            ticker_data = await self._get("/openApi/swap/v2/quote/ticker")
+            tickers = {t["symbol"]: t for t in ticker_data.get("data", [])}
+
+            filtered = []
+            for sym in usdt_pairs:
+                t = tickers.get(sym, {})
+                vol = float(t.get("quoteVolume", 0))   # volumen en USDT
+                if vol >= min_volume_usdt:
+                    filtered.append(sym)
+
+            filtered.sort()
+            logger.info(f"Símbolos activos con vol ≥ {min_volume_usdt/1e6:.0f}M USDT: {len(filtered)}")
+            return filtered
+
+        except Exception as e:
+            logger.error(f"Error obteniendo símbolos: {e}")
+            return ["BTC-USDT", "ETH-USDT"]   # fallback seguro
+
     # ── Market data ──────────────────────────────────────────
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         """interval: '3m' | '15m' | '1h' | ..."""
@@ -94,8 +133,8 @@ class BingXClient:
     async def place_order(
         self,
         symbol: str,
-        side: str,          # "BUY" | "SELL"
-        position_side: str, # "LONG" | "SHORT"
+        side: str,
+        position_side: str,
         qty: float,
         order_type: str = "MARKET",
         price: float = None,
@@ -131,7 +170,6 @@ class BingXClient:
             logger.info(f"[PAPER] SL={sl_price} TP={tp_price}")
             return {"paper": True}
 
-        # SL
         sl_side = "SELL" if position_side == "LONG" else "BUY"
         await self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
@@ -142,7 +180,6 @@ class BingXClient:
             "quantity":     qty,
             "reduceOnly":   "true",
         })
-        # TP
         await self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         sl_side,
@@ -162,7 +199,7 @@ class BingXClient:
         if self.paper:
             return {"paper": True}
         return await self._post("/openApi/swap/v2/trade/leverage", {
-            "symbol": symbol, "side": "LONG",  "leverage": leverage
+            "symbol": symbol, "side": "LONG", "leverage": leverage
         })
 
     async def close(self):
