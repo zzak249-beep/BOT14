@@ -1,104 +1,106 @@
-# -*- coding: utf-8 -*-
-"""config.py -- Phantom Edge Bot v6: ZigZag + HMA + FutureTrend."""
-import os
-from dataclasses import dataclass
+"""
+Configuración Central — QF Machine × JP Fusion Bot v3
+Todos los parámetros del indicador y del bot en un solo lugar.
+"""
 
+# ── Temporalidades ────────────────────────────────────────────
+HTF = "15m"   # Higher timeframe para confirmación de régimen
 
-@dataclass
-class Config:
-    bingx_api_key:    str   = ""
-    bingx_secret_key: str   = ""
-    telegram_token:   str   = ""
-    telegram_chat_id: str   = ""
+# ── Símbolos a operar ─────────────────────────────────────────
+# Añade o quita según tu capital. Más símbolos = más oportunidades
+# pero más margen utilizado. Empieza con 1-2 en paper.
+SYMBOLS = [
+    "BTC-USDT",
+    "ETH-USDT",
+]
 
-    trade_usdt:  float = 9.0
-    leverage:    int   = 7      # FIX: 10→7 — reduce exposición en 5m
+# ── Señal: parámetros del indicador (espejo del Pine Script) ──
+SIGNAL_CFG = {
+    # L1 / General
+    "smo":      3,      # Suavizado de señal
+    "atr_len":  10,     # Longitud ATR
 
-    # ── Estrategia v6 ─────────────────────────────────────────
-    pivot_len:   int   = 5      # Pine: ta.pivothigh(high, 5, 5)
-    hma_len:     int   = 50     # Pine: ta.hma(close, 50)
-    ft_period:   int   = 25     # FutureTrend period
-    atr_period:  int   = 14
-    atr_mult:    float = 2.0    # FIX: 1.5→2.0 — más espacio en 5m, evita SL hunting
-    rr:          float = 2.5    # TP = SL × 2.5
+    # L2 Factores
+    "mom":      20,     # Lookback momentum
+    "rev":      8,      # Lookback media-reversión
+    "vol_len":  14,     # Longitud volumen OBV
+    "w1":       0.40,   # Peso momentum
+    "w2":       0.30,   # Peso media-rev
+    "w3":       0.30,   # Peso volumen
 
-    # ── Filtros ───────────────────────────────────────────────
-    min_atr_pct:  float = 0.15  # FIX: 0.10→0.15 — evitar pares planos en 5m
-    min_vol_mult: float = 0.6
-    min_score:    int   = 5     # FIX: 3→5 — exige confirmación 15m o volumen
+    # L3 Decaimiento
+    "dlen":     40,     # Ventana decaimiento
+    "dthr":     0.50,   # Umbral vida media
 
-    # ── Timeframes ────────────────────────────────────────────
-    timeframe:      str = "5m"
-    timeframe_slow: str = "15m"
-    timeframe_1h:   str = "1h"   # compat, no usado
+    # L4 Dark Pool
+    "dpm":      2.5,    # Multiplicador volumen spike
+    "dpb":      20,     # Baseline dark pool (barras)
+    "spl":      5,      # Longitud spread
 
-    # ── Gestión posiciones ────────────────────────────────────
-    max_positions:   int   = 5
-    breakeven_r:     float = 1.0
-    partial_pct:     float = 0.35   # 35% cierre en TP1 (como Pine v6)
-    max_trade_hours: float = 8.0
-    min_r_time_exit: float = 0.5
+    # L5 Ejecución
+    "exl":      12,     # Baseline ejecución
+    "bpt":      0.18,   # Umbral drenaje BP (%)
 
-    # ── Riesgo diario ─────────────────────────────────────────
-    max_daily_trades:   int   = 40
-    max_daily_loss_pct: float = 5.0
-    min_balance_usdt:   float = 9.0
+    # L6 Asimetría
+    "asl":      10,     # Ventana asimetría
+    "arr":      1.40,   # Ratio alcista/bajista
+    "abr":      1.40,   # Ratio bajista/alcista
 
-    # ── Scanning ──────────────────────────────────────────────
-    symbols_raw:    str = "ALL"
-    scan_interval:  int = 30    # 30s = más reactivo en 5m
-    max_concurrent: int = 30
+    # L7 Trendline
+    "tlb":      30,     # Lookback TL pivotes
+    "tll":      5,      # Pivote barras izq
+    "tlr":      3,      # Pivote barras der
+    "tlm":      0.15,   # Buffer ruptura (ATR)
 
-    # ── Compat (ignorados en v6 strategy) ────────────────────
-    zz_deviation:   float = 0.5
-    zz15_deviation: float = 0.8
-    st_period:      int   = 10
-    st_mult:        float = 3.0
-    rsi_period:     int   = 14
-    adx_period:     int   = 14
-    adx_min:        float = 0.0
+    # L8 Swing Analysis
+    "pll":      5,      # Swing low izq
+    "plr":      3,      # Swing low der
+    "phl":      5,      # Swing high izq
+    "phr":      3,      # Swing high der
+    "hlc":      2,      # Min HL ascendentes
+    "hhc":      2,      # Min LH descendentes
+    "hlw":      40,     # Ventana análisis
 
-    http_timeout: int = 12
-    health_port:  int = 8080
+    # L9 FVG
+    "fvg_min":  0.3,    # Tamaño mínimo (× ATR)
+    "fvg_bars": 40,     # Validez FVG (barras)
 
-    @property
-    def symbols(self) -> list[str]:
-        if self.symbols_raw.strip().upper() == "ALL":
-            return []
-        return [s.strip() for s in self.symbols_raw.split(",") if s.strip()]
+    # L10 Order Blocks
+    "ob_imp":   1.5,    # Impulso mínimo (× ATR)
+    "ob_bars":  50,     # Validez OB (barras)
 
-    def __post_init__(self) -> None:
-        e = lambda k, d: os.getenv(k, d)
-        self.bingx_api_key      = e("BINGX_API_KEY",      self.bingx_api_key)
-        self.bingx_secret_key   = e("BINGX_SECRET_KEY",   self.bingx_secret_key)
-        self.telegram_token     = e("TELEGRAM_TOKEN",     self.telegram_token)
-        self.telegram_chat_id   = e("TELEGRAM_CHAT_ID",   self.telegram_chat_id)
-        self.trade_usdt         = max(9.0, float(e("TRADE_USDT",       str(self.trade_usdt))))
-        self.leverage           = int(e("LEVERAGE",            str(self.leverage)))
-        self.pivot_len          = int(e("PIVOT_LEN",           str(self.pivot_len)))
-        self.hma_len            = int(e("HMA_LEN",             str(self.hma_len)))
-        self.ft_period          = int(e("FT_PERIOD",           str(self.ft_period)))
-        self.atr_period         = int(e("ATR_PERIOD",          str(self.atr_period)))
-        self.atr_mult           = float(e("ATR_MULT",          str(self.atr_mult)))
-        self.rr                 = float(e("RR",                str(self.rr)))
-        self.min_atr_pct        = float(e("MIN_ATR_PCT",       str(self.min_atr_pct)))
-        self.min_vol_mult       = float(e("MIN_VOL_MULT",      str(self.min_vol_mult)))
-        self.min_score          = int(e("MIN_SCORE",           str(self.min_score)))
-        self.timeframe          = e("TIMEFRAME",               self.timeframe)
-        self.timeframe_slow     = e("TIMEFRAME_SLOW",          self.timeframe_slow)
-        self.max_positions      = int(e("MAX_POSITIONS",       str(self.max_positions)))
-        self.scan_interval      = int(e("SCAN_INTERVAL",       str(self.scan_interval)))
-        self.max_concurrent     = int(e("MAX_CONCURRENT",      str(self.max_concurrent)))
-        self.symbols_raw        = e("SYMBOLS",                 self.symbols_raw)
-        self.health_port        = int(e("PORT",                str(self.health_port)))
-        self.max_daily_loss_pct = float(e("MAX_DAILY_LOSS",    str(self.max_daily_loss_pct)))
-        self.max_daily_trades   = int(e("MAX_DAILY_TRADES",    str(self.max_daily_trades)))
-        self.max_trade_hours    = float(e("MAX_TRADE_HOURS",   str(self.max_trade_hours)))
+    # L11 CVD Delta
+    "cvd_len":  20,     # EMA CVD
+    "cvd_div":  5,      # Ventana divergencia
 
-        if not self.bingx_api_key or not self.bingx_secret_key:
-            import sys
-            print("FATAL: BINGX_API_KEY / BINGX_SECRET_KEY no configurados", flush=True)
-            sys.exit(1)
+    # L12 Squeeze
+    "sq_len":   20,     # Longitud squeeze
+    "sq_bbm":   2.0,    # Multiplicador BB
+    "sq_kcm":   1.5,    # Multiplicador KC
+}
 
+# ── Riesgo ────────────────────────────────────────────────────
+RISK_CFG = {
+    # Capital inicial (sincronizar con equity real de BingX)
+    "initial_equity": 500.0,   # USDT
 
-cfg = Config()
+    # Leverage (BingX soporta hasta 100x; usa poco mientras validas)
+    "leverage": 5,
+
+    # Riesgo por operación (% del equity) según tier
+    "risk_pct_suprema": 1.5,   # Señal más fuerte
+    "risk_pct_fuel":    1.0,
+    "risk_pct_std":     0.5,
+    "risk_pct_max":     2.0,   # Techo absoluto, nunca superado
+
+    # Ratio Reward:Risk según tier
+    "rr_suprema": 3.0,
+    "rr_fuel":    2.5,
+    "rr_std":     2.0,
+
+    # Circuit Breakers
+    "max_daily_loss_pct":      3.0,   # Pérdida máxima diaria (% equity)
+    "max_drawdown_pct":       15.0,   # DD máximo desde pico (para siempre)
+    "max_consecutive_losses":   4,    # Pérdidas seguidas antes de pausa
+    "max_daily_trades":        10,    # Máx operaciones por día
+}

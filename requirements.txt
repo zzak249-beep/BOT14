@@ -1,7 +1,6 @@
 aiohttp==3.9.5
-aiosignal>=1.1.2
-frozenlist>=1.1.1
-multidict>=4.5
-yarl>=1.0
-loguru==0.7.2
+pandas==2.2.2
 numpy==1.26.4
+python-telegram-bot==21.3
+ta-lib-easy==0.0.2
+python-dotenv==1.0.1
