@@ -241,17 +241,21 @@ class QFSignalEngine:
         in_bull_fvg = False
         if bull_fvg.iloc[-n:].any():
             idx = bull_fvg.iloc[-n:][bull_fvg.iloc[-n:]].index[-1]
-            top = df.loc[idx, 'low']
-            bot = df.loc[idx, 'high'] if idx - 2 >= df.index[0] else np.nan
+            _top = df.loc[idx, 'low']
+            _bot = df.loc[idx, 'high'] if idx - 2 >= df.index[0] else np.nan
+            top = float(_top.iloc[-1]) if isinstance(_top, pd.Series) else float(_top)
+            bot = float(_bot.iloc[-1]) if isinstance(_bot, pd.Series) else float(_bot)
             if not np.isnan(bot):
-                in_bull_fvg = df['close'].iloc[-1] <= top and df['close'].iloc[-1] >= bot
+                in_bull_fvg = bool(df['close'].iloc[-1] <= top and df['close'].iloc[-1] >= bot)
 
         in_bear_fvg = False
         if bear_fvg.iloc[-n:].any():
             idx = bear_fvg.iloc[-n:][bear_fvg.iloc[-n:]].index[-1]
-            top = df.loc[idx, 'low']
-            bot = df.loc[idx, 'high']
-            in_bear_fvg = df['close'].iloc[-1] >= bot and df['close'].iloc[-1] <= top
+            _top = df.loc[idx, 'low']
+            _bot = df.loc[idx, 'high']
+            top = float(_top.iloc[-1]) if isinstance(_top, pd.Series) else float(_top)
+            bot = float(_bot.iloc[-1]) if isinstance(_bot, pd.Series) else float(_bot)
+            in_bear_fvg = bool(df['close'].iloc[-1] >= bot and df['close'].iloc[-1] <= top)
 
         return {
             'bull_fvg_raw': bool(bull_fvg.iloc[-1]),
@@ -276,15 +280,19 @@ class QFSignalEngine:
 
         if bull_ob.iloc[-n:].any():
             idx = bull_ob.iloc[-n:][bull_ob.iloc[-n:]].index[-1]
-            hi  = df.loc[idx, 'open']
-            lo  = df.loc[idx, 'close']
-            in_bull_ob = df['close'].iloc[-1] <= hi and df['close'].iloc[-1] >= lo
+            _hi = df.loc[idx, 'open']
+            _lo = df.loc[idx, 'close']
+            hi  = float(_hi.iloc[-1]) if isinstance(_hi, pd.Series) else float(_hi)
+            lo  = float(_lo.iloc[-1]) if isinstance(_lo, pd.Series) else float(_lo)
+            in_bull_ob = bool(df['close'].iloc[-1] <= hi and df['close'].iloc[-1] >= lo)
 
         if bear_ob.iloc[-n:].any():
             idx = bear_ob.iloc[-n:][bear_ob.iloc[-n:]].index[-1]
-            hi  = df.loc[idx, 'close']
-            lo  = df.loc[idx, 'open']
-            in_bear_ob = df['close'].iloc[-1] >= lo and df['close'].iloc[-1] <= hi
+            _hi = df.loc[idx, 'close']
+            _lo = df.loc[idx, 'open']
+            hi  = float(_hi.iloc[-1]) if isinstance(_hi, pd.Series) else float(_hi)
+            lo  = float(_lo.iloc[-1]) if isinstance(_lo, pd.Series) else float(_lo)
+            in_bear_ob = bool(df['close'].iloc[-1] >= lo and df['close'].iloc[-1] <= hi)
 
         return {
             'bull_ob_raw': bool(bull_ob.iloc[-1]),
