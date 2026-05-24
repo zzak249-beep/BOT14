@@ -1,1 +1,1 @@
-# QF Machine × JP Fusion Bot v3
+# QF×JP Bot v3.0

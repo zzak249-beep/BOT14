@@ -1,168 +1,196 @@
-# QF Machine × JP Fusion Bot v3 🤖
+# QF Machine × JP Fusion — Bot v3.0
 
-Bot de trading algorítmico para criptomonedas. Porta la lógica del indicador Pine Script (12 capas) a Python para operar en BingX con señales en Telegram.
-
-> ⚠️ **PAPER MODE activo por defecto.** El bot NO opera con dinero real hasta que cambies `PAPER_MODE=false` explícitamente.
-
----
-
-## 🏗 Arquitectura
-
-```
-src/
-├── main.py          ← Orquestador principal (loop de trading)
-├── signals.py       ← Motor de señales (12 capas, port del Pine Script)
-├── exchange.py      ← Conector BingX REST API
-├── risk.py          ← Gestión de riesgo y circuit breakers
-├── positions.py     ← Tracker de posiciones abiertas
-├── telegram_bot.py  ← Bot de Telegram (señales + comandos)
-├── config.py        ← Todos los parámetros configurables
-└── backtest.py      ← Backtester sobre datos históricos CSV
-```
+Bot de trading algorítmico para BingX Perpetual Futures con señales por Telegram.  
+Traduce fielmente el indicador Pine Script QF×JP v3 (12 capas) a Python asyncio.
 
 ---
 
-## ⚡ Setup rápido (Railway)
+## ⚠️ AVISO DE RIESGO
 
-### 1. Fork / sube a GitHub
+Trading con apalancamiento puede resultar en pérdida total del capital.  
+**Empieza SIEMPRE en modo `MODE=SIGNAL` y valida al menos 2 semanas antes de pasar a LIVE.**
+
+---
+
+## Arquitectura
+
+```
+qf-jp-bot/
+├── bot/
+│   ├── main.py              # Loop principal asyncio
+│   ├── engine.py            # Motor QF×JP (L1–L12 en Python/NumPy)
+│   ├── bingx_client.py      # API BingX Futures (USDT-M)
+│   ├── telegram_client.py   # Notificaciones Telegram
+│   ├── risk_manager.py      # Tamaño de posición + drawdown
+│   └── session_filter.py    # Filtro Asia/Londres/NY
+├── config.py                # Todos los parámetros desde .env
+├── requirements.txt
+├── Dockerfile
+├── railway.toml
+└── .env.example
+```
+
+---
+
+## Capas del motor de señal
+
+| Capa | Nombre | Función |
+|------|--------|---------|
+| L1 | Microestructura | ATR, spread bid/ask estimado |
+| L2 | Motor de Factores | Momentum + Mean-Reversion + OBV (ponderados) |
+| L3 | Decaimiento de Señal | IC rolling — la señal se "apaga" si pierde predictibilidad |
+| L4 | Dark Pool | Volumen spike + rango estrecho → bloque institucional |
+| L5 | Ejecución | Filtro de spread destructivo del alfa |
+| L6 | Asimetría Momentum | Velas alcistas vs bajistas (ratio rango) |
+| L7 | Ruptura Trendline | Pivots automáticos + break con buffer ATR |
+| L8 | Swing Analysis | HL↑ consecutivos = agotamiento vendedor |
+| L9 | Fair Value Gaps | Imbalances ICT — precio retestando zona |
+| L10 | Order Blocks | Última vela opuesta antes de impulso fuerte |
+| L11 | CVD Delta | Buy/sell pressure proxy — divergencias ocultas |
+| L12 | Squeeze Momentum | BB dentro de KC → compresión → explosión |
+
+### Tiers de señal
+
+| Tier | Condición | Convicción mínima recomendada |
+|------|-----------|-------------------------------|
+| STD | L1-L8 alineadas | 5/10 |
+| FUEL | STD + TL break ó Squeeze ó FVG/OB con CVD | 7/10 |
+| SUP ⭐ | FUEL + Dark Pool ó Divergencia CVD | 8/10 |
+
+---
+
+## Instalación local
+
+```bash
+git clone https://github.com/TU_USUARIO/qf-jp-bot.git
+cd qf-jp-bot
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+# Edita .env con tus credenciales
+python -m bot.main
+```
+
+---
+
+## Despliegue en Railway (recomendado)
+
+### 1. Crear bot de Telegram
+
+1. Habla con `@BotFather` → `/newbot`
+2. Guarda el token
+3. Crea un grupo o canal, añade el bot como admin
+4. Obtén el chat_id: envía un mensaje y visita  
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`
+
+### 2. Credenciales BingX
+
+1. Entra en BingX → **API Management**
+2. Crea clave con permisos: **Read + Trade** (NO Withdraw)
+3. Whitelist tu IP de Railway (o déjala abierta solo si usas Railway con IP fija)
+
+### 3. Subir a GitHub
 
 ```bash
 git init
 git add .
-git commit -m "QF Bot v3 initial"
-git remote add origin https://github.com/TU_USUARIO/qf-bot.git
+git commit -m "QF×JP Bot v3.0"
+git remote add origin https://github.com/TU_USUARIO/qf-jp-bot.git
 git push -u origin main
 ```
 
-### 2. Crea proyecto en Railway
+### 4. Crear proyecto en Railway
 
-1. railway.app → New Project → Deploy from GitHub
-2. Selecciona tu repo
-3. Railway detecta el `Dockerfile` automáticamente
+1. [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
+2. Selecciona tu repositorio
+3. Ve a **Variables** y añade una por una:
 
-### 3. Variables de entorno en Railway
+```
+BINGX_API_KEY     = tu_key
+BINGX_SECRET      = tu_secret
+TG_TOKEN          = 123456:ABC...
+TG_CHAT_ID        = -100123456789
+MODE              = SIGNAL          ← empieza aquí
+SYMBOLS           = BTC-USDT,ETH-USDT,SOL-USDT
+LEVERAGE          = 10
+RISK_PCT          = 1.0
+MAX_DD_PCT        = 5.0
+TP_RR             = 2.0
+MIN_CONV_STD      = 5
+MIN_CONV_FUEL     = 7
+MIN_CONV_SUP      = 8
+SESSIONS          = NY,LDN
+LOOP_INTERVAL     = 30
+```
 
-En tu proyecto → **Variables** → añade:
+4. Railway detecta el `Dockerfile` y despliega automáticamente
+5. Verifica en **Logs** que aparece:
+   ```
+   QF × JP Bot v3 iniciado
+   Balance USDT: xxx.xx
+   ```
 
-| Variable | Valor |
-|---|---|
-| `BINGX_API_KEY` | Tu API key de BingX |
-| `BINGX_SECRET` | Tu secret de BingX |
-| `TELEGRAM_TOKEN` | Token de @BotFather |
-| `TELEGRAM_CHAT_ID` | Tu Chat ID (ver abajo) |
-| `PAPER_MODE` | `true` (¡no cambies hasta validar!) |
-| `MIN_CONVICTION` | `6` |
-| `LOOP_SECONDS` | `30` |
-| `TRAIL_ATR` | `1.5` |
+---
 
-### 4. Obtener API Keys de BingX
+## Flujo de operación
 
-1. BingX → Cuenta → Gestión de API
-2. Crear API → habilitar **Futuros Perpetuos**
-3. Habilitar: Lectura ✅ | Trading ✅ | Retiro ❌ (NUNCA)
-4. IP whitelist: añade la IP de tu servidor Railway (opcional pero recomendado)
-
-### 5. Obtener Telegram Token y Chat ID
-
-```bash
-# 1. Habla con @BotFather → /newbot → sigue instrucciones → guarda el token
-
-# 2. Obtén tu Chat ID:
-curl "https://api.telegram.org/bot<TOKEN>/getUpdates"
-# Manda un mensaje a tu bot y busca "chat":{"id": XXXX}
+```
+Cada 30s por símbolo:
+  1. ¿Sesión permitida? (NY/LDN/ASIA)
+  2. Descarga 250 velas 3min + 100 velas 15min
+  3. Calcula L1→L12 en NumPy
+  4. Evalúa señal: STD / FUEL / SUP
+  5. Si posición abierta → revisa SL dinámico y señal contraria
+  6. Si señal nueva → calcula tamaño (Kelly fraccionado)
+  7. SIGNAL: Telegram | LIVE: orden market BingX + SL integrado
 ```
 
 ---
 
-## 🧪 Backtest antes de operar
+## Gestión de riesgo
 
-```bash
-# Instalar dependencias
-pip install -r requirements.txt
+- **1% del balance** por trade (ajustable con `RISK_PCT`)
+- **SL automático** basado en último swing low/high del indicador
+- **TP automático** en R:R 2.0 (ajustable con `TP_RR`)
+- **Drawdown diario** máx 5% → bot se detiene automáticamente
+- **Apalancamiento** 10× máximo recomendado (usa 5× para empezar)
+- Nunca más del 80% del margen disponible en una sola posición
 
-# Descargar datos históricos de BingX (CSV)
-# o exportar desde TradingView: Símbolo → Exportar datos CSV
+---
 
-# Ejecutar backtest
-python src/backtest.py \
-  --file3m  datos/BTCUSDT_3m.csv \
-  --conviction 6 \
-  --out logs/bt_result.json
+## Protocolo de arranque (obligatorio)
 
-# Resultado:
-# ══════════════════════════════════════════
-#   total_trades     : 87
-#   win_rate_pct     : 58.6
-#   total_pnl        : +234.50
-#   max_drawdown_pct : 8.2
-#   profit_factor    : 1.74
-# ══════════════════════════════════════════
+```
+Semana 1-2 → MODE=SIGNAL   Observa señales, valida calidad
+Semana 3   → MODE=LIVE      RISK_PCT=0.5, LEVERAGE=5
+Semana 4+  → MODE=LIVE      RISK_PCT=1.0, LEVERAGE=10
 ```
 
-**Criterios mínimos para pasar a paper trading:**
-- Win rate > 50%
-- Profit factor > 1.3
-- Max drawdown < 15%
+---
 
-**Criterios mínimos para pasar a live:**
-- Paper trading rentable durante ≥ 3 semanas
-- Al menos 30 operaciones en paper
-- Win rate estable > 52%
+## Símbolos recomendados (BingX)
+
+```
+BTC-USDT   ETH-USDT   SOL-USDT
+BNB-USDT   XRP-USDT   DOGE-USDT
+```
+
+Formato exacto requerido: `BTC-USDT` (con guion, en mayúsculas).
 
 ---
 
-## 📱 Comandos Telegram
+## Actualizar el bot
 
-| Comando | Función |
-|---|---|
-| `/start` | Panel principal con botones |
-| `/status` | Equity, PnL, drawdown, circuit breaker |
-| `/pause` | Detiene nuevas entradas (posiciones abiertas siguen) |
-| `/resume` | Reanuda el bot |
-| `/reset` | Desbloquea circuit breaker manualmente |
-| `/mode` | Muestra modo paper vs live |
-| `/help` | Lista de comandos |
+```bash
+git add .
+git commit -m "update"
+git push
+```
+Railway redespliega automáticamente en segundos.
 
 ---
 
-## 🛡 Gestión de Riesgo (config.py)
+## Licencia
 
-| Parámetro | Default | Descripción |
-|---|---|---|
-| `leverage` | 5x | Apalancamiento (empieza con 3-5x) |
-| `risk_pct_suprema` | 1.5% | Riesgo por op. señal SUPREMA |
-| `risk_pct_fuel` | 1.0% | Riesgo por op. señal FUEL |
-| `risk_pct_std` | 0.5% | Riesgo por op. señal STD |
-| `max_daily_loss_pct` | 3% | Circuit breaker diario |
-| `max_drawdown_pct` | 15% | Circuit breaker permanente |
-| `max_consecutive_losses` | 4 | Pause tras N pérdidas seguidas |
-| `max_daily_trades` | 10 | Máximo trades por día |
-
----
-
-## 📊 Señales — Niveles de calidad
-
-| Tier | Condición | Emoji Telegram |
-|---|---|---|
-| **SUPREMA** | FUEL + Dark Pool ó CVD div. | ⭐⭐⭐ |
-| **FUEL** | STD + TL break ó Squeeze ó FVG/OB + CVD | 🔥 |
-| **STD** | 6 capas base alineadas | ▶️ |
-
-Con `MIN_CONVICTION=6` sólo se ejecutan señales con ≥6/10 filtros activos.
-
----
-
-## 🔧 Ajustes recomendados por capital
-
-| Capital | Leverage | Risk/op | Símbolos |
-|---|---|---|---|
-| < $500 | 3x | 0.5% / 0.8% / 1.2% | 1 (BTC) |
-| $500-2K | 5x | 0.5% / 1.0% / 1.5% | 1-2 |
-| $2K-10K | 5-10x | 0.3% / 0.8% / 1.2% | 2-3 |
-| > $10K | Consult. prof. | < 0.5% | 2-4 |
-
----
-
-## ⚠️ Disclaimer
-
-Este software es una herramienta de automatización. El trading de futuros de criptomonedas conlleva riesgo de pérdida total del capital. Valida siempre en paper trading antes de usar dinero real. El autor no es responsable de pérdidas.
+Uso personal. No redistribuir sin autorización.
