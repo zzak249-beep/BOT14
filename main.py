@@ -308,10 +308,12 @@ async def scanner_loop(
     scanner = MarketScanner(exchange)
     tasks: dict[str, asyncio.Task] = {}
     reconcile_counter = 0
+    first_run = True
 
     while True:
         try:
             symbols = await scanner.get_tradeable_symbols()
+            sym_set = set(symbols)
             gs      = perf.global_stats()
 
             if gs:
@@ -324,24 +326,40 @@ async def scanner_loop(
 
             bal = await exchange.get_balance()
 
-            # Reconciliar cada 10 ciclos de scanner
+            # Reconciliar cada 10 ciclos
             reconcile_counter += 1
             if reconcile_counter % 10 == 0 and cfg.MODE == "LIVE":
                 await reconcile_positions(exchange)
 
-            for sym in symbols:
-                if sym not in tasks or tasks[sym].done():
-                    t = asyncio.create_task(
-                        run_symbol(sym, exchange, tg, risk, session, engine, perf, bal)
-                    )
-                    tasks[sym] = t
-                    log.info(f"Task iniciada: {sym}")
-
+            # ── Cancelar tasks de símbolos que ya no están ────
             for sym in list(tasks.keys()):
-                if sym not in symbols and not tasks[sym].done():
-                    tasks[sym].cancel()
+                if sym not in sym_set:
+                    if not tasks[sym].done():
+                        tasks[sym].cancel()
+                        await asyncio.sleep(0)   # ceder control
                     del tasks[sym]
                     log.info(f"Task cancelada: {sym}")
+
+            # ── Iniciar tasks nuevas (sin duplicar) ───────────
+            new_count = 0
+            for sym in symbols:
+                task = tasks.get(sym)
+                # Solo crear si no existe o terminó/falló
+                if task is None or task.done():
+                    # Pequeño delay entre tasks para no sobrecargar API
+                    if new_count > 0:
+                        await asyncio.sleep(0.1)
+                    t = asyncio.create_task(
+                        run_symbol(sym, exchange, tg, risk, session, engine, perf, bal),
+                        name=f"sym_{sym}",
+                    )
+                    tasks[sym] = t
+                    new_count += 1
+                    log.info(f"Task {'iniciada' if first_run else 'reiniciada'}: {sym}")
+
+            if first_run and new_count > 0:
+                log.info(f"Total tasks activas: {len(tasks)}")
+                first_run = False
 
         except Exception as e:
             log.error(f"scanner_loop: {e}", exc_info=True)
