@@ -1,27 +1,32 @@
 """
-Filtro de Sesiones Crypto — UTC
-Asia: 00-08 | Londres: 07-16 | NY: 13-22
+QF×JP Bot v6.0 — session_filter.py
+Sesiones: NY (13-22 UTC), LDN (08-17 UTC), ASIA (00-09 UTC)
 """
 from datetime import datetime, timezone
 from config import cfg
 
 
+SESSION_HOURS = {
+    "NY":   (13, 22),
+    "LDN":  (8,  17),
+    "ASIA": (0,   9),
+}
+
+
 class SessionFilter:
+    def is_tradeable(self) -> bool:
+        if not cfg.ALLOWED_SESSIONS:
+            return True
+        h = datetime.now(timezone.utc).hour
+        for sess in cfg.ALLOWED_SESSIONS:
+            start, end = SESSION_HOURS.get(sess, (0, 24))
+            if start <= h < end:
+                return True
+        return False
 
     def current_session(self) -> str:
-        now_h = datetime.now(timezone.utc).hour
-        if 13 <= now_h < 22:
-            return "NY"
-        if 7 <= now_h < 16:
-            return "LDN"
-        if 0 <= now_h < 8:
-            return "ASIA"
+        h = datetime.now(timezone.utc).hour
+        for sess, (start, end) in SESSION_HOURS.items():
+            if start <= h < end:
+                return sess
         return "OFF"
-
-    def is_tradeable(self) -> bool:
-        """Devuelve True si estamos en una sesión permitida por config."""
-        session = self.current_session()
-        allowed = cfg.ALLOWED_SESSIONS
-        if not allowed:          # lista vacía = operar siempre
-            return True
-        return session in allowed

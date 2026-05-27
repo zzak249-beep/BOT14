@@ -1,106 +1,104 @@
 """
-Configuración Central — QF Machine × JP Fusion Bot v3
-Todos los parámetros del indicador y del bot en un solo lugar.
+QF×JP Bot v6.0 — config.py
+Lee variables de entorno con defaults seguros.
 """
+import os
+from dataclasses import dataclass, field
+from typing import List
 
-# ── Temporalidades ────────────────────────────────────────────
-HTF = "15m"   # Higher timeframe para confirmación de régimen
 
-# ── Símbolos a operar ─────────────────────────────────────────
-# Añade o quita según tu capital. Más símbolos = más oportunidades
-# pero más margen utilizado. Empieza con 1-2 en paper.
-SYMBOLS = [
-    "BTC-USDT",
-    "ETH-USDT",
-]
+def _bool(v: str) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-# ── Señal: parámetros del indicador (espejo del Pine Script) ──
-SIGNAL_CFG = {
-    # L1 / General
-    "smo":      3,      # Suavizado de señal
-    "atr_len":  10,     # Longitud ATR
+def _lst(v: str) -> List[str]:
+    return [x.strip().upper() for x in v.split(",") if x.strip()]
 
-    # L2 Factores
-    "mom":      20,     # Lookback momentum
-    "rev":      8,      # Lookback media-reversión
-    "vol_len":  14,     # Longitud volumen OBV
-    "w1":       0.40,   # Peso momentum
-    "w2":       0.30,   # Peso media-rev
-    "w3":       0.30,   # Peso volumen
 
-    # L3 Decaimiento
-    "dlen":     40,     # Ventana decaimiento
-    "dthr":     0.50,   # Umbral vida media
+@dataclass
+class Config:
+    # ── Credenciales ──────────────────────────────────────
+    BINGX_API_KEY:  str = os.getenv("BINGX_API_KEY",  "")
+    BINGX_SECRET:   str = os.getenv("BINGX_SECRET",   "")
+    TG_TOKEN:       str = os.getenv("TG_TOKEN",        "")
+    TG_CHAT_ID:     str = os.getenv("TG_CHAT_ID",      "")
 
-    # L4 Dark Pool
-    "dpm":      2.5,    # Multiplicador volumen spike
-    "dpb":      20,     # Baseline dark pool (barras)
-    "spl":      5,      # Longitud spread
+    # ── Modo operación ─────────────────────────────────────
+    # "LIVE" para operar real | "SIGNAL" para señales sin orden
+    MODE: str = os.getenv("MODE", "LIVE")
 
-    # L5 Ejecución
-    "exl":      12,     # Baseline ejecución
-    "bpt":      0.18,   # Umbral drenaje BP (%)
+    # ── Símbolos ───────────────────────────────────────────
+    SYMBOLS_MODE:    str   = os.getenv("SYMBOLS_MODE",    "AUTO")
+    MIN_VOLUME_USDT: float = float(os.getenv("MIN_VOLUME_USDT", "50000000"))
+    MAX_VOLUME_USDT: float = float(os.getenv("MAX_VOLUME_USDT", "600000000"))
+    MAX_SYMBOLS:     int   = int(os.getenv("MAX_SYMBOLS",       "20"))
 
-    # L6 Asimetría
-    "asl":      10,     # Ventana asimetría
-    "arr":      1.40,   # Ratio alcista/bajista
-    "abr":      1.40,   # Ratio bajista/alcista
+    # ── Riesgo ─────────────────────────────────────────────
+    LEVERAGE:             int   = int(os.getenv("LEVERAGE",         "5"))
+    RISK_PER_TRADE_PCT:   float = float(os.getenv("RISK_PCT",       "0.5"))
+    MAX_DAILY_DD_PCT:     float = float(os.getenv("MAX_DD_PCT",     "5.0"))
+    MAX_OPEN_POSITIONS:   int   = int(os.getenv("MAX_POSITIONS",    "5"))
+    TP_RR:                float = float(os.getenv("TP_RR",          "2.0"))
 
-    # L7 Trendline
-    "tlb":      30,     # Lookback TL pivotes
-    "tll":      5,      # Pivote barras izq
-    "tlr":      3,      # Pivote barras der
-    "tlm":      0.15,   # Buffer ruptura (ATR)
+    # ── Sesiones (NY / LDN / ASIA) ─────────────────────────
+    ALLOWED_SESSIONS: List[str] = field(
+        default_factory=lambda: _lst(os.getenv("SESSIONS", "NY,LDN"))
+    )
 
-    # L8 Swing Analysis
-    "pll":      5,      # Swing low izq
-    "plr":      3,      # Swing low der
-    "phl":      5,      # Swing high izq
-    "phr":      3,      # Swing high der
-    "hlc":      2,      # Min HL ascendentes
-    "hhc":      2,      # Min LH descendentes
-    "hlw":      40,     # Ventana análisis
+    # ── Timing ─────────────────────────────────────────────
+    LOOP_INTERVAL:    int = int(os.getenv("LOOP_INTERVAL",    "30"))
+    SCANNER_INTERVAL: int = int(os.getenv("SCANNER_INTERVAL", "3600"))
 
-    # L9 FVG
-    "fvg_min":  0.3,    # Tamaño mínimo (× ATR)
-    "fvg_bars": 40,     # Validez FVG (barras)
+    # ── Score / señal ──────────────────────────────────────
+    SCORE_THR_LONG:  float = float(os.getenv("SCORE_THR_LONG",  "0.60"))
+    SCORE_THR_SHORT: float = float(os.getenv("SCORE_THR_SHORT", "0.60"))
+    DECAY_THR:       float = float(os.getenv("DECAY_THR",       "0.60"))
 
-    # L10 Order Blocks
-    "ob_imp":   1.5,    # Impulso mínimo (× ATR)
-    "ob_bars":  50,     # Validez OB (barras)
+    # ── Convicción mínima por tier ─────────────────────────
+    MIN_CONV_STD:  int = int(os.getenv("MIN_CONV_STD",  "5"))
+    MIN_CONV_FUEL: int = int(os.getenv("MIN_CONV_FUEL", "6"))
+    MIN_CONV_SUP:  int = int(os.getenv("MIN_CONV_SUP",  "7"))
 
-    # L11 CVD Delta
-    "cvd_len":  20,     # EMA CVD
-    "cvd_div":  5,      # Ventana divergencia
+    # ── Performance filter ─────────────────────────────────
+    MIN_PF:    float = float(os.getenv("MIN_PF",    "1.2"))
+    PF_WINDOW: int   = int(os.getenv("PF_WINDOW",   "20"))
 
-    # L12 Squeeze
-    "sq_len":   20,     # Longitud squeeze
-    "sq_bbm":   2.0,    # Multiplicador BB
-    "sq_kcm":   1.5,    # Multiplicador KC
-}
+    # ── OFI ────────────────────────────────────────────────
+    OFI_LEVELS:     int   = int(os.getenv("OFI_LEVELS",      "5"))
+    OFI_THR_WEAK:   float = float(os.getenv("OFI_THR_WEAK",  "0.25"))
+    OFI_THR_STRONG: float = float(os.getenv("OFI_THR_STRONG","0.45"))
 
-# ── Riesgo ────────────────────────────────────────────────────
-RISK_CFG = {
-    # Capital inicial (sincronizar con equity real de BingX)
-    "initial_equity": 500.0,   # USDT
+    # ── Funding Rate ───────────────────────────────────────
+    FR_BULL_THR:    float = float(os.getenv("FR_BULL_THR",    "0.0001"))
+    FR_BEAR_THR:    float = float(os.getenv("FR_BEAR_THR",   "-0.0001"))
+    FR_EXTREME_THR: float = float(os.getenv("FR_EXTREME_THR", "0.005"))
 
-    # Leverage (BingX soporta hasta 100x; usa poco mientras validas)
-    "leverage": 5,
+    # ── Open Interest ──────────────────────────────────────
+    OI_DELTA_THR: float = float(os.getenv("OI_DELTA_THR", "0.005"))
 
-    # Riesgo por operación (% del equity) según tier
-    "risk_pct_suprema": 1.5,   # Señal más fuerte
-    "risk_pct_fuel":    1.0,
-    "risk_pct_std":     0.5,
-    "risk_pct_max":     2.0,   # Techo absoluto, nunca superado
+    # ── Trailing SL ────────────────────────────────────────
+    TRAIL_ACTIVATE_ATR: float = float(os.getenv("TRAIL_ACTIVATE_ATR", "1.0"))
+    TRAIL_ATR_MULT:     float = float(os.getenv("TRAIL_ATR_MULT",     "1.5"))
 
-    # Ratio Reward:Risk según tier
-    "rr_suprema": 3.0,
-    "rr_fuel":    2.5,
-    "rr_std":     2.0,
+    # ── Órdenes maker ─────────────────────────────────────
+    USE_MAKER_ORDERS:   bool  = _bool(os.getenv("USE_MAKER_ORDERS",  "true"))
+    MAKER_TIMEOUT:      int   = int(os.getenv("MAKER_TIMEOUT",       "20"))
+    MAKER_OFFSET_PCT:   float = float(os.getenv("MAKER_OFFSET_PCT",  "0.015"))
 
-    # Circuit Breakers
-    "max_daily_loss_pct":      3.0,   # Pérdida máxima diaria (% equity)
-    "max_drawdown_pct":       15.0,   # DD máximo desde pico (para siempre)
-    "max_consecutive_losses":   4,    # Pérdidas seguidas antes de pausa
-    "max_daily_trades":        10,    # Máx operaciones por día
-}
+    # ── Multi-TF ───────────────────────────────────────────
+    USE_1H_FILTER:  bool = _bool(os.getenv("USE_1H_FILTER", "true"))
+    MULTI_TF_BONUS: int  = int(os.getenv("MULTI_TF_BONUS",  "2"))
+
+    # ── Anti-rate-limit ────────────────────────────────────
+    BALANCE_CACHE_TTL: int = int(os.getenv("BALANCE_CACHE_TTL", "60"))
+    API_RETRY_MAX:     int = int(os.getenv("API_RETRY_MAX",      "3"))
+    API_RETRY_DELAY:   float = float(os.getenv("API_RETRY_DELAY","2.0"))
+
+    # ── Entry logic weights (Score+CVD+MOM+DECAY) ──────────
+    W_SCORE:  float = float(os.getenv("W_SCORE",  "0.40"))
+    W_CVD:    float = float(os.getenv("W_CVD",    "0.25"))
+    W_MOM:    float = float(os.getenv("W_MOM",    "0.20"))
+    W_DECAY:  float = float(os.getenv("W_DECAY",  "0.15"))
+    ENTRY_MIN_COMPOSITE: float = float(os.getenv("ENTRY_MIN_COMPOSITE", "0.58"))
+
+
+cfg = Config()
