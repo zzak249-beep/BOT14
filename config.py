@@ -1,104 +1,101 @@
 """
-QF×JP Bot v6.0 — config.py
-Lee variables de entorno con defaults seguros.
+config.py — Configuración central del QF×JP v3.4 Bot
+Lee todas las variables desde Railway Environment Variables / .env
 """
-import os
-from dataclasses import dataclass, field
-from typing import List
+import os, sys
 
+def _e(k, d=None, req=False):
+    v = os.getenv(k, d)
+    if req and not v:
+        print(f"❌ FATAL: '{k}' no definida. Añádela en Railway → Variables.")
+        sys.exit(1)
+    return str(v).strip() if v is not None else v
 
-def _bool(v: str) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+# ── BINGX ─────────────────────────────────────────────────────────────────────
+BINGX_API_KEY    = _e("BINGX_API_KEY",    req=True)
+BINGX_SECRET_KEY = _e("BINGX_SECRET_KEY", req=True)
+BINGX_BASE_URL   = _e("BINGX_BASE_URL",   "https://open-api.bingx.com")
 
-def _lst(v: str) -> List[str]:
-    return [x.strip().upper() for x in v.split(",") if x.strip()]
+# ── TELEGRAM ──────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = _e("TELEGRAM_TOKEN",   req=True)
+TELEGRAM_CHAT_ID = _e("TELEGRAM_CHAT_ID", req=True)
 
+# ── SÍMBOLOS ──────────────────────────────────────────────────────────────────
+SYMBOLS = [s.strip() for s in _e("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT").split(",")]
 
-@dataclass
-class Config:
-    # ── Credenciales ──────────────────────────────────────
-    BINGX_API_KEY:  str = os.getenv("BINGX_API_KEY",  "")
-    BINGX_SECRET:   str = os.getenv("BINGX_SECRET",   "")
-    TG_TOKEN:       str = os.getenv("TG_TOKEN",        "")
-    TG_CHAT_ID:     str = os.getenv("TG_CHAT_ID",      "")
+# ── TRADING ───────────────────────────────────────────────────────────────────
+LEVERAGE          = int(_e("LEVERAGE",         "5"))
+RISK_PER_TRADE    = float(_e("RISK_PER_TRADE", "0.01"))   # 1% balance
+MAX_OPEN_TRADES   = int(_e("MAX_OPEN_TRADES",  "3"))
 
-    # ── Modo operación ─────────────────────────────────────
-    # "LIVE" para operar real | "SIGNAL" para señales sin orden
-    MODE: str = os.getenv("MODE", "LIVE")
+# ── SCORE UMBRALES (del Pine Script) ─────────────────────────────────────────
+SCORE_STD         = int(_e("SCORE_STD",   "55"))   # señal estándar
+SCORE_FUEL        = int(_e("SCORE_FUEL",  "68"))   # señal fuel
+SCORE_SUP         = int(_e("SCORE_SUP",   "80"))   # señal suprema
+HTF_MIN_ALIGNED   = int(_e("HTF_MIN",     "2"))    # TFs alineados mínimo
 
-    # ── Símbolos ───────────────────────────────────────────
-    SYMBOLS_MODE:    str   = os.getenv("SYMBOLS_MODE",    "AUTO")
-    MIN_VOLUME_USDT: float = float(os.getenv("MIN_VOLUME_USDT", "50000000"))
-    MAX_VOLUME_USDT: float = float(os.getenv("MAX_VOLUME_USDT", "600000000"))
-    MAX_SYMBOLS:     int   = int(os.getenv("MAX_SYMBOLS",       "20"))
+# ── INDICADORES ───────────────────────────────────────────────────────────────
+ATR_LEN           = int(_e("ATR_LEN",    "10"))
+ATR_SL_MULT       = float(_e("ATR_SL",  "1.0"))    # SL dinámico × ATR
+ATR_TP1_MULT      = float(_e("ATR_TP1", "1.5"))
+ATR_TP2_MULT      = float(_e("ATR_TP2", "3.0"))
+ATR_PTP_MULT      = float(_e("ATR_PTP", "0.5"))    # partial TP en 0.5×ATR
+MOM_LEN           = int(_e("MOM_LEN",   "20"))
+REV_LEN           = int(_e("REV_LEN",   "8"))
+VOL_LEN           = int(_e("VOL_LEN",   "14"))
+CVD_LEN           = int(_e("CVD_LEN",   "20"))
+CVD_ROLL          = int(_e("CVD_ROLL",  "100"))
+DECAY_LEN         = int(_e("DECAY_LEN", "40"))
+ADX_LEN           = int(_e("ADX_LEN",   "14"))
+ADX_TREND         = int(_e("ADX_TREND", "25"))
+ADX_LATERAL       = int(_e("ADX_LAT",   "20"))
+SQ_LEN            = int(_e("SQ_LEN",    "20"))
+RSI_LEN           = int(_e("RSI_LEN",   "14"))
+VP_LEN            = int(_e("VP_LEN",    "100"))
+VP_BINS           = int(_e("VP_BINS",   "24"))
+OB_BARS           = int(_e("OB_BARS",   "50"))
+OB_IMP_MULT       = float(_e("OB_IMP", "1.5"))
+FVG_MIN_MULT      = float(_e("FVG_MIN","0.3"))
+FVG_BARS          = int(_e("FVG_BARS",  "40"))
+FVG_MAX           = int(_e("FVG_MAX",   "5"))
+SWING_BARS        = int(_e("SWING_BARS","40"))
+OI_LEN            = int(_e("OI_LEN",    "20"))
+LS_LEN            = int(_e("LS_LEN",    "20"))
+TL_LOOKBACK       = int(_e("TL_LB",     "30"))
+HL_WINDOW         = int(_e("HL_WIN",    "40"))
 
-    # ── Riesgo ─────────────────────────────────────────────
-    LEVERAGE:             int   = int(os.getenv("LEVERAGE",         "5"))
-    RISK_PER_TRADE_PCT:   float = float(os.getenv("RISK_PCT",       "0.5"))
-    MAX_DAILY_DD_PCT:     float = float(os.getenv("MAX_DD_PCT",     "5.0"))
-    MAX_OPEN_POSITIONS:   int   = int(os.getenv("MAX_POSITIONS",    "5"))
-    TP_RR:                float = float(os.getenv("TP_RR",          "2.0"))
+# ── KELLY ─────────────────────────────────────────────────────────────────────
+KELLY_ENABLED     = _e("KELLY",       "true").lower() == "true"
+KELLY_FRACTION    = float(_e("KELLY_FRAC", "0.25"))
+KELLY_WIN_RATE    = float(_e("KELLY_WR",   "0.55"))
+KELLY_RR          = float(_e("KELLY_RR",   "1.8"))
 
-    # ── Sesiones (NY / LDN / ASIA) ─────────────────────────
-    ALLOWED_SESSIONS: List[str] = field(
-        default_factory=lambda: _lst(os.getenv("SESSIONS", "NY,LDN"))
-    )
+# ── CIRCUIT BREAKER ───────────────────────────────────────────────────────────
+CB_ENABLED        = _e("CB_ON",       "true").lower() == "true"
+CB_BARS           = int(_e("CB_BARS",  "10"))
+CB_MULT           = float(_e("CB_MULT","3.0"))
+DAILY_LOSS_LIMIT  = float(_e("DAILY_LOSS", "0.05"))   # 5%
 
-    # ── Timing ─────────────────────────────────────────────
-    LOOP_INTERVAL:    int = int(os.getenv("LOOP_INTERVAL",    "30"))
-    SCANNER_INTERVAL: int = int(os.getenv("SCANNER_INTERVAL", "3600"))
+# ── PARTIAL TP ────────────────────────────────────────────────────────────────
+PTP_ENABLED       = _e("PTP_ON",  "true").lower() == "true"
+PTP_PCT           = float(_e("PTP_PCT", "0.25"))      # cerrar 25% en TP0.5
 
-    # ── Score / señal ──────────────────────────────────────
-    SCORE_THR_LONG:  float = float(os.getenv("SCORE_THR_LONG",  "0.60"))
-    SCORE_THR_SHORT: float = float(os.getenv("SCORE_THR_SHORT", "0.60"))
-    DECAY_THR:       float = float(os.getenv("DECAY_THR",       "0.60"))
+# ── CANDLES ───────────────────────────────────────────────────────────────────
+CANDLE_TF         = _e("CANDLE_TF",    "3m")
+CANDLE_LIMIT      = int(_e("CANDLE_LIMIT", "300"))
+HTF_15M_TF        = _e("HTF_15M", "15m")
+HTF_1H_TF         = _e("HTF_1H",  "1h")
+HTF_W_TF          = _e("HTF_W",   "1w")
+HTF_1M_TF         = _e("HTF_1M",  "1m")
 
-    # ── Convicción mínima por tier ─────────────────────────
-    MIN_CONV_STD:  int = int(os.getenv("MIN_CONV_STD",  "5"))
-    MIN_CONV_FUEL: int = int(os.getenv("MIN_CONV_FUEL", "6"))
-    MIN_CONV_SUP:  int = int(os.getenv("MIN_CONV_SUP",  "7"))
+# ── FILTROS ───────────────────────────────────────────────────────────────────
+VOL_FILTER_ON     = _e("VOL_FILTER", "true").lower() == "true"
+VOL_FILTER_THR    = float(_e("VOL_THR", "0.70"))
+EXEC_BPT          = float(_e("EXEC_BPT","0.18"))      # umbral drenaje spread %
+OVERLAP_BOOST     = int(_e("OVL_BOOST", "3"))          # pts extra en LDN/NY overlap
+SESSION_ASIA      = _e("SES_ASIA", "false").lower() == "true"  # incluir Asia en señales
 
-    # ── Performance filter ─────────────────────────────────
-    MIN_PF:    float = float(os.getenv("MIN_PF",    "1.2"))
-    PF_WINDOW: int   = int(os.getenv("PF_WINDOW",   "20"))
-
-    # ── OFI ────────────────────────────────────────────────
-    OFI_LEVELS:     int   = int(os.getenv("OFI_LEVELS",      "5"))
-    OFI_THR_WEAK:   float = float(os.getenv("OFI_THR_WEAK",  "0.25"))
-    OFI_THR_STRONG: float = float(os.getenv("OFI_THR_STRONG","0.45"))
-
-    # ── Funding Rate ───────────────────────────────────────
-    FR_BULL_THR:    float = float(os.getenv("FR_BULL_THR",    "0.0001"))
-    FR_BEAR_THR:    float = float(os.getenv("FR_BEAR_THR",   "-0.0001"))
-    FR_EXTREME_THR: float = float(os.getenv("FR_EXTREME_THR", "0.005"))
-
-    # ── Open Interest ──────────────────────────────────────
-    OI_DELTA_THR: float = float(os.getenv("OI_DELTA_THR", "0.005"))
-
-    # ── Trailing SL ────────────────────────────────────────
-    TRAIL_ACTIVATE_ATR: float = float(os.getenv("TRAIL_ACTIVATE_ATR", "1.0"))
-    TRAIL_ATR_MULT:     float = float(os.getenv("TRAIL_ATR_MULT",     "1.5"))
-
-    # ── Órdenes maker ─────────────────────────────────────
-    USE_MAKER_ORDERS:   bool  = _bool(os.getenv("USE_MAKER_ORDERS",  "true"))
-    MAKER_TIMEOUT:      int   = int(os.getenv("MAKER_TIMEOUT",       "20"))
-    MAKER_OFFSET_PCT:   float = float(os.getenv("MAKER_OFFSET_PCT",  "0.015"))
-
-    # ── Multi-TF ───────────────────────────────────────────
-    USE_1H_FILTER:  bool = _bool(os.getenv("USE_1H_FILTER", "true"))
-    MULTI_TF_BONUS: int  = int(os.getenv("MULTI_TF_BONUS",  "2"))
-
-    # ── Anti-rate-limit ────────────────────────────────────
-    BALANCE_CACHE_TTL: int = int(os.getenv("BALANCE_CACHE_TTL", "60"))
-    API_RETRY_MAX:     int = int(os.getenv("API_RETRY_MAX",      "3"))
-    API_RETRY_DELAY:   float = float(os.getenv("API_RETRY_DELAY","2.0"))
-
-    # ── Entry logic weights (Score+CVD+MOM+DECAY) ──────────
-    W_SCORE:  float = float(os.getenv("W_SCORE",  "0.40"))
-    W_CVD:    float = float(os.getenv("W_CVD",    "0.25"))
-    W_MOM:    float = float(os.getenv("W_MOM",    "0.20"))
-    W_DECAY:  float = float(os.getenv("W_DECAY",  "0.15"))
-    ENTRY_MIN_COMPOSITE: float = float(os.getenv("ENTRY_MIN_COMPOSITE", "0.58"))
-
-
-cfg = Config()
+# ── HEALTH CHECK ──────────────────────────────────────────────────────────────
+PORT              = int(_e("PORT", "8080"))
+LOG_LEVEL         = _e("LOG_LEVEL", "INFO")
+CYCLE_MINUTES     = int(_e("CYCLE_MINUTES", "3"))

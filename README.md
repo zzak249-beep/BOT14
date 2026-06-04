@@ -1,196 +1,83 @@
-# QF Machine × JP Fusion — Bot v3.0
+# QF×JP v3.4 Bot — BingX Perpetuals
 
-Bot de trading algorítmico para BingX Perpetual Futures con señales por Telegram.  
-Traduce fielmente el indicador Pine Script QF×JP v3 (12 capas) a Python asyncio.
-
----
-
-## ⚠️ AVISO DE RIESGO
-
-Trading con apalancamiento puede resultar en pérdida total del capital.  
-**Empieza SIEMPRE en modo `MODE=SIGNAL` y valida al menos 2 semanas antes de pasar a LIVE.**
-
----
+Port completo del indicador QF Machine × JP Fusion v3.4 en Python.
+Desplegado en Railway, opera en BingX Perpetuals en temporalidad 3m.
 
 ## Arquitectura
 
 ```
-qf-jp-bot/
-├── bot/
-│   ├── main.py              # Loop principal asyncio
-│   ├── engine.py            # Motor QF×JP (L1–L12 en Python/NumPy)
-│   ├── bingx_client.py      # API BingX Futures (USDT-M)
-│   ├── telegram_client.py   # Notificaciones Telegram
-│   ├── risk_manager.py      # Tamaño de posición + drawdown
-│   └── session_filter.py    # Filtro Asia/Londres/NY
-├── config.py                # Todos los parámetros desde .env
+qfxjp_bot/
+├── main.py                       # Orquestador + health server + loop
+├── config.py                     # Variables de entorno
 ├── requirements.txt
-├── Dockerfile
 ├── railway.toml
-└── .env.example
+├── Procfile
+├── .env.example
+├── bingx/
+│   └── client.py                 # API BingX (HMAC-SHA256)
+├── strategy/
+│   ├── indicators.py             # TODOS los indicadores v3.4 portados
+│   └── qfxjp_signal.py           # Score compuesto + señales STD/FUEL/SUP
+├── trader/
+│   ├── position_manager.py       # Abrir/cerrar con Partial TP → BE
+│   └── risk_manager.py           # Daily loss, drawdown, circuit breaker
+├── notifications/
+│   └── telegram_notifier.py      # Mensajes ricos Telegram
+└── market_mechanics/
+    ├── session_manager.py        # Asia/London/NY + Judas Swing
+    ├── funding_monitor.py        # Funding rate veto
+    ├── oi_tracker.py             # Open Interest señales
+    ├── liquidation_estimator.py  # Mapa de liquidaciones
+    └── market_context.py         # Orquestador
 ```
 
----
+## Indicadores portados del Pine Script v3.4
 
-## Capas del motor de señal
+| Módulo  | Qué hace |
+|---------|----------|
+| L2      | Factores Momentum / Mean-Rev / Volume con pesos ADX dinámicos |
+| L3      | Decay adaptativo (IC rolling correlation) |
+| L4      | Dark Pool (volumen alto + rango estrecho) |
+| L6      | Asimetría de momentum alcista/bajista |
+| L7      | Ruptura de trendlines (pivotes) |
+| L8      | Swing HL/LH (sell_exhausted / buy_exhausted) |
+| L9      | Fair Value Gaps tracking múltiple |
+| L10     | Order Blocks + Breaker Blocks |
+| L11     | CVD Delta rolling + divergencias |
+| L12     | Squeeze Momentum (BB vs KC) |
+| L13     | CHoCH / BoS (cambio de estructura) |
+| L14     | Liquidity Sweeps |
+| L15     | Volume Profile (POC / VAH / VAL) |
+| L16     | OI Delta sintético (conf long/short/squeeze) |
+| L17     | LS Ratio sentiment contrarian |
+| [REG]   | Pesos dinámicos por régimen (TEND/LATERAL/NEUTRAL) |
+| [ENT]   | Entry Refinement 1m (wick rechazo) |
+| [SLD]   | SL Dinámico ATR × estructura |
+| [PTP]   | Partial TP 25% en TP0.5 → SL a breakeven |
+| [CB]    | Circuit Breaker (vela gigante = news filter) |
+| [KEL]   | Kelly Criterion sizing con walk-forward WR |
+| [HTF4]  | 3 TFs alineados (15m + 1h) + semanal macro |
 
-| Capa | Nombre | Función |
-|------|--------|---------|
-| L1 | Microestructura | ATR, spread bid/ask estimado |
-| L2 | Motor de Factores | Momentum + Mean-Reversion + OBV (ponderados) |
-| L3 | Decaimiento de Señal | IC rolling — la señal se "apaga" si pierde predictibilidad |
-| L4 | Dark Pool | Volumen spike + rango estrecho → bloque institucional |
-| L5 | Ejecución | Filtro de spread destructivo del alfa |
-| L6 | Asimetría Momentum | Velas alcistas vs bajistas (ratio rango) |
-| L7 | Ruptura Trendline | Pivots automáticos + break con buffer ATR |
-| L8 | Swing Analysis | HL↑ consecutivos = agotamiento vendedor |
-| L9 | Fair Value Gaps | Imbalances ICT — precio retestando zona |
-| L10 | Order Blocks | Última vela opuesta antes de impulso fuerte |
-| L11 | CVD Delta | Buy/sell pressure proxy — divergencias ocultas |
-| L12 | Squeeze Momentum | BB dentro de KC → compresión → explosión |
+## Señales
 
-### Tiers de señal
+- **STD** (score ≥ 55): señal estándar con exhaustion
+- **FUEL** (score ≥ 68): STD + categoría fuel (TL break / SQ / FVG / OB / Sweep / CHoCH)
+- **SUP** (score ≥ 80): FUEL + divergencias DP/CVD/RSI + sin OI squeeze
 
-| Tier | Condición | Convicción mínima recomendada |
-|------|-----------|-------------------------------|
-| STD | L1-L8 alineadas | 5/10 |
-| FUEL | STD + TL break ó Squeeze ó FVG/OB con CVD | 7/10 |
-| SUP ⭐ | FUEL + Dark Pool ó Divergencia CVD | 8/10 |
+## Deploy en Railway
 
----
+1. Push a GitHub
+2. Conectar repo en Railway → New Project from GitHub
+3. Añadir variables de entorno desde `.env.example`
+4. Railway detecta `railway.toml` → deploy automático
+5. Variables mínimas requeridas:
+   - `BINGX_API_KEY`, `BINGX_SECRET_KEY`
+   - `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`
 
-## Instalación local
+## Test local
 
 ```bash
-git clone https://github.com/TU_USUARIO/qf-jp-bot.git
-cd qf-jp-bot
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env
-# Edita .env con tus credenciales
-python -m bot.main
+cp .env.example .env   # editar con tus claves
+python main.py
 ```
-
----
-
-## Despliegue en Railway (recomendado)
-
-### 1. Crear bot de Telegram
-
-1. Habla con `@BotFather` → `/newbot`
-2. Guarda el token
-3. Crea un grupo o canal, añade el bot como admin
-4. Obtén el chat_id: envía un mensaje y visita  
-   `https://api.telegram.org/bot<TOKEN>/getUpdates`
-
-### 2. Credenciales BingX
-
-1. Entra en BingX → **API Management**
-2. Crea clave con permisos: **Read + Trade** (NO Withdraw)
-3. Whitelist tu IP de Railway (o déjala abierta solo si usas Railway con IP fija)
-
-### 3. Subir a GitHub
-
-```bash
-git init
-git add .
-git commit -m "QF×JP Bot v3.0"
-git remote add origin https://github.com/TU_USUARIO/qf-jp-bot.git
-git push -u origin main
-```
-
-### 4. Crear proyecto en Railway
-
-1. [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
-2. Selecciona tu repositorio
-3. Ve a **Variables** y añade una por una:
-
-```
-BINGX_API_KEY     = tu_key
-BINGX_SECRET      = tu_secret
-TG_TOKEN          = 123456:ABC...
-TG_CHAT_ID        = -100123456789
-MODE              = SIGNAL          ← empieza aquí
-SYMBOLS           = BTC-USDT,ETH-USDT,SOL-USDT
-LEVERAGE          = 10
-RISK_PCT          = 1.0
-MAX_DD_PCT        = 5.0
-TP_RR             = 2.0
-MIN_CONV_STD      = 5
-MIN_CONV_FUEL     = 7
-MIN_CONV_SUP      = 8
-SESSIONS          = NY,LDN
-LOOP_INTERVAL     = 30
-```
-
-4. Railway detecta el `Dockerfile` y despliega automáticamente
-5. Verifica en **Logs** que aparece:
-   ```
-   QF × JP Bot v3 iniciado
-   Balance USDT: xxx.xx
-   ```
-
----
-
-## Flujo de operación
-
-```
-Cada 30s por símbolo:
-  1. ¿Sesión permitida? (NY/LDN/ASIA)
-  2. Descarga 250 velas 3min + 100 velas 15min
-  3. Calcula L1→L12 en NumPy
-  4. Evalúa señal: STD / FUEL / SUP
-  5. Si posición abierta → revisa SL dinámico y señal contraria
-  6. Si señal nueva → calcula tamaño (Kelly fraccionado)
-  7. SIGNAL: Telegram | LIVE: orden market BingX + SL integrado
-```
-
----
-
-## Gestión de riesgo
-
-- **1% del balance** por trade (ajustable con `RISK_PCT`)
-- **SL automático** basado en último swing low/high del indicador
-- **TP automático** en R:R 2.0 (ajustable con `TP_RR`)
-- **Drawdown diario** máx 5% → bot se detiene automáticamente
-- **Apalancamiento** 10× máximo recomendado (usa 5× para empezar)
-- Nunca más del 80% del margen disponible en una sola posición
-
----
-
-## Protocolo de arranque (obligatorio)
-
-```
-Semana 1-2 → MODE=SIGNAL   Observa señales, valida calidad
-Semana 3   → MODE=LIVE      RISK_PCT=0.5, LEVERAGE=5
-Semana 4+  → MODE=LIVE      RISK_PCT=1.0, LEVERAGE=10
-```
-
----
-
-## Símbolos recomendados (BingX)
-
-```
-BTC-USDT   ETH-USDT   SOL-USDT
-BNB-USDT   XRP-USDT   DOGE-USDT
-```
-
-Formato exacto requerido: `BTC-USDT` (con guion, en mayúsculas).
-
----
-
-## Actualizar el bot
-
-```bash
-git add .
-git commit -m "update"
-git push
-```
-Railway redespliega automáticamente en segundos.
-
----
-
-## Licencia
-
-Uso personal. No redistribuir sin autorización.
