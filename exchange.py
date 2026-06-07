@@ -87,11 +87,39 @@ class BingXClient:
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
         )
-        return [
-            {"time": int(r[0]), "open": float(r[1]), "high": float(r[2]),
-             "low":  float(r[3]), "close": float(r[4]), "volume": float(r[5])}
-            for r in data.get("data", [])
-        ]
+        raw = data.get("data", [])
+        result = []
+        for r in raw:
+            try:
+                # Formato A: lista/tupla  [time, open, high, low, close, volume, ...]
+                if isinstance(r, (list, tuple)):
+                    result.append({
+                        "time":   int(r[0]),
+                        "open":   float(r[1]),
+                        "high":   float(r[2]),
+                        "low":    float(r[3]),
+                        "close":  float(r[4]),
+                        "volume": float(r[5]),
+                    })
+                # Formato B: diccionario {"time":..., "open":..., ...}
+                elif isinstance(r, dict):
+                    # BingX v3 usa claves: openTime/time, open/o, high/h, low/l, close/c, volume/v
+                    result.append({
+                        "time":   int(r.get("time", r.get("openTime", r.get("t", 0)))),
+                        "open":   float(r.get("open", r.get("o", 0))),
+                        "high":   float(r.get("high", r.get("h", 0))),
+                        "low":    float(r.get("low",  r.get("l", 0))),
+                        "close":  float(r.get("close", r.get("c", 0))),
+                        "volume": float(r.get("volume", r.get("v", 0))),
+                    })
+                else:
+                    log.warning("get_klines: formato de vela desconocido: %s", type(r))
+            except (KeyError, IndexError, TypeError, ValueError) as e:
+                log.warning("get_klines: error parseando vela %s — %s", r, e)
+                continue
+        if not result:
+            log.error("get_klines: respuesta vacía o no parseable. raw=%s", str(raw)[:300])
+        return result
 
     # ── Balance ────────────────────────────────────────────────────────────────
 
