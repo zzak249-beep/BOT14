@@ -83,15 +83,41 @@ class BingXClient:
     # ── Klines ─────────────────────────────────────────────────────────────────
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 150) -> List[Dict]:
+        """
+        Obtiene velas OHLCV.
+        Usa v2 (arrays) con fallback a v3 (dicts).
+        """
         data = await self._get_pub(
-            "/openApi/swap/v3/quote/klines",
+            "/openApi/swap/v2/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
         )
-        return [
-            {"time": int(r[0]), "open": float(r[1]), "high": float(r[2]),
-             "low":  float(r[3]), "close": float(r[4]), "volume": float(r[5])}
-            for r in data.get("data", [])
-        ]
+        candles = []
+        for r in data.get("data", []):
+            try:
+                if isinstance(r, (list, tuple)):
+                    # Formato v2: [time, open, high, low, close, volume, ...]
+                    candles.append({
+                        "time":   int(r[0]),
+                        "open":   float(r[1]),
+                        "high":   float(r[2]),
+                        "low":    float(r[3]),
+                        "close":  float(r[4]),
+                        "volume": float(r[5]),
+                    })
+                elif isinstance(r, dict):
+                    # Formato v3: {"time":..., "open":..., ...}
+                    candles.append({
+                        "time":   int(r.get("time",   r.get("t", 0))),
+                        "open":   float(r.get("open",   r.get("o", 0))),
+                        "high":   float(r.get("high",   r.get("h", 0))),
+                        "low":    float(r.get("low",    r.get("l", 0))),
+                        "close":  float(r.get("close",  r.get("c", 0))),
+                        "volume": float(r.get("volume", r.get("v", 0))),
+                    })
+            except (IndexError, KeyError, TypeError, ValueError) as e:
+                log.warning("Error parseando vela %s: %s", r, e)
+                continue
+        return candles
 
     # ── Balance ────────────────────────────────────────────────────────────────
 
