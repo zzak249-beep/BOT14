@@ -1,6 +1,6 @@
 """
-GUA-USDT Bot v3 — Notificador Telegram
-Nuevo: MFI · Compresión · Fortaleza relativa · Funding predictivo · Score breakdown
+GUA-USDT Bot v2 — Notificador Telegram
+Mensajes con contexto SMC: FVG · OB · LiqSweep · Squeeze · RVOL.
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from strategy import Signal
 
 log = logging.getLogger("notifier")
 
-_BASE = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
-_MTAG = "🔴 LIVE" if config.MODE == "LIVE" else "🟡 SIGNAL"
+_BASE  = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
+_MTAG  = "🔴 LIVE" if config.MODE == "LIVE" else "🟡 SIGNAL"
 
 
 class Notifier:
@@ -34,8 +34,8 @@ class Notifier:
         try:
             s = await self._sess()
             async with s.post(_BASE, json={
-                "chat_id":    config.TELEGRAM_CHAT_ID,
-                "text":       text,
+                "chat_id": config.TELEGRAM_CHAT_ID,
+                "text":    text,
                 "parse_mode": "Markdown",
             }) as r:
                 if r.status != 200:
@@ -43,20 +43,13 @@ class Notifier:
         except Exception as e:
             log.error("Telegram error: %s", e)
 
-    # ── Señal ─────────────────────────────────────────────────────────────────
+    # ── Señal ──────────────────────────────────────────────────────────────────
 
     async def send_signal(self, sig: Signal) -> None:
-        em  = "📈" if sig.direction == "LONG" else "📉"
-        bar = _bar(sig.score)
-        vol = "🌋 Alta" if sig.atr_pct >= 75 else ("🌊 Normal" if sig.atr_pct >= 40 else "😴 Baja")
-        smcs = _smc_tags(sig)
-        anti = _anticipation_tags(sig)
-
-        # Top-3 componentes del score
-        top3 = ""
-        if sig.components:
-            top = sorted(sig.components.items(), key=lambda x: -x[1])[:3]
-            top3 = "🔑 Top señales: " + " · ".join(f"{k}(+{v:.2f})" for k, v in top) + "\n"
+        em    = "📈" if sig.direction == "LONG" else "📉"
+        bar   = _bar(sig.score)
+        vol   = "🌋 Alta" if sig.atr_pct >= 75 else ("🌊 Normal" if sig.atr_pct >= 40 else "😴 Baja")
+        smcs  = _smc_tags(sig)
 
         text = (
             f"{em} *GUA-USDT {sig.direction}* {_MTAG}\n"
@@ -66,26 +59,23 @@ class Notifier:
             f"🎯 TP1:    `{sig.tp1:.5f}`\n"
             f"🏆 TP2:    `{sig.tp2:.5f}`\n"
             f"────────────────────\n"
-            f"📊 RSI: `{sig.rsi:.1f}` | MFI: `{sig.mfi:.1f}` | ADX: `{sig.adx:.1f}`\n"
-            f"📣 RVOL: `{sig.rvol:.2f}x` | {vol} (ATR `{sig.atr_pct:.0f}`)\n"
+            f"📊 RSI: `{sig.rsi:.1f}` | ADX: `{sig.adx:.1f}`\n"
+            f"📣 RVOL: `{sig.rvol:.2f}x` | {vol} (ATR pct `{sig.atr_pct:.0f}`)\n"
             f"💰 Funding: `{sig.funding:.4%}`\n"
             f"🌀 Squeeze: `{'activo' if sig.squeeze else 'libre'}`\n"
             f"────────────────────\n"
             f"{smcs}"
-            f"{anti}"
-            f"{top3}"
             f"⭐ Score: `{sig.score:.0%}` {bar}\n"
             f"────────────────────\n"
             f"🧠 *Razones:*\n{_fmt(sig.reason)}"
         )
         await self._send(text)
 
-    # ── Entrada ───────────────────────────────────────────────────────────────
+    # ── Entrada ────────────────────────────────────────────────────────────────
 
     async def send_entry(self, sig: Signal, qty: float, balance: float) -> None:
         em   = "🟢" if sig.direction == "LONG" else "🔴"
         smcs = _smc_tags(sig)
-        anti = _anticipation_tags(sig)
         sl_m = config.ATR_HIGHVOL_MULT if sig.atr_pct >= 75 else config.ATR_SL_MULT
         text = (
             f"{em} *ENTRADA {sig.direction}* — GUA-USDT\n"
@@ -100,12 +90,11 @@ class Notifier:
             f"🌋 ATR pct: `{sig.atr_pct:.0f}` | RVOL: `{sig.rvol:.2f}x`\n"
             f"────────────────────\n"
             f"{smcs}"
-            f"{anti}"
             f"⚙️ Modo: {config.MODE}"
         )
         await self._send(text)
 
-    # ── TP ────────────────────────────────────────────────────────────────────
+    # ── TP ─────────────────────────────────────────────────────────────────────
 
     async def send_tp(self, label: str, price: float, pnl: float,
                        partial: bool = False) -> None:
@@ -120,49 +109,44 @@ class Notifier:
             text += "\n🔄 SL → Breakeven | Trailing activado"
         await self._send(text)
 
-    # ── Cierre ────────────────────────────────────────────────────────────────
+    # ── Cierre ─────────────────────────────────────────────────────────────────
 
     async def send_close(self, label: str, price: float, pnl: float,
                           is_sl: bool = False) -> None:
         em   = "❌" if is_sl else "✅"
         sign = "+" if pnl >= 0 else ""
-        cd   = config.COOLDOWN_MIN_LOSS if is_sl else config.COOLDOWN_MIN
         text = (
             f"{em} *{label} — GUA-USDT*\n"
             f"📌 Precio: `{price:.5f}`\n"
             f"💵 PnL: `{sign}{pnl:.4f} USDT`\n"
-            f"⏱ Cooldown: `{cd} min`"
+            f"⏱ Cooldown: `{config.COOLDOWN_MIN} min`"
         )
         await self._send(text)
 
     async def send_error(self, msg: str) -> None:
-        await self._send(f"⚠️ *ERROR GUA Bot v3*\n```\n{msg}\n```")
+        await self._send(f"⚠️ *ERROR GUA Bot v2*\n```\n{msg}\n```")
 
     async def send_status(self, text: str) -> None:
-        await self._send(f"🤖 *GUA Bot v3 Status*\n{text}")
+        await self._send(f"🤖 *GUA Bot v2 Status*\n{text}")
 
     async def send_startup(self) -> None:
         text = (
-            f"🚀 *GUA-USDT Bot v3 iniciado*\n"
+            f"🚀 *GUA-USDT Bot v2 iniciado*\n"
             f"────────────────────\n"
             f"📍 Símbolo: `{config.SYMBOL}`\n"
             f"⏱ TFs: `{config.INTERVAL}` · `{config.INTERVAL_TREND}` · `{config.INTERVAL_MACRO}`\n"
-            f"📊 LOOKBACK: `{config.LOOKBACK}` (EMA200 válida ✅)\n"
             f"⚡ Leverage: `{config.LEVERAGE}x` | Riesgo: `{config.RISK_PCT:.0%}`\n"
-            f"📊 Score mín: `{config.SCORE_THR:.0%}` (walk-forward adaptativo)\n"
+            f"📊 Score mín: `{config.SCORE_THR:.0%}`\n"
             f"🔍 Sesión: `{'London+NY' if config.SESSION_FILTER else 'Always'}`\n"
             f"⚙️ Modo: *{config.MODE}*\n"
             f"────────────────────\n"
-            f"🆕 *v3 — Técnicas activas:*\n"
-            f"  • SMC: FVG · OB · LiqSweep (tol.dinámica) · BOS/CHoCH\n"
-            f"  • Momentum: Squeeze · MACD (usado en score) · RSI\n"
-            f"  • Volumen: MFI · CVD Div · RVOL\n"
-            f"  • VWAP+Bandas · ATR Percentil\n"
-            f"  • Derivados: Funding+Predictivo · OI Delta (1h)\n"
-            f"  • Anticipación: Compresión · Fortaleza BTC · Liquidaciones\n"
-            f"  • Walk-forward: umbral adaptativo · CSV logging\n"
-            f"  • Microestructura OB cada 30s\n"
-            f"  • MTF: {config.INTERVAL} · {config.INTERVAL_TREND} · {config.INTERVAL_MACRO}"
+            f"🆕 *Técnicas activas:*\n"
+            f"  • SMC: FVG · Order Blocks · Liq Sweeps · BOS/CHoCH\n"
+            f"  • Momentum: TTM Squeeze · MACD\n"
+            f"  • Volumen: CVD Divergencia · RVOL\n"
+            f"  • Precio: VWAP+Bandas · ATR Percentil\n"
+            f"  • Derivados: Funding Extremo · OI Delta\n"
+            f"  • MTF: 3m · 15m · 1h"
         )
         await self._send(text)
 
@@ -171,38 +155,22 @@ class Notifier:
             await self._session.close()
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _bar(score: float) -> str:
     f = int(score * 10)
-    return "█" * f + "░" * (10 - f)
+    return "█"*f + "░"*(10-f)
 
 def _fmt(reason: str) -> str:
     return "\n".join(f"  • {p.strip()}" for p in reason.split("|") if p.strip())
 
 def _smc_tags(sig: Signal) -> str:
     tags = []
-    if sig.liq_sweep:              tags.append("🎣 LiqSweep")
-    if sig.fvg_hit:                tags.append("📦 FVG")
-    if sig.ob_hit:                 tags.append("🧱 OB")
-    if sig.bos   != "NONE":        tags.append(f"⚡ BOS {sig.bos}")
-    if sig.choch != "NONE":        tags.append(f"🔄 CHoCH {sig.choch}")
+    if sig.liq_sweep: tags.append("🎣 LiqSweep")
+    if sig.fvg_hit:   tags.append("📦 FVG")
+    if sig.ob_hit:    tags.append("🧱 OB")
+    if sig.bos   != "NONE": tags.append(f"⚡ BOS {sig.bos}")
+    if sig.choch != "NONE": tags.append(f"🔄 CHoCH {sig.choch}")
     if not tags:
         return ""
     return "🏷 SMC: " + " · ".join(tags) + "\n"
-
-def _anticipation_tags(sig: Signal) -> str:
-    """Etiquetas de técnicas anticipatorias v3."""
-    tags = []
-    if sig.compression:
-        tags.append("🗜 Compresión pre-BK")
-    if abs(sig.rel_strength) >= config.REL_STRENGTH_THR:
-        arrow = "📈" if sig.rel_strength > 0 else "📉"
-        tags.append(f"{arrow} RelStr BTC {sig.rel_strength:+.4f}")
-    if sig.liq_candle:
-        tags.append("⚡ Liquidación detectada")
-    if sig.funding_pre:
-        tags.append("⏰ Pre-funding window")
-    if not tags:
-        return ""
-    return "🔮 Anticipación: " + " · ".join(tags) + "\n"

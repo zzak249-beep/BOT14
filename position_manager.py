@@ -1,6 +1,6 @@
 """
-GUA-USDT Bot v3 — Gestor de Posiciones
-Nuevo: cooldown dinámico (win/loss) · CSV logging · walk-forward registro
+GUA-USDT Bot v2 — Gestor de Posiciones
+Dynamic SL según régimen ATR · Partial TP → BE → Trailing · Force-close.
 """
 
 from __future__ import annotations
@@ -11,28 +11,27 @@ from typing import Optional
 import config
 from exchange import BingXClient
 from notifier import Notifier
-from strategy import Signal, cooldown_duration, record_trade_result, log_trade_csv
+from strategy import Signal
 
 log = logging.getLogger("pm")
 
 
 @dataclass
 class ActivePosition:
-    symbol:     str
-    direction:  str
-    entry:      float
-    sl:         float
-    tp1:        float
-    tp2:        float
-    atr:        float
-    atr_pct:    float
-    qty_total:  float
-    qty_left:   float
-    signal:     Signal             # guardamos la señal completa para el CSV
-    tp1_hit:    bool  = False
-    trail_sl:   float = 0.0
-    opened_at:  float = field(default_factory=time.time)
-    peak_price: float = 0.0
+    symbol:    str
+    direction: str
+    entry:     float
+    sl:        float
+    tp1:       float
+    tp2:       float
+    atr:       float
+    atr_pct:   float
+    qty_total: float
+    qty_left:  float
+    tp1_hit:   bool  = False
+    trail_sl:  float = 0.0
+    opened_at: float = field(default_factory=time.time)
+    peak_price: float = 0.0   # máximo favorable alcanzado
 
 
 class PositionManager:
@@ -51,7 +50,7 @@ class PositionManager:
     def in_cooldown(self) -> bool:
         return time.time() < self._cooldown_until
 
-    # ── Apertura ──────────────────────────────────────────────────────────────
+    # ── Apertura ───────────────────────────────────────────────────────────────
 
     async def open_position(self, signal: Signal) -> None:
         if self.has_position or self.in_cooldown:
@@ -65,7 +64,7 @@ class PositionManager:
         if balance <= 0:
             log.error("Balance cero"); return
 
-        # Tamaño reducido en alta volatilidad
+        # Tamaño dinámico: más pequeño en alta volatilidad
         vol_factor = 0.8 if signal.atr_pct >= 75 else 1.0
         risk_usd   = balance * config.RISK_PCT * config.LEVERAGE * vol_factor
         sl_dist    = signal.atr * (
@@ -106,13 +105,12 @@ class PositionManager:
             atr_pct    = signal.atr_pct,
             qty_total  = qty,
             qty_left   = qty,
-            signal     = signal,
             trail_sl   = init_trail,
             peak_price = signal.price,
         )
         await self._n.send_entry(signal, qty, balance)
 
-    # ── Monitor ───────────────────────────────────────────────────────────────
+    # ── Monitor ────────────────────────────────────────────────────────────────
 
     async def monitor(self, price: float) -> None:
         if not self._pos:
@@ -123,19 +121,17 @@ class PositionManager:
         if p.direction == "LONG"  and price > p.peak_price: p.peak_price = price
         if p.direction == "SHORT" and price < p.peak_price: p.peak_price = price
 
-        # TP1 parcial (50%)
+        # TP1
         if not p.tp1_hit:
-            tp1_reached = (
-                (p.direction == "LONG"  and price >= p.tp1) or
-                (p.direction == "SHORT" and price <= p.tp1)
-            )
-            if tp1_reached:
+            tp1_hit = (p.direction=="LONG" and price>=p.tp1) or \
+                      (p.direction=="SHORT" and price<=p.tp1)
+            if tp1_hit:
                 await self._partial_close(p, price, "TP1")
                 p.tp1_hit = True
-                p.sl = p.entry   # mover SL a breakeven
+                p.sl = p.entry      # BE
                 return
 
-        # Actualizar trailing SL
+        # Trailing actualizado dinámicamente
         if p.tp1_hit:
             if p.direction == "LONG":
                 new_t = price - p.atr * config.ATR_TRAIL_MULT
@@ -145,24 +141,20 @@ class PositionManager:
                 if new_t < p.trail_sl: p.trail_sl = new_t
 
         # TP2
-        tp2_reached = (
-            (p.direction == "LONG"  and price >= p.tp2) or
-            (p.direction == "SHORT" and price <= p.tp2)
-        )
-        if tp2_reached:
-            await self._full_close(p, price, "TP2", is_sl=False); return
+        tp2_hit = (p.direction=="LONG" and price>=p.tp2) or \
+                  (p.direction=="SHORT" and price<=p.tp2)
+        if tp2_hit:
+            await self._full_close(p, price, "TP2"); return
 
-        # SL o trailing SL
+        # SL / Trailing SL
         sl_ref = p.trail_sl if p.tp1_hit else p.sl
-        sl_hit = (
-            (p.direction == "LONG"  and price <= sl_ref) or
-            (p.direction == "SHORT" and price >= sl_ref)
-        )
+        sl_hit = (p.direction=="LONG"  and price<=sl_ref) or \
+                 (p.direction=="SHORT" and price>=sl_ref)
         if sl_hit:
             label = "Trailing SL" if p.tp1_hit else "SL"
-            await self._full_close(p, price, label, is_sl=True)
+            await self._full_close(p, price, label)
 
-    # ── Cierres ───────────────────────────────────────────────────────────────
+    # ── Cierres ────────────────────────────────────────────────────────────────
 
     async def _partial_close(self, p: ActivePosition, price: float, label: str) -> None:
         qty  = round(p.qty_total * 0.5, 4)
@@ -177,62 +169,42 @@ class PositionManager:
         await self._n.send_tp(label, price, pnl, partial=True)
         log.info("%s parcial @%.5f | PnL=%.4f", label, price, pnl)
 
-    async def _full_close(self, p: ActivePosition, price: float,
-                           label: str, is_sl: bool) -> None:
+    async def _full_close(self, p: ActivePosition, price: float, label: str) -> None:
         side = "SELL" if p.direction == "LONG" else "BUY"
         pnl  = self._pnl(p, price, p.qty_left)
-
         if config.MODE == "LIVE":
             try:
-                await self._c.place_market_order(
-                    config.SYMBOL, side, p.qty_left, reduce_only=True
-                )
+                await self._c.place_market_order(config.SYMBOL, side, p.qty_left, reduce_only=True)
             except Exception as e:
                 log.error("Full close error: %s", e); return
-
+        is_sl = label in ("SL", "Trailing SL")
         await self._n.send_close(label, price, pnl, is_sl=is_sl)
-        log.info("%s @%.5f | PnL=%.4f | is_sl=%s", label, price, pnl, is_sl)
-
-        # ── Walk-forward: registrar resultado ─────────────────────────────────
-        win = pnl > 0
-        record_trade_result(win)
-
-        # ── CSV logging ───────────────────────────────────────────────────────
-        outcome = label
-        log_trade_csv(p.signal, outcome, pnl)
-
-        # ── Cooldown dinámico (más tiempo tras SL) ────────────────────────────
-        cd_mins = cooldown_duration(is_sl=is_sl, atr_pct=p.atr_pct)
-        self._cooldown_until = time.time() + cd_mins * 60
-        log.info("Cooldown: %d min (is_sl=%s atr_pct=%.0f)", cd_mins, is_sl, p.atr_pct)
-
+        log.info("%s @%.5f | PnL=%.4f", label, price, pnl)
         self._pos = None
+        self._cooldown_until = time.time() + config.COOLDOWN_MIN * 60
 
     def _pnl(self, p: ActivePosition, price: float, qty: float) -> float:
         mult = config.LEVERAGE
-        return (
-            (price - p.entry) * qty * mult if p.direction == "LONG"
-            else (p.entry - price) * qty * mult
-        )
+        return ((price - p.entry) * qty * mult if p.direction == "LONG"
+                else (p.entry - price) * qty * mult)
 
     async def force_close(self, price: float, reason: str = "manual") -> None:
         if self._pos:
-            await self._full_close(self._pos, price, f"Cierre forzado ({reason})", is_sl=False)
+            await self._full_close(self._pos, price, f"Cierre forzado ({reason})")
 
     def status(self, price: float) -> str:
         if not self._pos:
-            cd_left = max(0, int(self._cooldown_until - time.time()))
-            return f"Sin posición | CD: {cd_left}s restantes" if cd_left > 0 else "Sin posición activa"
-        p   = self._pos
-        pnl = self._pnl(p, price, p.qty_left)
-        trail = f"\n🔄 Trail SL: {p.trail_sl:.5f}" if p.tp1_hit else ""
-        vol   = "🌋 Alta vol" if p.atr_pct >= 75 else "📊 Normal"
+            return "Sin posición activa"
+        p = self._pos
+        pnl    = self._pnl(p, price, p.qty_left)
+        trail  = f"\n🔄 Trail SL: {p.trail_sl:.5f}" if p.tp1_hit else ""
+        volreg = "🌋 Alta volatilidad" if p.atr_pct >= 75 else "📊 Normal"
         return (
             f"{'📈 LONG' if p.direction=='LONG' else '📉 SHORT'} GUA-USDT\n"
-            f"Entry: {p.entry:.5f} | Now: {price:.5f}\n"
+            f"Entry: {p.entry:.5f} | Precio: {price:.5f}\n"
             f"SL: {p.sl:.5f}{trail}\n"
             f"TP1: {p.tp1:.5f} {'✅' if p.tp1_hit else '⏳'}\n"
             f"TP2: {p.tp2:.5f}\n"
-            f"Qty: {p.qty_left:.4f} | PnL: {pnl:+.4f} USDT\n"
-            f"Peak: {p.peak_price:.5f} | {vol}"
+            f"Qty left: {p.qty_left:.4f} | PnL: {pnl:+.4f} USDT\n"
+            f"Peak: {p.peak_price:.5f} | {volreg}"
         )
