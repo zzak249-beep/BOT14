@@ -1,112 +1,97 @@
 """
-GUA-USDT Bot v2 — Configuración
+QF×JP Bot v6.5 — Config ANTI-LIQUIDACIÓN
+Fixes críticos basados en análisis de pérdidas:
+  - Notional cap 200 USDT (era ilimitado → liquidaciones de -85, -104, -278 USDT)
+  - SL_ATR_MULT 2.0 (era 1.2 → stop hunts en VANA, ILV, BANANA)
+  - Daily loss limit 2% (era 5% → hyper perdió 278 USDT en un día)
+  - MAX_OPEN_TRADES 3 (era 5-6 → acumula posiciones perdedoras)
 """
-
 import os
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# ── BingX API ──────────────────────────────────────────────────────────────────
-BINGX_API_KEY  = os.getenv("BINGX_API_KEY", "")
-BINGX_SECRET   = os.getenv("BINGX_SECRET", "")
-BASE_URL       = "https://open-api.bingx.com"
+def _bool(k, d): return os.getenv(k, str(d)).strip().lower() in ("true","1","yes")
+def _float(k, d):
+    try: return float(os.getenv(k, str(d)))
+    except: return d
+def _int(k, d):
+    try: return int(os.getenv(k, str(d)))
+    except: return d
+def _list(k, d):
+    r = os.getenv(k, d).strip()
+    return [x.strip() for x in r.split(",") if x.strip()] if r else []
 
-# ── Símbolo y temporalidades ───────────────────────────────────────────────────
-SYMBOL           = os.getenv("SYMBOL", "GUA-USDT")
-INTERVAL         = os.getenv("INTERVAL", "3m")
-INTERVAL_TREND   = os.getenv("INTERVAL_TREND", "15m")
-INTERVAL_MACRO   = os.getenv("INTERVAL_MACRO", "1h")
-LOOKBACK         = 150
-LOOKBACK_TREND   = 100
-LOOKBACK_MACRO   = 72
+# ── BingX ─────────────────────────────────────────────────────────────────────
+BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
+BINGX_BASE_URL   = "https://open-api.bingx.com"
 
-# ── Telegram ───────────────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── Modo ── CAMBIA A LIVE EN RAILWAY ──────────────────────────────────────────
-#   SIGNAL → solo Telegram, sin órdenes reales
-#   LIVE   → ejecuta órdenes en BingX
-MODE = os.getenv("MODE", "SIGNAL")
+# ── Modo ──────────────────────────────────────────────────────────────────────
+MODE = os.getenv("MODE", "SIGNAL").upper()
 
-# ── Capital ────────────────────────────────────────────────────────────────────
-LEVERAGE         = int(os.getenv("LEVERAGE",        "5"))
-RISK_PCT         = float(os.getenv("RISK_PCT",      "0.02"))
-MAX_OPEN_TRADES  = int(os.getenv("MAX_OPEN_TRADES", "1"))
+# ── Capital y riesgo ──────────────────────────────────────────────────────────
+CAPITAL          = _float("CAPITAL", 700.0)      # actualizar con saldo real
+RISK_PCT         = _float("RISK_PCT", 0.5)       # era 1.0 → reducido a 0.5%
+LEVERAGE         = _int("LEVERAGE", 10)
+MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)    # era 5-6 → 3 máximo
+MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)  # era 20 → 10 máximo
 
-# ── ATR dinámico ──────────────────────────────────────────────────────────────
-ATR_SL_MULT      = float(os.getenv("ATR_SL_MULT",      "1.5"))
-ATR_TP1_MULT     = float(os.getenv("ATR_TP1_MULT",     "2.0"))
-ATR_TP2_MULT     = float(os.getenv("ATR_TP2_MULT",     "4.0"))
-ATR_TRAIL_MULT   = float(os.getenv("ATR_TRAIL_MULT",   "1.0"))
-ATR_HIGHVOL_MULT = float(os.getenv("ATR_HIGHVOL_MULT", "2.0"))
+# ── Umbrales de señal ─────────────────────────────────────────────────────────
+MIN_SCORE  = _float("MIN_SCORE",  58.0)   # era 50 → más estricto
+FUEL_SCORE = _float("FUEL_SCORE", 65.0)   # era 62
+SUP_SCORE  = _float("SUP_SCORE",  80.0)
+MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()  # era STD → solo FUEL o SUP
 
-# ── Indicadores ────────────────────────────────────────────────────────────────
-RSI_PERIOD       = 14
-RSI_OB           = float(os.getenv("RSI_OB",  "63"))
-RSI_OS           = float(os.getenv("RSI_OS",  "37"))
-EMA_FAST         = 9
-EMA_SLOW         = 21
-EMA_TREND        = 50
-EMA_MACRO        = 200
-ADX_PERIOD       = 14
-ADX_MIN          = float(os.getenv("ADX_MIN", "18"))
+# ── Entrada ───────────────────────────────────────────────────────────────────
+REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
+HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)    # era 1 → 2 TFs confirmados
 
-# ── TTM Squeeze ────────────────────────────────────────────────────────────────
-BB_PERIOD        = 20
-BB_MULT          = 2.0
-KC_PERIOD        = 20
-KC_MULT          = 1.5
-MOM_PERIOD       = 12
+# ── Scanner ───────────────────────────────────────────────────────────────────
+SCAN_INTERVAL   = _int("SCAN_INTERVAL", 60)
+TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 0)
+BLACKLIST       = set(_list("BLACKLIST", ""))
+MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 5_000_000.0)
 
-# ── VWAP ──────────────────────────────────────────────────────────────────────
-VWAP_PERIOD      = 60
-VWAP_BAND_MULT   = 1.5
+# ── Timeframes ────────────────────────────────────────────────────────────────
+TIMEFRAME      = os.getenv("TIMEFRAME",      "3m")
+HTF_TIMEFRAME  = os.getenv("HTF_TIMEFRAME",  "15m")
+HTF2_TIMEFRAME = os.getenv("HTF2_TIMEFRAME", "1h")
+HTF5_TIMEFRAME = os.getenv("HTF5_TIMEFRAME", "4h")
 
-# ── RVOL ──────────────────────────────────────────────────────────────────────
-RVOL_PERIOD      = 20
-RVOL_MIN         = float(os.getenv("RVOL_MIN", "1.0"))  # bajado de 1.3 → más permisivo
+# ── ATR / SL / TP ─────────────────────────────────────────────────────────────
+ATR_LEN      = _int("ATR_LEN",       10)
+SL_ATR_MULT  = _float("SL_ATR_MULT",  2.0)   # era 1.2 → 2.0 para evitar stop hunts
+TP1_ATR_MULT = _float("TP1_ATR_MULT", 2.0)   # TP1 con R:R = 1:1
+TP2_ATR_MULT = _float("TP2_ATR_MULT", 4.0)   # TP2 con R:R = 1:2
 
-# ── CVD ────────────────────────────────────────────────────────────────────────
-CVD_LB           = 20
-CVD_DIV_LB       = 10
+# ── ADX ───────────────────────────────────────────────────────────────────────
+ADX_LEN     = _int("ADX_LEN", 14)
+ADX_TREND   = _float("ADX_TREND",   25.0)
+ADX_LATERAL = _float("ADX_LATERAL", 20.0)
 
-# ── FVG ────────────────────────────────────────────────────────────────────────
-FVG_LOOKBACK     = 30
-FVG_MIN_SIZE     = float(os.getenv("FVG_MIN_SIZE", "0.002"))  # bajado 0.3→0.2%
+# ── Kelly ─────────────────────────────────────────────────────────────────────
+KELLY_WIN_RATE = _float("KELLY_WIN_RATE", 0.55)
+KELLY_RR       = _float("KELLY_RR",       1.5)
+KELLY_FRACTION = _float("KELLY_FRACTION", 0.15)  # era 0.25 → reducido
 
-# ── Order Blocks ───────────────────────────────────────────────────────────────
-OB_LOOKBACK      = 40
-OB_IMPULSE_BARS  = 3
+# ── Circuit Breaker ───────────────────────────────────────────────────────────
+CB_ENABLED  = _bool("CB_ENABLED",   True)
+CB_ATR_MULT = _float("CB_ATR_MULT", 3.0)
+CB_BARS     = _int("CB_BARS",       10)
 
-# ── Liquidity Sweeps ───────────────────────────────────────────────────────────
-LIQ_LOOKBACK     = 25
-LIQ_TOLERANCE    = float(os.getenv("LIQ_TOLERANCE", "0.003"))  # subido 0.2→0.3%
+# ── Gestión de posiciones ─────────────────────────────────────────────────────
+POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
+BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.5)  # mover BE antes
 
-# ── ATR Percentil ──────────────────────────────────────────────────────────────
-ATR_PERCENTILE_LB = 50
+# ── Límite de pérdida diaria ──────────────────────────────────────────────────
+DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)  # era 5% → 2% del capital
 
-# ── Funding ────────────────────────────────────────────────────────────────────
-FUNDING_EXTREME_LONG  = float(os.getenv("FUNDING_EXTREME_LONG",  "0.0003"))
-FUNDING_EXTREME_SHORT = float(os.getenv("FUNDING_EXTREME_SHORT", "-0.0003"))
+# ── Notional máximo por trade ─────────────────────────────────────────────────
+MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)  # NUNCA subir sin justificación
 
-# ── OI ─────────────────────────────────────────────────────────────────────────
-OI_HISTORY_LEN   = 5
-
-# ── Señal ──────────────────────────────────────────────────────────────────────
-SCORE_THR        = float(os.getenv("SCORE_THR", "0.55"))  # bajado 0.58→0.55
-
-# ── Cooldown ───────────────────────────────────────────────────────────────────
-COOLDOWN_MIN     = int(os.getenv("COOLDOWN_MIN", "15"))
-
-# ── Sesiones ── GUA es cripto 24h, filtro OFF por defecto ─────────────────────
-SESSION_FILTER   = os.getenv("SESSION_FILTER", "false").lower() == "true"
-SESSION_HOURS    = [(0, 24)]   # 24h — sobreescribir con SESSION_FILTER=true si se quiere limitar
-
-# ── Order Book Imbalance ───────────────────────────────────────────────────────
-# GUA tiene volumen bajo → libro naturalmente desequilibrado → umbral alto
-OB_IMBALANCE_THR = float(os.getenv("OB_IMBALANCE_THR", "0.60"))  # subido 0.50→0.60
-
-# ── Health ─────────────────────────────────────────────────────────────────────
-PORT = int(os.getenv("PORT", "8080"))
+# ── Puerto ────────────────────────────────────────────────────────────────────
+PORT = _int("PORT", 8080)

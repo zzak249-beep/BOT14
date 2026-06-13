@@ -1,0 +1,120 @@
+"""
+QF×JP Bot v6.4 — Telegram Client
+Envía notificaciones al canal configurado.
+Todas las funciones son fire-and-forget (no bloquean el bot).
+"""
+import asyncio
+import logging
+
+import aiohttp
+
+import config as C
+
+log = logging.getLogger("telegram")
+
+_BASE = f"https://api.telegram.org/bot{C.TELEGRAM_TOKEN}/sendMessage"
+
+# ── Envío base ────────────────────────────────────────────────────────────────
+
+async def send(text: str, parse_mode: str = "Markdown") -> bool:
+    """Envía un mensaje al chat configurado. Silencia errores para no romper el bot."""
+    if not C.TELEGRAM_TOKEN or not C.TELEGRAM_CHAT_ID:
+        log.debug("Telegram no configurado — skip")
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(_BASE, json={
+                "chat_id":    C.TELEGRAM_CHAT_ID,
+                "text":       text,
+                "parse_mode": parse_mode,
+            }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    log.warning("Telegram %d: %s", r.status, body[:200])
+                return r.status == 200
+    except Exception as e:
+        log.warning("Telegram send error: %s", e)
+        return False
+
+# ── Notificaciones específicas ────────────────────────────────────────────────
+
+async def notify_signal(sig) -> None:
+    """Señal detectada (modo SIGNAL o antes de abrir en LIVE)."""
+    tier_icon = {"SUP": "🔥🔥", "FUEL": "🔥", "STD": "⚡"}.get(sig.tier, "📡")
+    dir_icon  = "🟢" if sig.direction == "LONG" else "🔴"
+
+    msg = (
+        f"{tier_icon} *{sig.symbol}* {dir_icon} `{sig.direction}`\n"
+        f"Score: `{sig.score:.1f}` | Tier: `{sig.tier}`\n"
+        f"Entry: `{sig.entry:.6f}`\n"
+        f"SL:    `{sig.sl:.6f}`\n"
+        f"TP1:   `{sig.tp1:.6f}`\n"
+        f"TP2:   `{sig.tp2:.6f}`\n"
+        f"ADX: `{sig.adx:.1f}` | MFI: `{sig.mfi:.1f}` | CVD: `{sig.cvd:.3f}`\n"
+        f"Estructura: `{sig.structure}` | TL: `{sig.tl_break}`\n"
+        f"HTF: `{sig.htf_score:.2f}` | FR: `{sig.funding_rate:.4f}`"
+    )
+    await send(msg)
+
+
+async def notify_trade_opened(sig, qty: float, order_id: str) -> None:
+    """Trade abierto en BingX."""
+    dir_icon = "🟢 LONG" if sig.direction == "LONG" else "🔴 SHORT"
+    msg = (
+        f"✅ *TRADE ABIERTO* — {sig.symbol}\n"
+        f"Dirección: {dir_icon}\n"
+        f"Entry: `{sig.entry:.6f}` | Qty: `{qty}`\n"
+        f"SL: `{sig.sl:.6f}` | TP1: `{sig.tp1:.6f}` | TP2: `{sig.tp2:.6f}`\n"
+        f"Score: `{sig.score:.1f}` ({sig.tier})\n"
+        f"Order ID: `{order_id}`"
+    )
+    await send(msg)
+
+
+async def notify_trade_closed(
+    symbol: str,
+    direction: str,
+    entry: float,
+    close_price: float,
+    qty: float,
+    reason: str,
+    pnl: float,
+) -> None:
+    """Trade cerrado (SL/TP auto o manual)."""
+    pnl_icon = "💚" if pnl >= 0 else "💔"
+    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    msg = (
+        f"{pnl_icon} *TRADE CERRADO* — {symbol} {dir_icon}\n"
+        f"Entry: `{entry:.6f}` → Close: `{close_price:.6f}`\n"
+        f"Qty: `{qty}` | Razón: `{reason}`\n"
+        f"PnL: `{pnl:+.4f} USDT`"
+    )
+    await send(msg)
+
+
+async def notify_circuit_breaker(symbol: str) -> None:
+    msg = f"⚠️ *CIRCUIT BREAKER* — `{symbol}`\nVela extrema detectada. En cooldown 10 min."
+    await send(msg)
+
+
+async def notify_status(status: dict, balance: float, n_symbols: int) -> None:
+    """Status periódico del bot."""
+    msg = (
+        f"📊 *STATUS QF×JP Bot*\n"
+        f"Modo: `{status.get('mode', '?')}`\n"
+        f"Balance: `{balance:.2f} USDT`\n"
+        f"Trades abiertos: `{status.get('open_trades', 0)}/{status.get('max_open', 0)}`\n"
+        f"Trades hoy: `{status.get('daily_trades', 0)}/{status.get('max_daily', 0)}`\n"
+        f"PnL diario: `{status.get('daily_pnl', 0):+.4f} USDT`\n"
+        f"Símbolos escaneados: `{n_symbols}`"
+    )
+    await send(msg)
+
+
+async def notify_error(context: str, error: str) -> None:
+    """Error interno del bot."""
+    msg = (
+        f"🚨 *ERROR* — `{context}`\n"
+        f"`{error[:300]}`"
+    )
+    await send(msg)
