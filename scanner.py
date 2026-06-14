@@ -1,9 +1,10 @@
 """
-QF×JP Bot v6.5.2 — Scanner con anticipación
-Nuevas funciones:
-  [ANT] Pre-señal: notifica símbolos calientes antes de cruzar umbral
-  [ANT] Hot queue: prioriza símbolos con pre_score alto en siguiente ciclo
-  [ANT] notify_pre_signal: Telegram con ⚡ pre-alerta
+QF×JP Bot v6.5 — Scanner CORREGIDO
+Fixes:
+  - symbol_allowed check (cooldown + límite/día)
+  - OBI boost desde order book
+  - Funding rate como filtro de sesgo
+  - Batch 20, pausa 0.2s
 """
 import asyncio
 import logging
@@ -19,10 +20,8 @@ import telegram_client as tg
 
 log = logging.getLogger("scanner")
 
-_cb_blacklist:  dict[str, float] = {}
-_hot_symbols:   dict[str, float] = {}  # [ANT] symbol → pre_score reciente
-CB_COOLDOWN  = 600
-HOT_DECAY    = 300   # segundos hasta olvidar pre-señal
+_cb_blacklist: dict[str, float] = {}
+CB_COOLDOWN = 600
 
 
 async def _fetch_all(client: BingXClient, symbol: str):
@@ -38,8 +37,8 @@ async def _fetch_all(client: BingXClient, symbol: str):
     def _l(r): return r if isinstance(r, list) else []
     def _d(r): return r if isinstance(r, dict) else {}
     def _f(r): return r if isinstance(r, float) else 0.0
-    return (_l(results[0]), _l(results[1]), _l(results[2]), _l(results[3]),
-            _d(results[4]), _f(results[5]))
+    return _l(results[0]), _l(results[1]), _l(results[2]), _l(results[3]), \
+           _d(results[4]), _f(results[5])
 
 
 def _obi(ob: dict) -> float:
@@ -96,21 +95,11 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         await tg.notify_circuit_breaker(symbol)
         return None
 
-    # [ANT] Pre-señal: score insuficiente pero pre_score alto
-    if sig.score < C.MIN_SCORE and sig.pre_score >= 60:
-        _hot_symbols[symbol] = now  # marcar como caliente
-        log.info("[%s] PRE-SEÑAL %s pre=%.1f score=%.1f sweep=%s sq_fire=%s",
-                 symbol, sig.direction, sig.pre_score, sig.score,
-                 sig.sweep, sig.squeeze_fire)
-        await tg.notify_pre_signal(sig)
-        return None
-
     if not risk.tier_ok(sig.tier):
         return None
 
-    log.info("[%s] Señal %s tier=%s score=%.1f pre=%.1f sweep=%s fr=%.4f",
-             symbol, sig.direction, sig.tier, sig.score, sig.pre_score,
-             sig.sweep, fr)
+    log.info("[%s] Señal %s tier=%s score=%.1f fr=%.4f",
+             symbol, sig.direction, sig.tier, sig.score, fr)
 
     if C.MODE == "SIGNAL":
         await tg.notify_signal(sig)
@@ -122,6 +111,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
 
+    # Cooldown por símbolo
     sym_ok, sym_reason = risk.symbol_allowed(symbol)
     if not sym_ok:
         log.debug("[%s] Bloqueado por símbolo: %s", symbol, sym_reason)
@@ -173,14 +163,11 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     )
     await pos_mgr.register_trade(trade)
     await tg.notify_trade_opened(sig, qty, order_id)
-
-    # [ANT] Limpiar de hot_symbols al abrir trade
-    _hot_symbols.pop(symbol, None)
     return sig
 
 
 async def scan_loop(client, risk, pos_mgr):
-    log.info("Scanner v6.5.2 | Modo=%s | Interval=%ds | Batch=20",
+    log.info("Scanner v6.5 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
@@ -214,21 +201,10 @@ async def scan_loop(client, risk, pos_mgr):
             except Exception:
                 pass
 
-        # [ANT] Limpiar hot_symbols expirados
-        now_ts = time.time()
-        expired = [s for s, ts in _hot_symbols.items() if now_ts - ts > HOT_DECAY]
-        for s in expired:
-            _hot_symbols.pop(s, None)
-
-        # [ANT] Ordenar: hot symbols primero → respuesta más rápida
-        hot  = [s for s in symbols if s in _hot_symbols]
-        cold = [s for s in symbols if s not in _hot_symbols]
-        symbols_ordered = hot + cold
-
         BATCH = 20
         signals_found = 0
-        for i in range(0, len(symbols_ordered), BATCH):
-            batch   = symbols_ordered[i:i+BATCH]
+        for i in range(0, len(symbols), BATCH):
+            batch   = symbols[i:i+BATCH]
             results = await asyncio.gather(
                 *[_process_symbol(s, client, risk, pos_mgr) for s in batch],
                 return_exceptions=True,
@@ -239,8 +215,7 @@ async def scan_loop(client, risk, pos_mgr):
             await asyncio.sleep(0.2)
 
         elapsed = time.time() - start
-        hot_count = len(_hot_symbols)
-        log.info("Iter %d | %d símbolos | %d señales | %d hot | %.1fs",
-                 iteration, len(symbols), signals_found, hot_count, elapsed)
+        log.info("Iter %d | %d símbolos | %d señales | %.1fs",
+                 iteration, len(symbols), signals_found, elapsed)
 
         await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
