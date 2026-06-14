@@ -357,13 +357,26 @@ class BingXClient:
     # ── Apalancamiento ────────────────────────────────────────────────────────
 
     async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
-        data = await self._post(
-            "/openApi/swap/v2/trade/leverage",
-            {"symbol": symbol, "side": side, "leverage": leverage},
+        """
+        Llama LONG y SHORT en paralelo para soportar Hedge mode y One-way mode.
+        En One-way mode BingX acepta ambas llamadas sin error.
+        En Hedge mode REQUIERE las dos llamadas separadas.
+        """
+        results = await asyncio.gather(
+            self._post("/openApi/swap/v2/trade/leverage",
+                       {"symbol": symbol, "side": "LONG", "leverage": leverage}),
+            self._post("/openApi/swap/v2/trade/leverage",
+                       {"symbol": symbol, "side": "SHORT", "leverage": leverage}),
+            return_exceptions=True,
         )
-        ok = data.get("code", -1) == 0
-        if not ok:
-            log.warning("[%s] set_leverage code=%s — continuando", symbol, data.get("code"))
+        ok = True
+        for s, r in zip(["LONG", "SHORT"], results):
+            if isinstance(r, Exception):
+                log.warning("[%s] set_leverage %s error: %s", symbol, s, r)
+                ok = False
+            elif r.get("code", -1) != 0:
+                log.warning("[%s] set_leverage %s code=%s", symbol, s, r.get("code"))
+        return ok
         return ok
 
     # ── Órdenes ───────────────────────────────────────────────────────────────
