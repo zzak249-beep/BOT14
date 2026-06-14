@@ -1,12 +1,12 @@
 """
-QF×JP Bot v6.5.3 — BingX Client
+QF×JP Bot v6.5.4 — BingX Client
 FIXES críticos:
-  - One-Way mode BingX requiere positionSide="BOTH" en TODAS las órdenes
-  - place_stop_market_order: quantity real (nunca "0") + positionSide=BOTH
-  - SL: closePosition=true + quantity real + positionSide=BOTH
-  - TP1/TP2: quantity real + positionSide=BOTH
-  - place_market_order: positionSide=BOTH
-  - close_position_market: positionSide=BOTH
+  - HEDGE mode: positionSide = "LONG" o "SHORT" según dirección (nunca "BOTH")
+  - place_market_order: acepta position_side y lo envía a BingX
+  - place_stop_market_order: usa position_side real (antes ignorado)
+  - close_position_market: usa position_side real (antes ignorado)
+  - open_trade: pasa direction como position_side a todas las órdenes
+  - SL breakeven en position_manager ya pasa trade.direction → compatible
 """
 import asyncio
 import hashlib
@@ -49,7 +49,7 @@ class BingXClient:
         self._session:       Optional[aiohttp.ClientSession] = None
         self._precision_map: dict[str, int]   = {}
         self._min_qty_map:   dict[str, float] = {}
-        log.info("BingXClient v6.5.2 — One-Way mode, sin positionSide")
+        log.info("BingXClient v6.5.4 — HEDGE mode: positionSide=LONG/SHORT")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -320,16 +320,21 @@ class BingXClient:
             log.warning("[%s] set_leverage code=%s — continuando", symbol, data.get("code"))
         return ok
 
-    # ── Órdenes — FIX One-Way: sin positionSide ──────────────────────────────
+    # ── Órdenes — HEDGE mode: positionSide = LONG o SHORT ────────────────────
 
     async def place_market_order(
         self,
-        symbol:   str,
-        side:     str,
-        quantity: float,
+        symbol:        str,
+        side:          str,
+        quantity:      float,
+        position_side: str = "LONG",   # HEDGE: LONG para abrir/cerrar longs, SHORT para shorts
     ) -> dict:
         """
-        One-Way mode BingX requiere positionSide="BOTH".
+        HEDGE mode: positionSide debe ser LONG o SHORT según la posición.
+          - Abrir LONG:  side=BUY,  positionSide=LONG
+          - Abrir SHORT: side=SELL, positionSide=SHORT
+          - Cerrar LONG: side=SELL, positionSide=LONG
+          - Cerrar SHORT:side=BUY,  positionSide=SHORT
         """
         qty = self._round_qty(symbol, quantity)
         if not self._check_min_qty(symbol, qty):
@@ -338,7 +343,7 @@ class BingXClient:
         params = {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": position_side,
             "type":         "MARKET",
             "quantity":     str(qty),
         }
@@ -351,16 +356,17 @@ class BingXClient:
         side:           str,
         quantity:       float,
         stop_price:     float,
-        position_side:  str  = "LONG",   # ignorado — One-Way
+        position_side:  str  = "LONG",   # HEDGE: dirección de la posición (LONG o SHORT)
         close_position: bool = True,
         order_type:     str  = "STOP_MARKET",
     ) -> dict:
         """
-        FIX CRÍTICO:
-        - Sin positionSide (One-Way mode)
-        - quantity REAL nunca "0" (causa error 109400)
+        HEDGE mode:
+        - positionSide = dirección de la posición que se cierra (LONG o SHORT)
+        - quantity REAL nunca "0"
         - closePosition solo para SL (STOP_MARKET)
         - TP usa quantity real sin closePosition
+        position_manager.py ya pasa trade.direction → compatible sin cambios.
         """
         qty = self._round_qty(symbol, quantity)
         if qty <= 0:
@@ -371,11 +377,11 @@ class BingXClient:
         sp = round(stop_price, 8)
 
         if order_type == "STOP_MARKET":
-            # SL: closePosition=true + positionSide=BOTH + quantity real
+            # SL: closePosition=true + positionSide real + quantity real
             params = {
                 "symbol":        symbol,
                 "side":          side,
-                "positionSide":  "BOTH",
+                "positionSide":  position_side,
                 "type":          "STOP_MARKET",
                 "stopPrice":     str(sp),
                 "quantity":      str(qty),
@@ -384,11 +390,11 @@ class BingXClient:
                 "priceProtect":  "true",
             }
         else:
-            # TP: quantity real + positionSide=BOTH
+            # TP: quantity real + positionSide real
             params = {
                 "symbol":       symbol,
                 "side":         side,
-                "positionSide": "BOTH",
+                "positionSide": position_side,
                 "type":         "TAKE_PROFIT_MARKET",
                 "stopPrice":    str(sp),
                 "quantity":     str(qty),
@@ -418,15 +424,15 @@ class BingXClient:
         self,
         symbol:        str,
         quantity:      float,
-        position_side: str,   # ignorado — One-Way
+        position_side: str,   # HEDGE: LONG o SHORT según la posición a cerrar
     ) -> dict:
-        """FIX: sin positionSide para One-Way mode."""
+        """HEDGE mode: positionSide = dirección de la posición que se cierra."""
         side = "SELL" if position_side == "LONG" else "BUY"
         qty  = self._round_qty(symbol, quantity)
         params = {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": position_side,
             "type":         "MARKET",
             "quantity":     str(qty),
         }
@@ -445,12 +451,10 @@ class BingXClient:
         tp2_price: float,
     ) -> dict:
         """
-        FIX v6.5.2:
-        - place_market_order sin positionSide
-        - SL: STOP_MARKET con quantity real + closePosition=true
-        - TP1: TAKE_PROFIT_MARKET qty/2
-        - TP2: TAKE_PROFIT_MARKET qty/2
-        - Todos sin positionSide (One-Way)
+        HEDGE mode v6.5.4:
+        - Entrada:  side=BUY/SELL,  positionSide=direction (LONG/SHORT)
+        - SL/TP:    side=SELL/BUY,  positionSide=direction (misma posición)
+        - Si SL falla → cierre de emergencia con positionSide correcto
         """
         side_entry = "BUY"  if direction == "LONG" else "SELL"
         side_close = "SELL" if direction == "LONG" else "BUY"
@@ -464,8 +468,10 @@ class BingXClient:
             log.warning("[%s] qty %.6f < min → skip", symbol, qty)
             return {"entry": {"code": -1, "msg": "qty_below_minimum"}}
 
-        # 1. Orden de entrada
-        entry_resp = await self.place_market_order(symbol, side_entry, qty)
+        # 1. Orden de entrada — positionSide = dirección
+        entry_resp = await self.place_market_order(
+            symbol, side_entry, qty, position_side=direction
+        )
         results["entry"] = entry_resp
         if entry_resp.get("code", -1) != 0:
             log.error("[%s] Entrada fallida: %s", symbol, entry_resp)
@@ -485,21 +491,23 @@ class BingXClient:
 
         # 3. Qty para TP (mitad cada uno)
         qty_half = self._round_qty(symbol, qty / 2)
-        # Si qty_half queda en 0 por precision, usar qty completo en TP2
         if qty_half <= 0:
             qty_half = qty
 
-        # 4. SL + TP1 + TP2 en paralelo
+        # 4. SL + TP1 + TP2 en paralelo — todos con positionSide=direction
         sl_task  = self.place_stop_market_order(
             symbol, side_close, qty, sl_price,
+            position_side=direction,
             order_type="STOP_MARKET", close_position=True,
         )
         tp1_task = self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price,
+            position_side=direction,
             order_type="TAKE_PROFIT_MARKET", close_position=False,
         )
         tp2_task = self.place_stop_market_order(
             symbol, side_close, qty_half, tp2_price,
+            position_side=direction,
             order_type="TAKE_PROFIT_MARKET", close_position=False,
         )
 
