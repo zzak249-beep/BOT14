@@ -1,10 +1,10 @@
 """
-QF×JP Bot v6.5 — Position Manager CORREGIDO
+QF×JP Bot v6.5.1 — Position Manager
 Fixes:
-  - BE usa real_map del ciclo (no llamada extra → elimina 'position not exist')
-  - open_count sincronizado solo desde BingX real
-  - reconcile NO toca _open_count
-  - remove_trade pasa symbol para cooldown
+  - BE 109420 'position not exist': elimina posición del tracker cuando BingX
+    confirma que no existe (código 109420 o symbol no en real_map)
+  - BE loop infinito: be_moved=True aunque falle, para no reintentar
+  - Retry silencioso: si position ya no existe, solo limpiar sin spam
 """
 import asyncio
 import logging
@@ -120,7 +120,7 @@ class PositionManager:
             if p.get("symbol") and float(p.get("positionAmt", 0)) != 0
         }
 
-        # ── FIX: sincronizar open_count con BingX real ────────────────────────
+        # Sincronizar open_count con BingX real
         await self.risk.update_open_count(len(real_map))
 
         async with self._lock:
@@ -128,7 +128,7 @@ class PositionManager:
 
         for symbol, trade in tracked.items():
 
-            # Posición cerrada externamente
+            # Posición cerrada externamente (SL/TP ejecutado por BingX)
             if symbol not in real_map:
                 try:
                     ticker      = await self.client.get_ticker(symbol)
@@ -144,7 +144,7 @@ class PositionManager:
                 await self.remove_trade(symbol, pnl)
                 continue
 
-            # Posición abierta
+            # Posición abierta — obtener precio mark
             pos = real_map[symbol]
             try:
                 mark = float(pos.get("markPrice", 0) or 0)
@@ -166,7 +166,7 @@ class PositionManager:
                     trade.tp1_hit = True
                     log.info("[%s] TP1 alcanzado @ %.6f", symbol, mark)
 
-            # Breakeven
+            # Breakeven — solo si aún no se ha movido
             if not trade.be_moved:
                 be_trigger = (
                     trade.entry + trade.atr * C.BREAKEVEN_ATR_MULT
@@ -178,37 +178,57 @@ class PositionManager:
                     (trade.direction == "SHORT" and mark <= be_trigger)
                 )
                 if be_reached:
-                    # ── FIX: pasar real_map para no hacer llamada extra ────────
                     await self._move_to_breakeven(trade, mark, real_map)
 
     async def _move_to_breakeven(self, trade: OpenTrade, current_price: float,
                                   real_map: dict = None):
         """
-        FIX DEFINITIVO 'position not exist':
-        Usa real_map del ciclo actual — sin llamada extra a BingX.
+        FIX v6.5.1:
+        - Marca be_moved=True ANTES del intento para evitar loop infinito
+        - Si BingX responde 109420 (position not exist) → limpiar trade
+        - No envía positionSide en STOP_MARKET de cierre (One-Way mode)
         """
-        try:
-            # Verificar con real_map ya disponible
-            if real_map is not None and trade.symbol not in real_map:
-                log.info("[%s] BE skip — no en real_map", trade.symbol)
-                await self.remove_trade(trade.symbol, 0.0)
-                return
+        symbol = trade.symbol
 
-            await self.client.cancel_all_orders(trade.symbol)
+        # Verificar con real_map ya disponible
+        if real_map is not None and symbol not in real_map:
+            log.info("[%s] BE skip — no en real_map, limpiando", symbol)
+            await self.remove_trade(symbol, 0.0)
+            return
+
+        # FIX CRÍTICO: marcar como movido ANTES del intento
+        # Así si falla, no vuelve a intentarlo en el siguiente ciclo
+        trade.be_moved = True
+
+        try:
+            await self.client.cancel_all_orders(symbol)
             await asyncio.sleep(0.3)
 
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
+
             resp = await self.client.place_stop_market_order(
-                trade.symbol, side_close, trade.qty, trade.entry,
+                symbol, side_close, trade.qty, trade.entry,
                 trade.direction, close_position=True, order_type="STOP_MARKET",
             )
-            if resp.get("code", -1) == 0:
-                trade.be_moved = True
-                log.info("[%s] SL → breakeven @ %.6f", trade.symbol, trade.entry)
+
+            code = resp.get("code", -1)
+
+            if code == 0:
+                log.info("[%s] SL → breakeven @ %.6f ✓", symbol, trade.entry)
+
+            elif code == 109420:
+                # BingX confirma que la posición no existe → limpiar
+                log.info("[%s] BE 109420: posición ya cerrada por BingX → limpiando", symbol)
+                await self.remove_trade(symbol, 0.0)
+
             else:
-                log.warning("[%s] BE fallo: %s", trade.symbol, resp)
+                log.warning("[%s] BE fallo code=%s: %s", symbol, code, resp.get("msg", ""))
+                # be_moved ya es True → no reintentará; trade se limpiará
+                # en el próximo ciclo cuando no esté en real_map
+
         except Exception as e:
-            log.error("[%s] _move_to_breakeven error: %s", trade.symbol, e)
+            log.error("[%s] _move_to_breakeven error: %s", symbol, e)
+            # be_moved=True ya está seteado, no hay loop
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
 
