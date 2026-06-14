@@ -1,12 +1,12 @@
 """
-QF×JP Bot v6.5.2 — BingX Client
+QF×JP Bot v6.5.3 — BingX Client
 FIXES críticos:
-  - One-Way mode: eliminado positionSide de órdenes SL/TP/cierre
-  - place_stop_market_order: quantity real (nunca "0"), sin positionSide
-  - open_trade: SL usa closePosition=true sin positionSide
-  - TP1/TP2: quantity real redondeada, sin positionSide
-  - place_market_order: sin positionSide (One-Way)
-  - close_position_market: sin positionSide
+  - One-Way mode BingX requiere positionSide="BOTH" en TODAS las órdenes
+  - place_stop_market_order: quantity real (nunca "0") + positionSide=BOTH
+  - SL: closePosition=true + quantity real + positionSide=BOTH
+  - TP1/TP2: quantity real + positionSide=BOTH
+  - place_market_order: positionSide=BOTH
+  - close_position_market: positionSide=BOTH
 """
 import asyncio
 import hashlib
@@ -329,17 +329,18 @@ class BingXClient:
         quantity: float,
     ) -> dict:
         """
-        FIX: sin positionSide — One-Way mode BingX.
+        One-Way mode BingX requiere positionSide="BOTH".
         """
         qty = self._round_qty(symbol, quantity)
         if not self._check_min_qty(symbol, qty):
             log.warning("[%s] qty %.6f < min_qty — skip", symbol, qty)
             return {"code": -1, "msg": "qty_below_minimum"}
         params = {
-            "symbol":   symbol,
-            "side":     side,
-            "type":     "MARKET",
-            "quantity": str(qty),
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     str(qty),
         }
         log.info("[%s] MARKET order params: %s", symbol, params)
         return await self._post("/openApi/swap/v2/trade/order", params)
@@ -370,10 +371,11 @@ class BingXClient:
         sp = round(stop_price, 8)
 
         if order_type == "STOP_MARKET":
-            # SL: closePosition=true, quantity obligatorio igual
+            # SL: closePosition=true + positionSide=BOTH + quantity real
             params = {
                 "symbol":        symbol,
                 "side":          side,
+                "positionSide":  "BOTH",
                 "type":          "STOP_MARKET",
                 "stopPrice":     str(sp),
                 "quantity":      str(qty),
@@ -382,14 +384,15 @@ class BingXClient:
                 "priceProtect":  "true",
             }
         else:
-            # TP: quantity real, sin closePosition
+            # TP: quantity real + positionSide=BOTH
             params = {
-                "symbol":      symbol,
-                "side":        side,
-                "type":        "TAKE_PROFIT_MARKET",
-                "stopPrice":   str(sp),
-                "quantity":    str(qty),
-                "workingType": "MARK_PRICE",
+                "symbol":       symbol,
+                "side":         side,
+                "positionSide": "BOTH",
+                "type":         "TAKE_PROFIT_MARKET",
+                "stopPrice":    str(sp),
+                "quantity":     str(qty),
+                "workingType":  "MARK_PRICE",
                 "priceProtect": "true",
             }
 
@@ -421,10 +424,11 @@ class BingXClient:
         side = "SELL" if position_side == "LONG" else "BUY"
         qty  = self._round_qty(symbol, quantity)
         params = {
-            "symbol":   symbol,
-            "side":     side,
-            "type":     "MARKET",
-            "quantity": str(qty),
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     str(qty),
         }
         log.info("[%s] close_market params: %s", symbol, params)
         return await self._post("/openApi/swap/v2/trade/order", params)
