@@ -71,6 +71,7 @@ class PositionManager:
                     symbol=sym, direction=direction, entry=entry,
                     sl=sl, tp1=tp1, tp2=tp2, qty=qty,
                     atr=entry * 0.005, order_id="reconciled",
+                    be_moved=True,   # skip BE en posiciones reconciliadas
                 )
             count += 1
             log.info("[%s] Reconciliado: %s qty=%.4f @ %.6f", sym, direction, qty, entry)
@@ -184,31 +185,43 @@ class PositionManager:
     async def _move_to_breakeven(self, trade: OpenTrade, current_price: float,
                                   real_map: dict = None):
         """
-        FIX DEFINITIVO 'position not exist':
-        Usa real_map del ciclo actual — sin llamada extra a BingX.
+        Mueve SL a breakeven.
+        - Usa real_map del ciclo (sin llamada extra a BingX)
+        - Compatible con Hedge mode y One-way mode
+        - Si falla con cualquier error: marca be_moved=True para no reintentar
         """
         try:
-            # Verificar con real_map ya disponible
+            # Verificar que la posición sigue abierta
             if real_map is not None and trade.symbol not in real_map:
-                log.info("[%s] BE skip — no en real_map", trade.symbol)
+                log.info("[%s] BE skip — posición ya cerrada", trade.symbol)
                 await self.remove_trade(trade.symbol, 0.0)
                 return
 
-            await self.client.cancel_all_orders(trade.symbol)
-            await asyncio.sleep(0.3)
-
+            # En Hedge mode closePosition=true puede fallar
+            # Usar quantity explícita en vez de closePosition
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
+
+            # Intentar con quantity explícita (compatible con Hedge mode)
             resp = await self.client.place_stop_market_order(
                 trade.symbol, side_close, trade.qty, trade.entry,
-                trade.direction, close_position=True, order_type="STOP_MARKET",
+                trade.direction,
+                close_position=False,   # usar quantity en Hedge mode
+                order_type="STOP_MARKET",
             )
+
             if resp.get("code", -1) == 0:
                 trade.be_moved = True
                 log.info("[%s] SL → breakeven @ %.6f", trade.symbol, trade.entry)
             else:
-                log.warning("[%s] BE fallo: %s", trade.symbol, resp)
+                code = resp.get("code", -1)
+                msg  = resp.get("msg", "")
+                log.warning("[%s] BE fallo code=%s: %s", trade.symbol, code, msg)
+                # Cualquier error → marcar be_moved=True para no repetir en loop
+                trade.be_moved = True
+                log.info("[%s] BE desactivado tras fallo — no se reintentará", trade.symbol)
         except Exception as e:
             log.error("[%s] _move_to_breakeven error: %s", trade.symbol, e)
+            trade.be_moved = True   # evitar loop infinito
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
 
