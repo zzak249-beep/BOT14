@@ -2,6 +2,9 @@
 QF×JP Bot v6.4 — Telegram Client
 Envía notificaciones al canal configurado.
 Todas las funciones son fire-and-forget (no bloquean el bot).
+
+[FIX] notify_status: keys actualizadas para RiskManager v7.1
+      (daily_pnl_realized / daily_pnl_unrealized / daily_pnl_effective)
 """
 import asyncio
 import logging
@@ -54,13 +57,6 @@ async def notify_signal(sig) -> None:
         f"Estructura: `{sig.structure}` | TL: `{sig.tl_break}`\n"
         f"HTF: `{sig.htf_score:.2f}` | FR: `{sig.funding_rate:.4f}`"
     )
-    liq  = getattr(sig, "liq_bonus", 0.0)
-    trap = getattr(sig, "anti_trap_delta", 0.0)
-    edge = getattr(sig, "edge_reasons", "")
-    if liq or trap or (edge and edge != "ok"):
-        msg += f"\nEdge: `liq+{liq:.1f}` `trap{trap:+.1f}`"
-        if edge and edge != "ok":
-            msg += f" `{edge[:50]}`"
     await send(msg)
 
 
@@ -105,14 +101,29 @@ async def notify_circuit_breaker(symbol: str) -> None:
 
 
 async def notify_status(status: dict, balance: float, n_symbols: int) -> None:
-    """Status periódico del bot."""
+    """
+    Status periódico del bot.
+    Usa las keys de RiskManager v7.1:
+      daily_pnl_realized / daily_pnl_unrealized / daily_pnl_effective / daily_limit
+    """
+    # ✅ FIX: keys actualizadas para RiskManager v7.1
+    pnl_realized   = status.get("daily_pnl_realized",   0.0)
+    pnl_unrealized = status.get("daily_pnl_unrealized", 0.0)
+    pnl_effective  = status.get("daily_pnl_effective",  0.0)
+    daily_limit    = status.get("daily_limit",           0.0)   # ya viene negativo
+
+    pnl_icon = "💚" if pnl_effective >= 0 else "💔"
+
     msg = (
         f"📊 *STATUS QF×JP Bot*\n"
         f"Modo: `{status.get('mode', '?')}`\n"
         f"Balance: `{balance:.2f} USDT`\n"
         f"Trades abiertos: `{status.get('open_trades', 0)}/{status.get('max_open', 0)}`\n"
         f"Trades hoy: `{status.get('daily_trades', 0)}/{status.get('max_daily', 0)}`\n"
-        f"PnL diario: `{status.get('daily_pnl', 0):+.4f} USDT`\n"
+        f"{pnl_icon} PnL realizado: `{pnl_realized:+.4f} USDT`\n"
+        f"PnL no realizado: `{pnl_unrealized:+.4f} USDT`\n"
+        f"PnL efectivo: `{pnl_effective:+.4f} USDT`\n"
+        f"Límite diario: `{daily_limit:.2f} USDT`\n"
         f"Símbolos escaneados: `{n_symbols}`"
     )
     await send(msg)
@@ -123,17 +134,5 @@ async def notify_error(context: str, error: str) -> None:
     msg = (
         f"🚨 *ERROR* — `{context}`\n"
         f"`{error[:300]}`"
-    )
-    await send(msg)
-
-
-
-async def notify_trailing(symbol: str, direction: str, old_sl: float,
-                           new_sl: float, mark: float) -> None:
-    icon = "LONG" if direction == "LONG" else "SHORT"
-    msg = (
-        "*TRAILING STOP* - `" + symbol + "` " + icon + "\n"
-        + "SL: `" + "{:.6f}".format(old_sl) + "` to `" + "{:.6f}".format(new_sl) + "`\n"
-        + "Mark: `" + "{:.6f}".format(mark) + "`"
     )
     await send(msg)
