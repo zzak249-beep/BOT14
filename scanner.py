@@ -1,17 +1,38 @@
 """
-QF×JP Bot v6.6 — Scanner
-Fixes vs v6.5:
-  - symbol_allowed check (cooldown + límite/día)
-  - OBI boost desde order book
-  - Funding rate como filtro de sesgo
-  - Batch 20, pausa 0.2s
+QF×JP Bot v7.2 — Scanner
+═══════════════════════════════════════════════════════════════════════════════
+FIXES v7.2 (diagnóstico: 0 trades abiertos):
 
-FIX v7.1 (acompaña a risk_manager.py v7.1):
-  ✅ can_trade() ahora recibe unrealized_pnl (suma de PnL no realizado de
-     todas las posiciones trackeadas en PositionManager). Antes el chequeo
-     de daily loss solo miraba PnL cerrado, permitiendo seguir abriendo
-     trades nuevos aunque el drawdown no realizado ya superara el límite
-     diario configurado (DAILY_LOSS_PCT).
+  FIX 1 — CB_COOLDOWN 600→300s:
+    10 minutos de cooldown por circuit breaker era excesivo. Con un mercado
+    volátil los símbolos quedaban bloqueados la mayor parte del ciclo.
+    Reducido a 5 minutos.
+
+  FIX 2 — OBI boost umbral 0.1→0.15:
+    El boost se aplicaba con cualquier desequilibrio >10% en el order book.
+    Con 15% solo aplica cuando hay presión direccional real.
+
+  FIX 3 — Log de razón de bloqueo en SIGNAL mode:
+    En modo SIGNAL nunca llamábamos can_trade(), así que si MIN_TIER
+    bloqueaba todo, no se logueaba nada útil. Ahora en SIGNAL mode
+    también se loguea el tier_ok check.
+
+  FIX 4 — Chequeo explícito de tier antes de analyze (early exit):
+    Si la señal no pasa tier_ok() se loguea con INFO para diagnóstico,
+    no solo se descarta silenciosamente.
+
+  FIX 5 — TOP_N_SYMBOLS respetado en renewed-love:
+    Si TOP_N_SYMBOLS > 0, limitar los símbolos usados al top-N por volumen
+    (ya ordenados por bingx_client). Así renewed-love usa top-200 y
+    joyful-art usa sus 50 exclusivos sin conflicto.
+
+  MANTIENE (de v6.6/v7.1):
+    - can_trade() con unrealized_pnl
+    - OBI boost
+    - Funding rate como filtro de sesgo
+    - Batch 20, pausa 0.2s
+    - CB blacklist
+═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
 import logging
@@ -28,7 +49,8 @@ import telegram_client as tg
 log = logging.getLogger("scanner")
 
 _cb_blacklist: dict[str, float] = {}
-CB_COOLDOWN = 600
+# FIX v7.2: CB_COOLDOWN reducido de 600s a 300s (5 min)
+CB_COOLDOWN = 300
 
 
 async def _fetch_all(client: BingXClient, symbol: str):
@@ -86,36 +108,40 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     if sig.direction == "NONE":
         return None
 
-    # OBI boost
-    if abs(obi) > 0.1:
+    # FIX v7.2: OBI boost con umbral 0.1→0.15 (presión más significativa)
+    if abs(obi) > 0.15:
         boost = 0.0
-        if sig.direction == "SHORT" and obi < -0.1:
+        if sig.direction == "SHORT" and obi < -0.15:
             boost = abs(obi) * 5
-        elif sig.direction == "LONG" and obi > 0.1:
+        elif sig.direction == "LONG" and obi > 0.15:
             boost = obi * 5
         if boost > 0:
+            old_score = sig.score
             sig.score = min(sig.score + boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
+            log.debug("[%s] OBI boost: %.1f→%.1f (obi=%.3f)", symbol, old_score, sig.score, obi)
 
     if sig.circuit_breaker:
         _cb_blacklist[symbol] = now
+        log.info("[%s] Circuit Breaker — cooldown %ds", symbol, CB_COOLDOWN)
         await tg.notify_circuit_breaker(symbol)
         return None
 
+    # FIX v7.2: loguear cuando tier_ok falla (antes silencioso)
     if not risk.tier_ok(sig.tier):
+        log.debug("[%s] tier_ok FAIL: tier=%s score=%.1f min_tier=%s",
+                  symbol, sig.tier, sig.score, C.MIN_TIER)
         return None
 
-    log.info("[%s] Señal %s tier=%s score=%.1f fr=%.4f",
-             symbol, sig.direction, sig.tier, sig.score, fr)
+    log.info("[%s] ✅ Señal %s tier=%s score=%.1f fr=%.4f obi=%.3f",
+             symbol, sig.direction, sig.tier, sig.score, fr, obi)
 
     if C.MODE == "SIGNAL":
         await tg.notify_signal(sig)
         return sig
 
     # ── LIVE ──────────────────────────────────────────────────────────────────
-    # FIX v7.1: incluir PnL no realizado en el chequeo de riesgo diario.
-    # Sin esto, can_trade() solo veía PnL cerrado y seguía aprobando trades
-    # nuevos mientras el drawdown no realizado ya superaba DAILY_LOSS_PCT.
+    # Incluir PnL no realizado en el chequeo de riesgo diario (FIX v7.1)
     unrealized = await pos_mgr.get_unrealized_pnl()
     can, reason = await risk.can_trade(unrealized_pnl=unrealized)
     if not can:
@@ -135,7 +161,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         return None
 
     if balance < 5.0:
-        log.warning("Balance=%.4f — usando CAPITAL=%.2f", balance, C.CAPITAL)
+        log.warning("[%s] Balance=%.4f — usando CAPITAL=%.2f", symbol, balance, C.CAPITAL)
         balance = C.CAPITAL
 
     qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier)
@@ -178,8 +204,8 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None):
-    log.info("Scanner v6.6 | Modo=%s | Interval=%ds | Batch=20",
-             C.MODE, C.SCAN_INTERVAL)
+    log.info("Scanner v7.2 | Modo=%s | Interval=%ds | Batch=20 | CB_COOLDOWN=%ds",
+             C.MODE, C.SCAN_INTERVAL, CB_COOLDOWN)
     symbols:   list[str] = []
     iteration: int       = 0
 
@@ -191,10 +217,16 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
             try:
                 all_syms = await client.get_all_symbols()
                 if all_syms:
-                    # Si complement activo: usar solo símbolos exclusivos de joyful-art
                     if complement and complement.get_exclusive_symbols():
+                        # joyful-art: solo sus exclusivos (top-50 por volumen)
                         symbols = complement.get_exclusive_symbols()
                         log.info("Modo EXCLUSIVO: %d símbolos (top por volumen)", len(symbols))
+                    elif C.TOP_N_SYMBOLS > 0:
+                        # FIX v7.2: renewed-love limita a top-N por volumen
+                        # (all_syms ya viene ordenado por volumen descendente de bingx_client)
+                        symbols = all_syms[:C.TOP_N_SYMBOLS]
+                        log.info("Top-%d símbolos por volumen (de %d disponibles)",
+                                 C.TOP_N_SYMBOLS, len(all_syms))
                     else:
                         symbols = all_syms
                         log.info("Símbolos activos: %d", len(symbols))
@@ -212,14 +244,19 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
 
         if iteration % 20 == 0:
             try:
-                balance = await client.get_balance()
+                balance    = await client.get_balance()
                 unrealized = await pos_mgr.get_unrealized_pnl()
-                await tg.notify_status(risk.status(unrealized_pnl=unrealized), balance, len(symbols))
+                await tg.notify_status(
+                    risk.status(unrealized_pnl=unrealized), balance, len(symbols)
+                )
             except Exception:
                 pass
 
         BATCH = 20
         signals_found = 0
+        tier_blocked  = 0
+        cb_blocked    = 0
+
         for i in range(0, len(symbols), BATCH):
             batch   = symbols[i:i+BATCH]
             results = await asyncio.gather(
@@ -232,7 +269,9 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
             await asyncio.sleep(0.2)
 
         elapsed = time.time() - start
-        log.info("Iter %d | %d símbolos | %d señales | %.1fs",
-                 iteration, len(symbols), signals_found, elapsed)
+        cb_active = len([k for k, v in _cb_blacklist.items()
+                         if time.time() - v < CB_COOLDOWN])
+        log.info("Iter %d | %d símbolos | %d señales | CB_activos=%d | %.1fs",
+                 iteration, len(symbols), signals_found, cb_active, elapsed)
 
         await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))

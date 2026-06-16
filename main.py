@@ -1,7 +1,11 @@
 """
-QF×JP Bot v7.1 — Main
+QF×JP Bot v7.2 — Main
 FastAPI con lifespan moderno + reconciliación al arrancar + trailing stop info
 + daily loss real (PnL no realizado incluido) en /status
+
+CAMBIOS v7.2:
+  - Version bump 7.1→7.2
+  - Log de configuración incluye MIN_TIER y CB settings para diagnóstico
 """
 import asyncio
 import logging
@@ -72,16 +76,22 @@ async def _run_complement():
 async def lifespan(app: FastAPI):
     global client, risk, pos_mgr, master, complement
 
-    log.info("═" * 54)
-    log.info("  QF×JP Bot v7.1 — TRAILING STOP + DAILY LOSS REAL")
+    log.info("═" * 60)
+    log.info("  QF×JP Bot v7.2 — FIXES 0-TRADES")
     log.info("  Modo: %s | Capital: %.2f USDT", C.MODE, C.CAPITAL)
-    log.info("  Leverage: %dx | Min tier: %s", C.LEVERAGE, C.MIN_TIER)
+    log.info("  Leverage: %dx | Min tier: %s | Min score: %.1f",
+             C.LEVERAGE, C.MIN_TIER, C.MIN_SCORE)
     log.info("  Max notional: %.0f USDT | Daily loss: %.1f%%",
              C.MAX_NOTIONAL_USDT, C.DAILY_LOSS_PCT)
     log.info("  SL mult: %.1f | Trail activation: %.1f ATR | Trail dist: %.1f ATR",
              C.SL_ATR_MULT, C.BREAKEVEN_ATR_MULT, C.TRAIL_DISTANCE_ATR)
-    log.info("  Max open: %d | Max daily: %d", C.MAX_OPEN_TRADES, C.MAX_DAILY_TRADES)
-    log.info("═" * 54)
+    log.info("  Max open: %d | Max daily: %d | Top-N: %d",
+             C.MAX_OPEN_TRADES, C.MAX_DAILY_TRADES, C.TOP_N_SYMBOLS)
+    log.info("  CB: enabled=%s mult=%.1f bars=%d",
+             C.CB_ENABLED, C.CB_ATR_MULT, C.CB_BARS)
+    log.info("  HTF_MIN_ALIGNED: %d | REQUIRE_TL_BREAK: %s",
+             C.HTF_MIN_ALIGNED, C.REQUIRE_TL_BREAK)
+    log.info("═" * 60)
 
     client     = BingXClient()
     risk       = RiskManager()
@@ -127,7 +137,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="QF×JP Bot v7.1",
+    title="QF×JP Bot v7.2",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -136,7 +146,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "7.1", "mode": C.MODE}
+    return {"status": "ok", "version": "7.2", "mode": C.MODE}
 
 
 @app.get("/status")
@@ -148,7 +158,6 @@ async def status():
     except Exception:
         balance = -1.0
 
-    # FIX v7.1: PnL no realizado real, incluido en el status de riesgo
     try:
         unrealized = await pos_mgr.get_unrealized_pnl() if pos_mgr else 0.0
     except Exception:
@@ -156,7 +165,7 @@ async def status():
 
     tracked = pos_mgr.get_tracked() if pos_mgr else {}
     return {
-        "version": "7.1",
+        "version": "7.2",
         "mode":    C.MODE,
         "balance": round(balance, 2),
         "risk":    risk.status(unrealized_pnl=unrealized),
@@ -169,7 +178,6 @@ async def status():
                 "tp2":             t.tp2,
                 "qty":             t.qty,
                 "be_moved":        t.be_moved,
-                # ── Trailing info ─────────────────────────────────────────────
                 "trailing_active": t.trailing_active,
                 "trail_sl":        round(t.trail_sl, 8) if t.trail_sl else None,
                 "peak_price":      round(t.peak_price, 8) if t.peak_price else None,

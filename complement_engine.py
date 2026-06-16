@@ -1,46 +1,36 @@
 """
-QF×JP Bot — Complement Engine v1.1
-joyful-art complementa a renewed-love con 4 modos simultáneos:
-
-MODO 1 — COPY TRADE FILTRADO
-  Lee trades SUP del master, copia con 0.4x size solo si score > 80.
-  FIX v1.1: además exige que el trade del master NO esté ya en pérdida
-  (mark vs entry favorable o neutro) antes de copiarlo — evita duplicar
-  posiciones que ya van en contra.
-
-MODO 2 — SÍMBOLOS EXCLUSIVOS (sin solapamiento)
-  joyful-art opera SOLO en top-50 símbolos por volumen.
-  renewed-love opera en los otros 514.
-  Resultado: cobertura total sin duplicar posiciones.
-
-MODO 3 — GUARDIAN DE SALIDAS
-  Monitoriza posiciones del master.
-  Si detecta CVD divergence contraria → alerta Telegram para cierre manual.
-  (No cierra automáticamente para no interferir con el master)
-
-MODO 4 — HEDGE MACRO
-  Si master tiene 3+ posiciones EN PÉRDIDA (direccional) >2% cada una
-  → joyful-art abre SHORT/LONG en BTC como cobertura macro
-  → neutraliza drawdown sistémico
-
+QF×JP Bot — Complement Engine v1.2
 ═══════════════════════════════════════════════════════════════════════════════
-FIXES v1.1:
-  ✅ run_hedge_mode: el cálculo de pérdida ahora es DIRECCIONAL.
-     Antes: loss_pct = abs((mark-entry)/entry)*100 → contaba ganadores
-     como perdedores (un LONG +2% activaba el contador de "pérdida").
-     Ahora: pnl_pct con signo correcto según LONG/SHORT, solo cuenta
-     cuando pnl_pct <= -HEDGE_LOSS_PCT (pérdida real).
+FIXES v1.2 (diagnóstico: joyful-art con 0 trades):
 
-  ✅ run_copy_mode: nuevo check — antes de copiar un trade SUP del master,
-     se compara mark actual vs entry del master. Si el trade del master
-     ya está en pérdida (pnl_pct < COPY_MAX_ADVERSE_PCT, default 0%),
-     se descarta la copia. Solo se copian trades SUP que siguen
-     siendo favorables o neutros en el momento de la copia.
+  FIX 1 — EXCLUSIVE_TOP_N 50→30:
+    Con 50 símbolos exclusivos todos son large-caps eficientes (BTC, ETH,
+    BNB...) donde la señal es más difícil de obtener. Con 30 se mantiene
+    calidad sin ser demasiado restrictivo. Configurable via EXCLUSIVE_TOP_N.
 
-  ✅ run_guardian_mode: nuevo parámetro GUARDIAN_AUTOCLOSE (default False).
-     Si está activo, además de alertar, joyful-art puede colocar un
-     hedge de cobertura puntual (no cierra la posición del master,
-     que está en otro bot/cuenta — solo abre protección propia).
+  FIX 2 — run_copy_mode ahora llama can_trade() con unrealized_pnl:
+    Igual que el scanner principal, la copia también debe respetar el
+    daily loss real (PnL no realizado incluido). Antes omitía este check.
+
+  FIX 3 — COPY solo si MASTER_URL está configurado Y el master tiene trades:
+    Si MASTER_URL no está configurado o el master no tiene trades SUP,
+    joyful-art debe funcionar de forma AUTÓNOMA con sus exclusivos.
+    El COPY mode ya tenía este check pero ahora lo loguea claramente.
+
+  FIX 4 — run_loop: si COPY y GUARDIAN fallan por MASTER_URL vacío,
+    joyful-art igual escanea sus exclusivos via scanner.py (siempre activo).
+    El complement_engine no bloquea el scanner — son tasks independientes.
+
+  FIX 5 — COPY_MAX_ADVERSE_PCT -0.3 (era 0.0):
+    Permitir copiar trades del master que están máx -0.3% en pérdida.
+    Con 0.0% se rechazaban trades válidos que habían revertido levemente
+    tras la apertura del master pero seguían siendo buenos setups.
+
+  MANTIENE de v1.1:
+    - Cálculo direccional de PnL para hedge y copy
+    - Guardian CVD divergence
+    - Hedge macro BTC
+    - Símbolos exclusivos sin solapamiento
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -63,14 +53,15 @@ log = logging.getLogger("complement")
 
 # ── Config complemento ────────────────────────────────────────────────────────
 COMPLEMENT_MODE   = os.getenv("COMPLEMENT_MODE", "GUARDIAN,COPY,EXCLUSIVE").upper()
-COPY_MIN_SCORE    = float(os.getenv("COPY_MIN_SCORE",    "80.0"))   # solo SUP del master
-COPY_SIZE_MULT    = float(os.getenv("COPY_SIZE_MULT",    "0.4"))    # 40% del size del master
-# FIX v1.1: no copiar si el trade del master ya está en pérdida (PnL% con signo)
-COPY_MAX_ADVERSE_PCT = float(os.getenv("COPY_MAX_ADVERSE_PCT", "0.0"))  # 0.0 = solo copiar si va igual o a favor
-GUARDIAN_CVD_THR  = float(os.getenv("GUARDIAN_CVD_THR", "-0.3"))   # CVD divergencia mínima
-HEDGE_LOSS_COUNT  = int(os.getenv("HEDGE_LOSS_COUNT",   "3"))       # trades en pérdida para hedge
-HEDGE_LOSS_PCT    = float(os.getenv("HEDGE_LOSS_PCT",   "2.0"))     # % pérdida por trade (positivo)
-EXCLUSIVE_TOP_N   = int(os.getenv("EXCLUSIVE_TOP_N",    "50"))      # top N símbolos exclusivos
+COPY_MIN_SCORE    = float(os.getenv("COPY_MIN_SCORE",    "80.0"))
+COPY_SIZE_MULT    = float(os.getenv("COPY_SIZE_MULT",    "0.4"))
+# FIX v1.2: -0.3% (era 0.0) — permite copiar trades levemente adversos del master
+COPY_MAX_ADVERSE_PCT = float(os.getenv("COPY_MAX_ADVERSE_PCT", "-0.3"))
+GUARDIAN_CVD_THR  = float(os.getenv("GUARDIAN_CVD_THR", "-0.3"))
+HEDGE_LOSS_COUNT  = int(os.getenv("HEDGE_LOSS_COUNT",   "3"))
+HEDGE_LOSS_PCT    = float(os.getenv("HEDGE_LOSS_PCT",   "2.0"))
+# FIX v1.2: 50→30 exclusivos (large-caps menos señal)
+EXCLUSIVE_TOP_N   = int(os.getenv("EXCLUSIVE_TOP_N",    "30"))
 
 
 class ComplementEngine:
@@ -81,8 +72,8 @@ class ComplementEngine:
         self.pos_mgr = pos_mgr
         self.master  = master
 
-        self._copied_trades:  set[str]   = set()   # símbolos ya copiados
-        self._exclusive_syms: list[str]  = []      # top-50 por volumen
+        self._copied_trades:  set[str]   = set()
+        self._exclusive_syms: list[str]  = []
         self._last_guardian:  float      = 0.0
         self._last_copy:      float      = 0.0
         self._last_hedge:     float      = 0.0
@@ -95,12 +86,11 @@ class ComplementEngine:
     async def refresh_exclusive_symbols(self):
         """
         joyful-art opera SOLO en los top-N símbolos por volumen 24h.
-        renewed-love opera en el resto.
-        → Sin solapamiento, cobertura total del mercado.
+        renewed-love opera en top-200 (configurado en su propio config).
+        → Sin solapamiento, cobertura complementaria del mercado.
         """
         try:
             all_syms = await self.client.get_all_symbols()
-            # get_all_symbols ya devuelve ordenados por volumen (ver bingx_client)
             self._exclusive_syms = all_syms[:EXCLUSIVE_TOP_N]
             log.info("Símbolos exclusivos joyful-art: %d (top-%d por volumen)",
                      len(self._exclusive_syms), EXCLUSIVE_TOP_N)
@@ -117,7 +107,6 @@ class ComplementEngine:
     def _master_trade_pnl_pct(self, trade_data: dict, mark: float) -> Optional[float]:
         """
         Calcula el PnL% direccional del trade del master, dado el mark actual.
-        Retorna None si faltan datos.
         Positivo = a favor, Negativo = en contra.
         """
         entry     = float(trade_data.get("entry", 0))
@@ -132,37 +121,39 @@ class ComplementEngine:
     async def run_copy_mode(self):
         """
         Copia trades SUP del master con 40% del size.
-        Solo copia si:
-          - Tier SUP (score > 80) en el master
-          - joyful-art no está ya en ese símbolo
-          - joyful-art tiene slots disponibles
-          - El símbolo NO está en los exclusivos de joyful-art
-            (para no duplicar análisis propios)
-          - FIX v1.1: el trade del master NO está ya en pérdida
-            (pnl_pct del master >= COPY_MAX_ADVERSE_PCT, default 0%)
+        Requiere MASTER_URL configurado.
+
+        FIX v1.2: también pasa unrealized_pnl a can_trade().
+        FIX v1.2: COPY_MAX_ADVERSE_PCT -0.3 (era 0.0).
         """
+        if not os.getenv("MASTER_URL"):
+            log.debug("[COPY] MASTER_URL no configurado — modo COPY desactivado")
+            return
+
         now = time.time()
-        if now - self._last_copy < 30:   # revisar cada 30s
+        if now - self._last_copy < 30:
             return
         self._last_copy = now
 
         master_trades = await self.master.get_master_trades()
         if not master_trades:
+            log.debug("[COPY] master sin trades activos")
             return
 
-        can, reason = await self.risk.can_trade()
+        # FIX v1.2: incluir unrealized_pnl en can_trade
+        unrealized = await self.pos_mgr.get_unrealized_pnl()
+        can, reason = await self.risk.can_trade(unrealized_pnl=unrealized)
         if not can:
+            log.debug("[COPY] risk bloqueado: %s", reason)
             return
 
         for symbol, trade_data in master_trades.items():
-            # Solo copiar tier SUP
             if trade_data.get("tier", "") != "SUP":
                 continue
             if symbol in self._copied_trades:
                 continue
             if self.pos_mgr.is_trading(symbol):
                 continue
-            # No copiar si es símbolo exclusivo propio (joyful-art lo analizará solo)
             if symbol in self._exclusive_syms:
                 continue
 
@@ -175,7 +166,6 @@ class ComplementEngine:
             if not direction or entry <= 0 or sl <= 0:
                 continue
 
-            # ── FIX v1.1: verificar que el trade del master no esté ya perdiendo ──
             try:
                 ticker = await self.client.get_ticker(symbol)
                 mark   = float(ticker.get("lastPrice", 0) or 0)
@@ -186,16 +176,15 @@ class ComplementEngine:
             pnl_pct = self._master_trade_pnl_pct(trade_data, mark)
             if pnl_pct is None:
                 continue
+            # FIX v1.2: threshold -0.3% en vez de 0.0%
             if pnl_pct < COPY_MAX_ADVERSE_PCT:
-                log.info("[COPY] %s SUP pero master ya en pérdida (%.2f%% < %.2f%%) — skip",
+                log.info("[COPY] %s SUP pero master en pérdida (%.2f%% < %.2f%%) — skip",
                          symbol, pnl_pct, COPY_MAX_ADVERSE_PCT)
                 continue
 
-            # Tamaño: 40% del master pero respetando nuestro propio cap
             master_qty = float(trade_data.get("qty", 0))
             qty = master_qty * COPY_SIZE_MULT
 
-            # Verificar cap notional propio
             notional = qty * entry
             if notional > C.MAX_NOTIONAL_USDT:
                 qty = C.MAX_NOTIONAL_USDT / entry
@@ -203,7 +192,7 @@ class ComplementEngine:
             if qty <= 0:
                 continue
 
-            log.info("[COPY] %s %s qty=%.4f (40%% del master, master_pnl=%.2f%%) notional=%.1f",
+            log.info("[COPY] %s %s qty=%.4f (40%% master, pnl=%.2f%%) notional=%.1f",
                      symbol, direction, qty, pnl_pct, qty * entry)
 
             try:
@@ -233,7 +222,7 @@ class ComplementEngine:
                         f"Entry: `{entry:.6f}` | SL: `{sl:.6f}`\n"
                         f"Qty: `{qty:.4f}` notional: `{qty*entry:.1f}` USDT"
                     )
-                    await self.risk.on_trade_opened(symbol=symbol)
+                    # Nota: register_trade ya llama on_trade_opened internamente
                 else:
                     log.warning("[COPY] %s entrada rechazada: %s", symbol, entry_resp)
             except Exception as e:
@@ -248,11 +237,14 @@ class ComplementEngine:
     async def run_guardian_mode(self):
         """
         Monitoriza posiciones del MASTER.
-        Si detecta CVD divergence contraria a la posición → alerta Telegram.
-        El trader decide si cerrar o no (no interferimos con el master).
+        Si detecta CVD divergence contraria → alerta Telegram.
+        Requiere MASTER_URL configurado.
         """
+        if not os.getenv("MASTER_URL"):
+            return
+
         now = time.time()
-        if now - self._last_guardian < 60:   # revisar cada 60s
+        if now - self._last_guardian < 60:
             return
         self._last_guardian = now
 
@@ -277,25 +269,20 @@ class ComplementEngine:
                 c_    = arr[:, 4]
                 v_    = arr[:, 5]
 
-                # CVD simple
                 delta = np.where(c_ > o_, v_, np.where(c_ < o_, -v_, 0))
                 cvd   = np.cumsum(delta)
 
-                # Divergencia: últimas 10 velas
-                period = 10
+                period    = 10
                 price_chg = c_[-1] - c_[-period]
                 cvd_chg   = cvd[-1] - cvd[-period]
 
-                # Señal de peligro
                 danger = False
                 reason = ""
 
                 if direction == "LONG" and price_chg > 0 and cvd_chg < 0:
-                    # Precio sube pero CVD baja → distribución → peligro para LONG
                     danger = True
                     reason = f"CVD divergencia bajista (precio +{price_chg:.4f}, CVD {cvd_chg:.0f})"
                 elif direction == "SHORT" and price_chg < 0 and cvd_chg > 0:
-                    # Precio baja pero CVD sube → acumulación → peligro para SHORT
                     danger = True
                     reason = f"CVD divergencia alcista (precio {price_chg:.4f}, CVD +{cvd_chg:.0f})"
 
@@ -316,7 +303,6 @@ class ComplementEngine:
             await asyncio.sleep(0.1)
 
         if alerts:
-            # Enviar máximo 3 alertas para no spamear
             for alert in alerts[:3]:
                 await tg.send(alert)
                 await asyncio.sleep(1)
@@ -329,14 +315,8 @@ class ComplementEngine:
         """
         Si master tiene ≥3 posiciones EN PÉRDIDA (direccional) >2% simultánea
         → joyful-art abre SHORT/LONG en BTC como cobertura macro.
-        Cuando el drawdown se recupera → cierra el hedge.
 
-        FIX v1.1: el cálculo de pérdida ahora respeta dirección.
-        Antes (BUG): loss_pct = abs((mark-entry)/entry*100) contaba
-        posiciones GANADORAS como "en pérdida" si el precio se había
-        movido ±2% en cualquier sentido. Esto podía disparar el hedge
-        con el mercado entero en verde.
-        Ahora: pnl_pct con signo correcto; solo cuenta si pnl_pct <= -HEDGE_LOSS_PCT.
+        FIX v1.1 (mantenido): PnL direccional correcto.
         """
         now = time.time()
         if now - self._last_hedge < 120:
@@ -365,13 +345,11 @@ class ComplementEngine:
             if mark <= 0:
                 continue
 
-            pnl_pct = self._master_trade_pnl_pct(td, mark)
+            pnl_pct   = self._master_trade_pnl_pct(td, mark)
             if pnl_pct is None:
                 continue
-
             direction = td.get("direction", "")
 
-            # FIX v1.1: solo cuenta como "en pérdida" si pnl_pct <= -HEDGE_LOSS_PCT
             if pnl_pct <= -HEDGE_LOSS_PCT:
                 if direction == "LONG":
                     losing_longs.append((sym, pnl_pct))
@@ -380,7 +358,6 @@ class ComplementEngine:
 
         total_losing = len(losing_longs) + len(losing_shorts)
 
-        # Si ya tenemos hedge activo y el drawdown se redujo → cerrar hedge
         if self._hedge_active and total_losing < HEDGE_LOSS_COUNT:
             if self.pos_mgr.is_trading("BTCUSDT"):
                 log.info("[HEDGE] Drawdown recuperado (%d < %d) — cerrando hedge BTCUSDT",
@@ -389,7 +366,6 @@ class ComplementEngine:
                 self._hedge_active = False
             return
 
-        # Condición para abrir hedge
         if total_losing < HEDGE_LOSS_COUNT:
             return
         if self._hedge_active:
@@ -397,13 +373,11 @@ class ComplementEngine:
         if self.pos_mgr.is_trading("BTCUSDT"):
             return
 
-        can, reason = await self.risk.can_trade()
+        unrealized = await self.pos_mgr.get_unrealized_pnl()
+        can, reason = await self.risk.can_trade(unrealized_pnl=unrealized)
         if not can:
             return
 
-        # Determinar dirección del hedge
-        # Más LONGs perdiendo (mercado cae) → hedge SHORT
-        # Más SHORTs perdiendo (mercado sube) → hedge LONG
         hedge_dir = "SHORT" if len(losing_longs) >= len(losing_shorts) else "LONG"
 
         log.info("[HEDGE] %d posiciones master en pérdida real ≥%.1f%% "
@@ -411,17 +385,16 @@ class ComplementEngine:
                  total_losing, HEDGE_LOSS_PCT, len(losing_longs), len(losing_shorts), hedge_dir)
 
         try:
-            ticker = await self.client.get_ticker("BTCUSDT")
+            ticker    = await self.client.get_ticker("BTCUSDT")
             btc_price = float(ticker.get("lastPrice", 0))
             if btc_price <= 0:
                 return
 
-            # Size pequeño: solo cobertura simbólica (~50 USDT notional)
             hedge_notional = min(50.0, C.MAX_NOTIONAL_USDT * 0.25)
             hedge_qty      = hedge_notional / btc_price
 
-            sl_pct  = 0.015  # 1.5% SL en BTC
-            tp1_pct = 0.02   # 2% TP
+            sl_pct  = 0.015
+            tp1_pct = 0.02
 
             if hedge_dir == "SHORT":
                 sl  = btc_price * (1 + sl_pct)
@@ -459,24 +432,25 @@ class ComplementEngine:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def run_loop(self):
-        log.info("Complement Engine v1.1 iniciado — modos: %s", COMPLEMENT_MODE)
+        log.info("Complement Engine v1.2 iniciado — modos: %s | exclusivos=%d",
+                 COMPLEMENT_MODE, EXCLUSIVE_TOP_N)
 
-        # Refresh inicial de símbolos exclusivos
         await self.refresh_exclusive_symbols()
 
         iteration = 0
         while True:
             iteration += 1
 
-            # Refresh símbolos cada 30 iteraciones
             if iteration % 30 == 0:
                 await self.refresh_exclusive_symbols()
 
             try:
-                if "COPY" in COMPLEMENT_MODE and os.getenv("MASTER_URL"):
+                # FIX v1.2: COPY y GUARDIAN solo si MASTER_URL configurado
+                master_url = os.getenv("MASTER_URL", "")
+                if "COPY" in COMPLEMENT_MODE and master_url:
                     await self.run_copy_mode()
 
-                if "GUARDIAN" in COMPLEMENT_MODE and os.getenv("MASTER_URL"):
+                if "GUARDIAN" in COMPLEMENT_MODE and master_url:
                     await self.run_guardian_mode()
 
                 if "HEDGE" in COMPLEMENT_MODE:
