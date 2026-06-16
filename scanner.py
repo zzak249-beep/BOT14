@@ -1,11 +1,17 @@
 """
-QF×JP Bot v6.5 — Scanner CORREGIDO
-Fixes:
+QF×JP Bot v6.6 — Scanner
+Fixes vs v6.5:
   - symbol_allowed check (cooldown + límite/día)
   - OBI boost desde order book
   - Funding rate como filtro de sesgo
   - Batch 20, pausa 0.2s
-  - [FIX] await risk.status() — era coroutine sin await
+
+FIX v7.1 (acompaña a risk_manager.py v7.1):
+  ✅ can_trade() ahora recibe unrealized_pnl (suma de PnL no realizado de
+     todas las posiciones trackeadas en PositionManager). Antes el chequeo
+     de daily loss solo miraba PnL cerrado, permitiendo seguir abriendo
+     trades nuevos aunque el drawdown no realizado ya superara el límite
+     diario configurado (DAILY_LOSS_PCT).
 """
 import asyncio
 import logging
@@ -107,7 +113,11 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         return sig
 
     # ── LIVE ──────────────────────────────────────────────────────────────────
-    can, reason = await risk.can_trade()
+    # FIX v7.1: incluir PnL no realizado en el chequeo de riesgo diario.
+    # Sin esto, can_trade() solo veía PnL cerrado y seguía aprobando trades
+    # nuevos mientras el drawdown no realizado ya superaba DAILY_LOSS_PCT.
+    unrealized = await pos_mgr.get_unrealized_pnl()
+    can, reason = await risk.can_trade(unrealized_pnl=unrealized)
     if not can:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
@@ -167,8 +177,8 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     return sig
 
 
-async def scan_loop(client, risk, pos_mgr):
-    log.info("Scanner v6.5 | Modo=%s | Interval=%ds | Batch=20",
+async def scan_loop(client, risk, pos_mgr, complement=None):
+    log.info("Scanner v6.6 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
@@ -179,10 +189,15 @@ async def scan_loop(client, risk, pos_mgr):
 
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
-                new = await client.get_all_symbols()
-                if new:
-                    symbols = new
-                    log.info("Símbolos activos: %d", len(symbols))
+                all_syms = await client.get_all_symbols()
+                if all_syms:
+                    # Si complement activo: usar solo símbolos exclusivos de joyful-art
+                    if complement and complement.get_exclusive_symbols():
+                        symbols = complement.get_exclusive_symbols()
+                        log.info("Modo EXCLUSIVO: %d símbolos (top por volumen)", len(symbols))
+                    else:
+                        symbols = all_syms
+                        log.info("Símbolos activos: %d", len(symbols))
                 else:
                     log.warning("get_all_symbols vacío (iter=%d)", iteration)
             except Exception as e:
@@ -198,9 +213,8 @@ async def scan_loop(client, risk, pos_mgr):
         if iteration % 20 == 0:
             try:
                 balance = await client.get_balance()
-                # ✅ FIX: risk.status() es async, hay que awaitarlo
-                status = await risk.status()
-                await tg.notify_status(status, balance, len(symbols))
+                unrealized = await pos_mgr.get_unrealized_pnl()
+                await tg.notify_status(risk.status(unrealized_pnl=unrealized), balance, len(symbols))
             except Exception:
                 pass
 
