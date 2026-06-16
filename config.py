@@ -34,17 +34,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MODE = os.getenv("MODE", "SIGNAL").upper()
 
 # ── Capital y riesgo ──────────────────────────────────────────────────────────
-CAPITAL          = _float("CAPITAL", 879.0)      # saldo actual visto en screenshots
-RISK_PCT         = _float("RISK_PCT", 0.4)       # bajado a 0.4% — liquidaciones destruyen ganancias
+CAPITAL          = _float("CAPITAL", 700.0)      # actualizar con saldo real
+RISK_PCT         = _float("RISK_PCT", 0.5)       # era 1.0 → reducido a 0.5%
 LEVERAGE         = _int("LEVERAGE", 10)
-MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)    # DURO: máx 3 simultáneos
-MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 8)   # bajado a 8 — calidad > cantidad
+MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)    # era 5-6 → 3 máximo
+MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)  # era 20 → 10 máximo
 
 # ── Umbrales de señal ─────────────────────────────────────────────────────────
-MIN_SCORE  = _float("MIN_SCORE",  62.0)   # subido: menos trades, mejores entradas
-FUEL_SCORE = _float("FUEL_SCORE", 68.0)   # subido
-SUP_SCORE  = _float("SUP_SCORE",  82.0)
-MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()
+MIN_SCORE  = _float("MIN_SCORE",  58.0)   # era 50 → más estricto
+FUEL_SCORE = _float("FUEL_SCORE", 65.0)   # era 62
+SUP_SCORE  = _float("SUP_SCORE",  80.0)
+MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()  # era STD → solo FUEL o SUP
 
 # ── Entrada ───────────────────────────────────────────────────────────────────
 REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
@@ -64,9 +64,9 @@ HTF5_TIMEFRAME = os.getenv("HTF5_TIMEFRAME", "4h")
 
 # ── ATR / SL / TP ─────────────────────────────────────────────────────────────
 ATR_LEN      = _int("ATR_LEN",       10)
-SL_ATR_MULT  = _float("SL_ATR_MULT",  1.8)   # 1.8: evita hunts pero no demasiado lejos
-TP1_ATR_MULT = _float("TP1_ATR_MULT", 1.5)   # TP1 rápido: cerrar 50% antes
-TP2_ATR_MULT = _float("TP2_ATR_MULT", 3.5)   # TP2 con R:R 1:2
+SL_ATR_MULT  = _float("SL_ATR_MULT",  2.0)   # era 1.2 → 2.0 para evitar stop hunts
+TP1_ATR_MULT = _float("TP1_ATR_MULT", 2.0)   # TP1 con R:R = 1:1
+TP2_ATR_MULT = _float("TP2_ATR_MULT", 4.0)   # TP2 con R:R = 1:2
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN     = _int("ADX_LEN", 14)
@@ -85,21 +85,18 @@ CB_BARS     = _int("CB_BARS",       10)
 
 # ── Gestión de posiciones ─────────────────────────────────────────────────────
 POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
-# BREAKEVEN_ATR_MULT movido abajo con SL_MIN/MAX_PCT
+BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.0)   # mover BE antes (era 1.5)
+
+# ── Trailing Stop ─────────────────────────────────────────────────────────────
+TRAIL_ATR_MULT = _float("TRAIL_ATR_MULT", 1.5)  # distancia del trailing SL en ATRs
+# Activa tras TP1: el SL sigue el precio a 1.5 ATR de distancia
+# Convierte trades ganadores de +2 USDT en +8-15 USDT sin riesgo adicional
 
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
-DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 1.5)  # bajado a 1.5%: parar antes
+DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)  # era 5% → 2% del capital
 
 # ── Notional máximo por trade ─────────────────────────────────────────────────
-MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 150.0)  # bajado: PIUSDT liquidó con 499 USDT
-
-# ── SL mínimo obligatorio (% del entry) ───────────────────────────────────────
-# Si ATR produce un SL demasiado cercano, usar este mínimo
-SL_MIN_PCT = _float("SL_MIN_PCT", 0.8)   # mínimo 0.8% de distancia al entry
-SL_MAX_PCT = _float("SL_MAX_PCT", 3.5)   # máximo 3.5%: SL muy lejano = pérdida enorme
-
-# ── Breakeven más agresivo ─────────────────────────────────────────────────────
-BREAKEVEN_ATR_MULT = _float("BREAKEVEN_ATR_MULT", 1.0)  # mover BE antes (era 1.5)
+MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)  # NUNCA subir sin justificación
 
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)

@@ -54,6 +54,13 @@ async def notify_signal(sig) -> None:
         f"Estructura: `{sig.structure}` | TL: `{sig.tl_break}`\n"
         f"HTF: `{sig.htf_score:.2f}` | FR: `{sig.funding_rate:.4f}`"
     )
+    liq  = getattr(sig, "liq_bonus", 0.0)
+    trap = getattr(sig, "anti_trap_delta", 0.0)
+    edge = getattr(sig, "edge_reasons", "")
+    if liq or trap or (edge and edge != "ok"):
+        msg += f"\nEdge: `liq+{liq:.1f}` `trap{trap:+.1f}`"
+        if edge and edge != "ok":
+            msg += f" `{edge[:50]}`"
     await send(msg)
 
 
@@ -116,5 +123,17 @@ async def notify_error(context: str, error: str) -> None:
     msg = (
         f"🚨 *ERROR* — `{context}`\n"
         f"`{error[:300]}`"
+    )
+    await send(msg)
+
+
+
+async def notify_trailing(symbol: str, direction: str, old_sl: float,
+                           new_sl: float, mark: float) -> None:
+    icon = "LONG" if direction == "LONG" else "SHORT"
+    msg = (
+        "*TRAILING STOP* - `" + symbol + "` " + icon + "\n"
+        + "SL: `" + "{:.6f}".format(old_sl) + "` to `" + "{:.6f}".format(new_sl) + "`\n"
+        + "Mark: `" + "{:.6f}".format(mark) + "`"
     )
     await send(msg)

@@ -17,6 +17,14 @@ from indicators import analyze, Signal, score_to_tier
 from risk_manager import RiskManager
 from position_manager import PositionManager, OpenTrade
 import telegram_client as tg
+try:
+    from market_edge import obi_deep
+except ImportError:
+    def obi_deep(ob, levels=20): return 0.0
+try:
+    from trade_analytics import analytics
+except ImportError:
+    analytics = None
 
 log = logging.getLogger("scanner")
 
@@ -42,13 +50,8 @@ async def _fetch_all(client: BingXClient, symbol: str):
 
 
 def _obi(ob: dict) -> float:
-    try:
-        bv = sum(float(b[1]) for b in ob.get("bids", [])[:5] if len(b) >= 2)
-        av = sum(float(a[1]) for a in ob.get("asks", [])[:5] if len(a) >= 2)
-        t  = bv + av
-        return (bv - av) / t if t > 0 else 0.0
-    except Exception:
-        return 0.0
+    """OBI profundo 20 niveles ponderado por distancia al mid."""
+    return obi_deep(ob, levels=20)
 
 
 async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
@@ -151,6 +154,17 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
         return None
 
+    # ── Verificar SL colocado ─────────────────────────────────────────────────
+    sl_resp = results.get("sl", {})
+    if isinstance(sl_resp, dict) and sl_resp.get("code", -1) != 0:
+        log.error("[%s] SL FALLIDO post-entrada: %s — cerrando posición", symbol, sl_resp)
+        await tg.notify_error(f"sl_fallido({symbol})", str(sl_resp))
+        try:
+            await client.close_position_market(symbol, qty, sig.direction)
+        except Exception as ce:
+            log.error("[%s] cierre emergencia fallido: %s", symbol, ce)
+        return None
+
     order_id = str(
         entry_resp.get("data", {}).get("order", {}).get("orderId", "unknown")
         or entry_resp.get("data", {}).get("orderId", "unknown")
@@ -160,8 +174,11 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         symbol=symbol, direction=sig.direction,
         entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
         qty=qty, atr=sig.atr, order_id=order_id,
+        qty_remaining=qty,
     )
     await pos_mgr.register_trade(trade)
+    if analytics:
+        await analytics.on_trade_opened(symbol, sig)
     await tg.notify_trade_opened(sig, qty, order_id)
     return sig
 

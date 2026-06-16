@@ -17,6 +17,10 @@ from risk_manager import RiskManager
 from position_manager import PositionManager
 from scanner import scan_loop
 import telegram_client as tg
+try:
+    from trade_analytics import analytics as trade_analytics
+except ImportError:
+    trade_analytics = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +59,7 @@ async def lifespan(app: FastAPI):
     global client, risk, pos_mgr
 
     log.info("═" * 50)
-    log.info("  QF×JP Bot v6.5 — ANTI-LIQUIDACIÓN")
+    log.info("  QF×JP Bot v6.6 — TRAILING + PARTIAL CLOSE")
     log.info("  Modo: %s | Capital: %.2f USDT", C.MODE, C.CAPITAL)
     log.info("  Leverage: %dx | Min tier: %s", C.LEVERAGE, C.MIN_TIER)
     log.info("  Max notional: %.0f USDT | Daily loss: %.1f%%",
@@ -103,7 +107,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="QF×JP Bot v6.5",
+    title="QF×JP Bot v6.6",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -112,7 +116,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "6.5", "mode": C.MODE}
+    return {"status": "ok", "version": "6.6", "mode": C.MODE}
 
 
 @app.get("/status")
@@ -125,7 +129,7 @@ async def status():
         balance = -1.0
     tracked = pos_mgr.get_tracked() if pos_mgr else {}
     return {
-        "version": "6.5",
+        "version": "6.6",
         "mode":    C.MODE,
         "balance": round(balance, 2),
         "risk":    risk.status(),
@@ -155,6 +159,20 @@ async def close_symbol(symbol: str):
         raise HTTPException(404, f"{symbol} sin posición")
     await pos_mgr.close_position_emergency(symbol, reason="manual_close")
     return {"status": "ok", "symbol": symbol}
+
+
+@app.get("/analytics")
+async def get_analytics(days: int = 14):
+    """Win rate por símbolo, hora y tier + auto-blacklist."""
+    if trade_analytics is None:
+        return {"error": "analytics not available"}
+    return {
+        "days":     days,
+        "summary":  trade_analytics.summary(days),
+        "by_symbol": trade_analytics.winrate_by_symbol(days),
+        "by_hour":  trade_analytics.winrate_by_hour(days),
+        "auto_blacklist": list(trade_analytics.get_dynamic_blacklist()),
+    }
 
 
 @app.get("/positions")
