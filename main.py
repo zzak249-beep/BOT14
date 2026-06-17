@@ -1,11 +1,11 @@
 """
-QF×JP Bot v7.2 — Main
-FastAPI con lifespan moderno + reconciliación al arrancar + trailing stop info
-+ daily loss real (PnL no realizado incluido) en /status
+QF×JP Bot v6.6 — Main
+FastAPI con lifespan moderno + reconciliación al arrancar
 
-CAMBIOS v7.2:
-  - Version bump 7.1→7.2
-  - Log de configuración incluye MIN_TIER y CB settings para diagnóstico
+Mejoras v6.6:
+  - PositionManager se construye con on_close=scanner.log_closed_trade,
+    conectando cada cierre real a _trade_log (memoria) para el nuevo
+    endpoint GET /stats (win-rate por símbolo/tier/hora).
 """
 import asyncio
 import logging
@@ -20,10 +20,9 @@ import config as C
 from bingx_client import BingXClient
 from risk_manager import RiskManager
 from position_manager import PositionManager
+import scanner
 from scanner import scan_loop
 import telegram_client as tg
-from copier_client import MasterClient
-from complement_engine import ComplementEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,16 +32,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-client:     BingXClient       = None
-risk:       RiskManager       = None
-pos_mgr:    PositionManager   = None
-master:     MasterClient      = None
-complement: ComplementEngine   = None
+VERSION = "6.6"
+
+client:  BingXClient    = None
+risk:    RiskManager    = None
+pos_mgr: PositionManager = None
 
 
 async def _run_scanner():
     try:
-        await scan_loop(client, risk, pos_mgr, complement)
+        await scan_loop(client, risk, pos_mgr)
     except Exception as e:
         log.critical("Scanner crash: %s", e, exc_info=True)
         await tg.notify_error("scanner_crash", str(e))
@@ -59,51 +58,31 @@ async def _run_monitor():
         log.info("Monitor desactivado en modo SIGNAL")
 
 
-async def _run_complement():
-    import os
-    if os.getenv("COMPLEMENT_MODE", "") == "DISABLED":
-        log.info("Complement engine desactivado")
-        return
-    if C.MODE == "LIVE":
-        try:
-            await complement.run_loop()
-        except Exception as e:
-            log.critical("Complement crash: %s", e, exc_info=True)
-            await tg.notify_error("complement_crash", str(e))
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, risk, pos_mgr, master, complement
+    global client, risk, pos_mgr
 
-    log.info("═" * 60)
-    log.info("  QF×JP Bot v7.2 — FIXES 0-TRADES")
+    log.info("═" * 50)
+    log.info("  QF×JP Bot v%s — ANTI-LIQUIDACIÓN + MEJORAS", VERSION)
     log.info("  Modo: %s | Capital: %.2f USDT", C.MODE, C.CAPITAL)
-    log.info("  Leverage: %dx | Min tier: %s | Min score: %.1f",
-             C.LEVERAGE, C.MIN_TIER, C.MIN_SCORE)
+    log.info("  Leverage: %dx | Min tier: %s", C.LEVERAGE, C.MIN_TIER)
     log.info("  Max notional: %.0f USDT | Daily loss: %.1f%%",
              C.MAX_NOTIONAL_USDT, C.DAILY_LOSS_PCT)
-    log.info("  SL mult: %.1f | Trail activation: %.1f ATR | Trail dist: %.1f ATR",
-             C.SL_ATR_MULT, C.BREAKEVEN_ATR_MULT, C.TRAIL_DISTANCE_ATR)
-    log.info("  Max open: %d | Max daily: %d | Top-N: %d",
-             C.MAX_OPEN_TRADES, C.MAX_DAILY_TRADES, C.TOP_N_SYMBOLS)
-    log.info("  CB: enabled=%s mult=%.1f bars=%d",
-             C.CB_ENABLED, C.CB_ATR_MULT, C.CB_BARS)
-    log.info("  HTF_MIN_ALIGNED: %d | REQUIRE_TL_BREAK: %s",
-             C.HTF_MIN_ALIGNED, C.REQUIRE_TL_BREAK)
-    log.info("═" * 60)
+    log.info("  SL mult: %.1f | Max open: %d | Max hold: %d min",
+             C.SL_ATR_MULT, C.MAX_OPEN_TRADES, C.MAX_HOLD_MINUTES)
+    log.info("═" * 50)
 
-    client     = BingXClient()
-    risk       = RiskManager()
-    pos_mgr    = PositionManager(client, risk)
-    master     = MasterClient()
-    complement = ComplementEngine(client, risk, pos_mgr, master)
+    client  = BingXClient()
+    risk    = RiskManager()
+    # v6.6: on_close conecta cada cierre real a _trade_log para /stats
+    pos_mgr = PositionManager(client, risk, on_close=scanner.log_closed_trade)
 
     if not C.BINGX_API_KEY or not C.BINGX_SECRET_KEY:
         log.error("BINGX_API_KEY / BINGX_SECRET_KEY no configurados")
     if not C.TELEGRAM_TOKEN or not C.TELEGRAM_CHAT_ID:
         log.warning("Telegram no configurado")
 
+    # Balance inicial
     try:
         balance = await client.get_balance()
         log.info("Balance: %.4f USDT", balance)
@@ -111,6 +90,7 @@ async def lifespan(app: FastAPI):
         log.warning("Balance inicial no disponible: %s", e)
         balance = 0.0
 
+    # Reconciliar posiciones abiertas tras redeploy
     if C.MODE == "LIVE":
         try:
             await pos_mgr.reconcile_on_startup()
@@ -119,25 +99,21 @@ async def lifespan(app: FastAPI):
 
     await tg.notify_status(risk.status(), balance, 0)
 
-    scanner_task    = asyncio.create_task(_run_scanner())
-    monitor_task    = asyncio.create_task(_run_monitor())
-    complement_task = asyncio.create_task(_run_complement())
-    log.info("Loops iniciados (scanner + monitor + complement)")
+    scanner_task = asyncio.create_task(_run_scanner())
+    monitor_task = asyncio.create_task(_run_monitor())
+    log.info("Loops iniciados")
 
     yield
 
     scanner_task.cancel()
     monitor_task.cancel()
-    complement_task.cancel()
-    if master:
-        await master.close()
     if client:
         await client.close()
     log.info("Bot detenido.")
 
 
 app = FastAPI(
-    title="QF×JP Bot v7.2",
+    title=f"QF×JP Bot v{VERSION}",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -146,7 +122,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "7.2", "mode": C.MODE}
+    return {"status": "ok", "version": VERSION, "mode": C.MODE}
 
 
 @app.get("/status")
@@ -157,41 +133,37 @@ async def status():
         balance = await client.get_balance()
     except Exception:
         balance = -1.0
-
-    try:
-        unrealized = await pos_mgr.get_unrealized_pnl() if pos_mgr else 0.0
-    except Exception:
-        unrealized = 0.0
-
     tracked = pos_mgr.get_tracked() if pos_mgr else {}
     return {
-        "version": "7.2",
+        "version": VERSION,
         "mode":    C.MODE,
         "balance": round(balance, 2),
-        "risk":    risk.status(unrealized_pnl=unrealized),
+        "risk":    risk.status(),
         "trades":  {
             sym: {
-                "direction":       t.direction,
-                "entry":           t.entry,
-                "sl":              t.sl,
-                "tp1":             t.tp1,
-                "tp2":             t.tp2,
-                "qty":             t.qty,
-                "be_moved":        t.be_moved,
-                "trailing_active": t.trailing_active,
-                "trail_sl":        round(t.trail_sl, 8) if t.trail_sl else None,
-                "peak_price":      round(t.peak_price, 8) if t.peak_price else None,
-                "pnl_at_trail_sl": round(
-                    (t.trail_sl - t.entry) * t.qty * C.LEVERAGE
-                    if t.direction == "LONG" and t.trail_sl > 0
-                    else (t.entry - t.trail_sl) * t.qty * C.LEVERAGE
-                    if t.direction == "SHORT" and t.trail_sl > 0
-                    else 0.0, 2
-                ),
+                "direction":    t.direction,
+                "entry":        t.entry,
+                "sl":           t.sl,
+                "tp1":          t.tp1,
+                "tp2":          t.tp2,
+                "qty":          t.qty,
+                "be_moved":     t.be_moved,
+                "tier":         t.tier,
+                "score":        t.score,
+                "opened_at":    t.opened_at,
             }
             for sym, t in tracked.items()
         },
     }
+
+
+@app.get("/stats")
+async def stats():
+    """
+    v6.6 Item 5: win-rate agregado por símbolo/tier/hora UTC de los
+    últimos 200 trades cerrados (en memoria, no persiste entre redeploys).
+    """
+    return scanner.get_stats()
 
 
 @app.post("/close/{symbol}")

@@ -57,38 +57,11 @@ def _build_signed_qs(params: dict) -> str:
 class BingXClient:
     BASE = C.BINGX_BASE_URL
 
-    # Cache de positionSide — detectado automáticamente en primer fallo
-    _ps_cache:     dict = {}
-    _account_mode: str  = ""   # "HEDGE" o "ONEWAY"
-
     def __init__(self):
         self._session:       Optional[aiohttp.ClientSession] = None
         self._precision_map: dict[str, int]   = {}
         self._min_qty_map:   dict[str, float] = {}
-        log.info("BingXClient v6.6 iniciado")
-
-    def _resolve_ps(self, symbol: str, direction: str) -> str:
-        """Resuelve positionSide desde cache. Hedge=LONG/SHORT, One-Way=BOTH."""
-        if self.__class__._account_mode == "ONEWAY":
-            return "BOTH"
-        return self.__class__._ps_cache.get(symbol, direction)
-
-    def _handle_ps_error(self, msg: str, symbol: str, direction: str,
-                          params: dict) -> bool:
-        """Ajusta params si hay error de positionSide. Retorna True si hay que reintentar."""
-        msg = msg.lower()
-        if "long or short" in msg or ("positionside" in msg and "only" in msg):
-            self.__class__._account_mode = "HEDGE"
-            self.__class__._ps_cache[symbol] = direction
-            params["positionSide"] = direction
-            log.warning("[%s] Hedge mode detectado → ps=%s", symbol, direction)
-            return True
-        if "position not exist" in msg and params.get("positionSide") != "BOTH":
-            self.__class__._account_mode = "ONEWAY"
-            params["positionSide"] = "BOTH"
-            log.warning("[%s] One-Way mode detectado → BOTH", symbol)
-            return True
-        return False
+        log.info("BingXClient v6.4 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -435,33 +408,26 @@ class BingXClient:
         side:           str,
         quantity:       float,
         stop_price:     float,
-        direction:      str  = "LONG",
+        position_side:  str  = "LONG",
         close_position: bool = True,
         order_type:     str  = "STOP_MARKET",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
-        ps  = self._resolve_ps(symbol, direction)
+        # HEDGE MODE: NO usar reduceOnly (BingX lo rechaza silenciosamente en Hedge mode).
+        # positionSide identifica la posición a cerrar — eso es suficiente.
         params = {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": ps,
+            "positionSide": position_side,
             "type":         order_type,
             "stopPrice":    str(round(stop_price, 8)),
             "quantity":     str(qty),
             "workingType":  "MARK_PRICE",
             "priceProtect": "true",
         }
-        log.debug("[%s] %s ps=%s stop=%.6f qty=%s", symbol, order_type, ps, stop_price, qty)
-        resp = await self._post("/openApi/swap/v2/trade/order", params)
-        if isinstance(resp, dict) and resp.get("code", -1) != 0:
-            msg = str(resp.get("msg", ""))
-            if self._handle_ps_error(msg, symbol, direction, params):
-                resp = await self._post("/openApi/swap/v2/trade/order", params)
-            elif "stop loss price" in msg.lower() or "greater than" in msg.lower() or "less than" in msg.lower():
-                log.error("[%s] SL price inválido %.6f: %s", symbol, stop_price, msg)
-        if isinstance(resp, dict) and resp.get("code", -1) == 0:
-            self.__class__._ps_cache[symbol] = params["positionSide"]
-        return resp if isinstance(resp, dict) else {"code": -1, "msg": str(resp)}
+        log.debug("[%s] %s side=%s positionSide=%s stopPrice=%s qty=%s",
+                  symbol, order_type, side, position_side, stop_price, qty)
+        return await self._post("/openApi/swap/v2/trade/order", params)
 
     async def cancel_order(self, symbol: str, order_id: str) -> dict:
         return await self._delete(
@@ -475,19 +441,22 @@ class BingXClient:
             {"symbol": symbol},
         )
 
-    async def close_position_market(self, symbol: str, quantity: float,
-                                     direction: str) -> dict:
-        side   = "SELL" if direction == "LONG" else "BUY"
-        qty    = self._round_qty(symbol, quantity)
-        ps     = self._resolve_ps(symbol, direction)
-        params = {"symbol": symbol, "side": side, "positionSide": ps,
-                  "type": "MARKET", "quantity": str(qty)}
-        log.info("[%s] CLOSE MARKET ps=%s qty=%s", symbol, ps, qty)
-        resp = await self._post("/openApi/swap/v2/trade/order", params)
-        if isinstance(resp, dict) and resp.get("code", -1) != 0:
-            if self._handle_ps_error(str(resp.get("msg", "")), symbol, direction, params):
-                resp = await self._post("/openApi/swap/v2/trade/order", params)
-        return resp if isinstance(resp, dict) else {"code": -1}
+    async def close_position_market(
+        self,
+        symbol:        str,
+        quantity:      float,
+        position_side: str,
+    ) -> dict:
+        side = "SELL" if position_side == "LONG" else "BUY"
+        qty  = self._round_qty(symbol, quantity)
+        # HEDGE MODE: positionSide requerido para cerrar la posición correcta
+        return await self._post("/openApi/swap/v2/trade/order", {
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": position_side,
+            "type":         "MARKET",
+            "quantity":     str(qty),
+        })
 
     # ── open_trade completo (entrada + SL + TP1 + TP2) ───────────────────────
 

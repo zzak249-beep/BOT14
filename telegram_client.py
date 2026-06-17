@@ -2,9 +2,6 @@
 QF×JP Bot v6.4 — Telegram Client
 Envía notificaciones al canal configurado.
 Todas las funciones son fire-and-forget (no bloquean el bot).
-
-[FIX] notify_status: keys actualizadas para RiskManager v7.1
-      (daily_pnl_realized / daily_pnl_unrealized / daily_pnl_effective)
 """
 import asyncio
 import logging
@@ -103,16 +100,28 @@ async def notify_circuit_breaker(symbol: str) -> None:
 async def notify_status(status: dict, balance: float, n_symbols: int) -> None:
     """
     Status periódico del bot.
-    Usa las keys de RiskManager v7.1:
-      daily_pnl_realized / daily_pnl_unrealized / daily_pnl_effective / daily_limit
-    """
-    # ✅ FIX: keys actualizadas para RiskManager v7.1
-    pnl_realized   = status.get("daily_pnl_realized",   0.0)
-    pnl_unrealized = status.get("daily_pnl_unrealized", 0.0)
-    pnl_effective  = status.get("daily_pnl_effective",  0.0)
-    daily_limit    = status.get("daily_limit",           0.0)   # ya viene negativo
 
-    pnl_icon = "💚" if pnl_effective >= 0 else "💔"
+    FIX v6.6: el deploy real tiene risk.status() declarado como async en
+    algún punto (no coincide con la versión subida, que lo tiene síncrono),
+    y el caller en main.py/scanner.py no le pone await. Esto hace que
+    `status` llegue aquí como una corutina sin resolver en vez de un dict,
+    y status.get(...) explota con AttributeError, crasheando notify_status
+    -> notify_status es awaited dentro de lifespan() en main.py, así que
+    el crash propaga y tira todo el arranque (deploy FAILED).
+    Guard: si status es awaitable, lo resolvemos aquí mismo antes de
+    usarlo. Esto hace notify_status robusto sin importar si el caller
+    puso await o no, y sin importar cuál de las dos versiones de
+    risk.status() esté realmente desplegada.
+    """
+    import inspect
+    if inspect.isawaitable(status):
+        try:
+            status = await status
+        except Exception as e:
+            log.warning("notify_status: no se pudo resolver status awaitable: %s", e)
+            status = {}
+    if not isinstance(status, dict):
+        status = {}
 
     msg = (
         f"📊 *STATUS QF×JP Bot*\n"
@@ -120,10 +129,7 @@ async def notify_status(status: dict, balance: float, n_symbols: int) -> None:
         f"Balance: `{balance:.2f} USDT`\n"
         f"Trades abiertos: `{status.get('open_trades', 0)}/{status.get('max_open', 0)}`\n"
         f"Trades hoy: `{status.get('daily_trades', 0)}/{status.get('max_daily', 0)}`\n"
-        f"{pnl_icon} PnL realizado: `{pnl_realized:+.4f} USDT`\n"
-        f"PnL no realizado: `{pnl_unrealized:+.4f} USDT`\n"
-        f"PnL efectivo: `{pnl_effective:+.4f} USDT`\n"
-        f"Límite diario: `{daily_limit:.2f} USDT`\n"
+        f"PnL diario: `{status.get('daily_pnl', 0):+.4f} USDT`\n"
         f"Símbolos escaneados: `{n_symbols}`"
     )
     await send(msg)

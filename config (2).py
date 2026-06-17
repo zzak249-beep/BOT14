@@ -1,17 +1,9 @@
 """
-QF×JP Bot v6.6 — Config ANTI-LIQUIDACIÓN + MEJORAS
-Fixes críticos v6.5 (anti-liquidación):
-  - Notional cap 200 USDT (era ilimitado → liquidaciones de -85, -104, -278 USDT)
-  - SL_ATR_MULT 2.0 (era 1.2 → stop hunts en VANA, ILV, BANANA)
-  - Daily loss limit 2% (era 5% → hyper perdió 278 USDT en un día)
-  - MAX_OPEN_TRADES 3 (era 5-6 → acumula posiciones perdedoras)
-
-Mejoras v6.6 (ver bloque "v6.6 — Mejoras post-consolidación" más abajo):
-  - MAX_HOLD_MINUTES: cierre forzado por tiempo (fix de mayor impacto
-    según análisis de 33 páginas de historial — liquidaciones por
-    exposición prolongada, no por tamaño de posición)
-  - FUNDING_RATE_MAX_ABS, MAX_SPREAD_PCT: filtros anti-trampa (item 4)
-  - OBI_DEPTH: profundidad de order book configurable (item 1)
+QF×JP Bot v7.0 — Config TRAILING STOP + ANTI-LIQUIDACIÓN
+Cambios vs v6.5:
+  - BREAKEVEN_ATR_MULT 1.5→1.0: activa trailing antes (más margen de trailing)
+  - TRAIL_DISTANCE_ATR 1.5: SL sigue el peak a 1.5 ATR de distancia
+  - Resto sin cambios (todos los caps anti-liquidación conservados)
 """
 import os
 from dotenv import load_dotenv
@@ -41,21 +33,21 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MODE = os.getenv("MODE", "SIGNAL").upper()
 
 # ── Capital y riesgo ──────────────────────────────────────────────────────────
-CAPITAL          = _float("CAPITAL", 700.0)      # actualizar con saldo real
-RISK_PCT         = _float("RISK_PCT", 0.5)       # era 1.0 → reducido a 0.5%
+CAPITAL          = _float("CAPITAL", 700.0)
+RISK_PCT         = _float("RISK_PCT", 0.5)
 LEVERAGE         = _int("LEVERAGE", 10)
-MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)    # era 5-6 → 3 máximo
-MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)  # era 20 → 10 máximo
+MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)
+MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)
 
 # ── Umbrales de señal ─────────────────────────────────────────────────────────
-MIN_SCORE  = _float("MIN_SCORE",  58.0)   # era 50 → más estricto
-FUEL_SCORE = _float("FUEL_SCORE", 65.0)   # era 62
+MIN_SCORE  = _float("MIN_SCORE",  58.0)
+FUEL_SCORE = _float("FUEL_SCORE", 65.0)
 SUP_SCORE  = _float("SUP_SCORE",  80.0)
-MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()  # era STD → solo FUEL o SUP
+MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()
 
 # ── Entrada ───────────────────────────────────────────────────────────────────
 REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
-HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)    # era 1 → 2 TFs confirmados
+HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
 SCAN_INTERVAL   = _int("SCAN_INTERVAL", 60)
@@ -71,9 +63,9 @@ HTF5_TIMEFRAME = os.getenv("HTF5_TIMEFRAME", "4h")
 
 # ── ATR / SL / TP ─────────────────────────────────────────────────────────────
 ATR_LEN      = _int("ATR_LEN",       10)
-SL_ATR_MULT  = _float("SL_ATR_MULT",  2.0)   # era 1.2 → 2.0 para evitar stop hunts
-TP1_ATR_MULT = _float("TP1_ATR_MULT", 2.0)   # TP1 con R:R = 1:1
-TP2_ATR_MULT = _float("TP2_ATR_MULT", 4.0)   # TP2 con R:R = 1:2
+SL_ATR_MULT  = _float("SL_ATR_MULT",  2.0)
+TP1_ATR_MULT = _float("TP1_ATR_MULT", 2.0)
+TP2_ATR_MULT = _float("TP2_ATR_MULT", 4.0)
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN     = _int("ADX_LEN", 14)
@@ -83,7 +75,7 @@ ADX_LATERAL = _float("ADX_LATERAL", 20.0)
 # ── Kelly ─────────────────────────────────────────────────────────────────────
 KELLY_WIN_RATE = _float("KELLY_WIN_RATE", 0.55)
 KELLY_RR       = _float("KELLY_RR",       1.5)
-KELLY_FRACTION = _float("KELLY_FRACTION", 0.15)  # era 0.25 → reducido
+KELLY_FRACTION = _float("KELLY_FRACTION", 0.15)
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 CB_ENABLED  = _bool("CB_ENABLED",   True)
@@ -92,46 +84,24 @@ CB_BARS     = _int("CB_BARS",       10)
 
 # ── Gestión de posiciones ─────────────────────────────────────────────────────
 POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
-BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.5)  # mover BE antes
+
+# ── Trailing Stop Dinámico ────────────────────────────────────────────────────
+# BREAKEVEN_ATR_MULT: umbral de ACTIVACIÓN del trailing (antes era solo BE)
+#   Era 1.5 → ahora 1.0: activa antes para tener más recorrido de trailing
+#   Ejemplo: ATR=0.01, entry=1.0 → activa cuando mark >= 1.010
+BREAKEVEN_ATR_MULT = _float("BREAKEVEN_ATR_MULT", 1.0)
+
+# TRAIL_DISTANCE_ATR: distancia del SL al peak del precio (en múltiplos de ATR)
+#   El SL sigue el precio manteniendo esta distancia desde el mejor precio visto
+#   Ejemplo: ATR=0.01, peak=1.040 → SL @ 1.040 - 1.5*0.01 = 1.025
+#   Configurable en Railway si el mercado es más/menos volátil
+TRAIL_DISTANCE_ATR = _float("TRAIL_DISTANCE_ATR", 1.5)
 
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
-DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)  # era 5% → 2% del capital
+DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)
 
 # ── Notional máximo por trade ─────────────────────────────────────────────────
-MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)  # NUNCA subir sin justificación
-
-# ── v6.6 — Mejoras post-consolidación ──────────────────────────────────────────
-# Análisis de 33 páginas de historial (balance 855 USDT): 3 liquidaciones
-# (PIUSDT -49.91 tras 29h abierto, HUSDT -12.51 tras 1h42m a 6x, BEATUSDT
-# -0.58 tras 1h17m) explican casi toda la pérdida neta — sin ellas, los
-# 20 trades restantes son ~breakeven (-1.70 USDT). El edge existe; el
-# riesgo de cola viene de trades que no se resuelven a tiempo y quedan
-# expuestos horas a leverage alto. Item de mayor impacto: cierre forzado
-# por tiempo.
-
-# Cierre forzado si un trade lleva abierto más de N minutos sin resolver
-# por SL/TP/BE. 0 = desactivado. Esta estrategia está diseñada para
-# cierres en 5-15 min; superar esto largamente indica que el mercado no
-# se mueve como se esperaba — mejor cortar que esperar una liquidación.
-MAX_HOLD_MINUTES = _int("MAX_HOLD_MINUTES", 180)   # 3h por defecto
-
-# Item 4 — filtros anti-trampa
-# Funding rate extremo: no abrir EN LA DIRECCIÓN que ya está abarrotada
-# (funding muy positivo = longs pagan mucho = lado long sobrepoblado →
-# bloquea abrir LONG; funding muy negativo bloquea SHORT). Distinto del
-# bonus de composite_score, que premia ir CONTRA el funding extremo —
-# este es un techo duro para no perseguir un movimiento ya exhausto.
-FUNDING_RATE_MAX_ABS = _float("FUNDING_RATE_MAX_ABS", 0.0005)  # 0.05%
-
-# Spread máximo (bid-ask) como % del mid price. Por encima de esto el
-# par se considera demasiado ilíquido para entrar con garantías de
-# ejecución cercana al precio esperado.
-MAX_SPREAD_PCT = _float("MAX_SPREAD_PCT", 0.15)   # 0.15%
-
-# Profundidad del order book para el cálculo de OBI (Order Book
-# Imbalance). Antes fijo a 5 niveles; ahora configurable, default 20
-# para una lectura más representativa de la presión real del libro.
-OBI_DEPTH = _int("OBI_DEPTH", 20)
+MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
 
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)

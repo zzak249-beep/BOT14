@@ -1,12 +1,23 @@
 """
-QF×JP Bot v6.4 — Indicators
+QF×JP Bot v6.6 — Indicators
 Basado en análisis de trades ganadores:
   - Todos SHORT, leverage 5-10x, duración 5-15 min
   - BoS↓ / CHoCH↓ priorizados en composite_score
   - CVD negativo muy correlacionado con ganancia (peso ++CVD)
   - HTF SHORT bias pesado
-  - SL ajustado (0.8 ATR), TP1 rápido (1.2 ATR)
+  - SL ajustado, TP1 rápido
   - funding_rate integrado en analyze()
+
+FIXES v6.6 [MEJORA — Item 1 de la lista de mejoras post-consolidación]:
+  - detect_cvd_divergence(): nueva función. Detecta cuando precio y CVD
+    se mueven en direcciones opuestas en los últimos 20 velas — precio↑
+    con CVD↓ es distribución (favorece SHORT), precio↓ con CVD↑ es
+    acumulación (favorece LONG). Integrado como BONUS de +4 pts en
+    composite_score cuando confirma la dirección de la señal, no como
+    filtro duro (ausencia de divergencia no penaliza — muchas señales
+    válidas no tienen divergencia clara).
+  - Signal.cvd_div: nuevo campo ("BULL"|"BEAR"|"NONE") para que scanner/
+    telegram puedan mostrarlo o loggearlo.
 """
 import logging
 import warnings
@@ -42,6 +53,7 @@ class Signal:
     tl_break_active: bool  = False
     circuit_breaker: bool  = False
     funding_rate:    float = 0.0
+    cvd_div:         str   = "NONE"   # v6.6: BULL | BEAR | NONE — ver detect_cvd_divergence
     reason:          str   = ""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -137,6 +149,33 @@ def calc_cvd(open_, close, volume) -> np.ndarray:
     total = bull + bear
     cvd   = np.divide(delta, total, out=np.zeros_like(delta), where=total > 0)
     return _ema(cvd, 5)
+
+
+def detect_cvd_divergence(close, cvd_series, lookback: int = 20) -> str:
+    """
+    v6.6 — Detecta divergencia precio/CVD sobre `lookback` velas:
+      - Precio sube pero CVD baja → "BEAR" (distribución, favorece SHORT)
+      - Precio baja pero CVD sube → "BULL" (acumulación, favorece LONG)
+      - Mismo signo o precio plano → "NONE"
+    Usado como bonus de score en composite_score (CVD_DIV_BONUS), no como
+    filtro duro — una divergencia sin el resto de confirmaciones no debe
+    bloquear una señal por sí sola.
+    """
+    c   = np.asarray(close, float)
+    cvd = np.asarray(cvd_series, float)
+    if len(c) < lookback + 1 or len(cvd) < lookback + 1:
+        return "NONE"
+
+    price_chg = c[-1] - c[-lookback]
+    cvd_chg   = cvd[-1] - cvd[-lookback]
+
+    if abs(price_chg) < 1e-12:
+        return "NONE"
+    if price_chg > 0 and cvd_chg < 0:
+        return "BEAR"
+    if price_chg < 0 and cvd_chg > 0:
+        return "BULL"
+    return "NONE"
 
 # ── MFI ───────────────────────────────────────────────────────────────────────
 
@@ -257,11 +296,12 @@ def composite_score(
     htf_s:     float,
     fvg:       str,
     funding:   float = 0.0,
+    cvd_div:   str   = "NONE",
 ) -> float:
     """
     Score 0-100 ponderado al perfil SHORT ganador.
 
-    Pesos (suma = 100 + 2 FVG bonus + 3 funding bonus):
+    Pesos (suma = 100 + 2 FVG bonus + 3 funding bonus + 4 CVD-div bonus):
       ADX:        20  — tendencia necesaria
       CVD:        20  — confirmación volumen (++ SHORT)
       Momentum:   15
@@ -271,6 +311,7 @@ def composite_score(
       HTF:         8
       FVG:         2  (bonus)
       Funding:     3  (bonus cuando confirma dirección)
+      CVD-div:     4  (bonus, v6.6 — divergencia precio/CVD a favor de la señal)
     """
     s = 0.0
 
@@ -320,6 +361,12 @@ def composite_score(
         s += min(fr / 0.001, 1.0) * 3
     elif direction == "LONG" and fr < -0.0001:
         s += min(abs(fr) / 0.001, 1.0) * 3
+
+    # CVD-divergence bonus (4 pts, v6.6)
+    # BEAR (precio↑ CVD↓, distribución) confirma SHORT; BULL confirma LONG.
+    # Es un bonus, no un filtro duro: ausencia de divergencia no penaliza.
+    if (direction == "SHORT" and cvd_div == "BEAR") or (direction == "LONG" and cvd_div == "BULL"):
+        s += 4
 
     return round(min(s, 100.0), 1)
 
@@ -381,10 +428,12 @@ def analyze(
     if atr <= 0 or not np.isfinite(atr):
         return _no_signal("invalid_atr")
 
-    cvd_val = _safe(calc_cvd(o, c, v)[-1])
+    cvd_series = calc_cvd(o, c, v)
+    cvd_val = _safe(cvd_series[-1])
     mom_val = _safe(calc_momentum(c, 10)[-1])
     mfi_val = _safe(calc_mfi(h, l, c, v, 14)[-1], 50.0)
     vdi_val = _safe(calc_vdi(c, v, 20)[-1])
+    cvd_div = detect_cvd_divergence(c, cvd_series, lookback=20)
 
     cb        = C.CB_ENABLED and check_circuit_breaker(h, l, atr_arr, C.CB_ATR_MULT, C.CB_BARS)
     structure = detect_structure(h, l, c, 5)
@@ -417,11 +466,12 @@ def analyze(
     score = composite_score(
         direction, adx, cvd_val, mom_val, mfi_val,
         vdi_val, structure, tl_break, htf_s, fvg, funding_rate,
+        cvd_div=cvd_div,
     )
     tier = score_to_tier(score)
 
     # ── SL / TP ───────────────────────────────────────────────────────────────
-    entry    = _safe(c[-1])
+    entry    = _safe(c[-2])   # FIX: usar candle [-2] (última vela cerrada, no la viva)
     sl_mult  = C.SL_ATR_MULT
     tp1_mult = C.TP1_ATR_MULT
     tp2_mult = C.TP2_ATR_MULT
@@ -443,5 +493,6 @@ def analyze(
         tl_break_active=(tl_break != "NONE"),
         circuit_breaker=cb,
         funding_rate=funding_rate,
+        cvd_div=cvd_div,
         reason="ok",
     )

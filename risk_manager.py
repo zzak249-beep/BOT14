@@ -24,7 +24,6 @@ class RiskManager:
         self._open_count       = 0
         self._daily_trades     = 0
         self._daily_pnl        = 0.0
-        self._unrealized_pnl   = 0.0
         self._last_reset       = date.today()
         # Anti-overtrading y anti-liquidación
         self._symbol_loss_ts:    dict[str, float] = {}  # symbol → ts última pérdida
@@ -40,7 +39,6 @@ class RiskManager:
             log.info("Reset diario: trades=%d pnl=%.2f", self._daily_trades, self._daily_pnl)
             self._daily_trades     = 0
             self._daily_pnl        = 0.0
-            self._unrealized_pnl   = 0.0
             self._last_reset       = today
             self._symbol_trade_cnt = {}
 
@@ -55,9 +53,8 @@ class RiskManager:
                 return False, f"max_daily_trades({self._daily_trades}/{C.MAX_DAILY_TRADES})"
             # Daily loss limit usa el porcentaje configurable
             daily_limit = C.CAPITAL * (C.DAILY_LOSS_PCT / 100.0)
-            # Solo bloquear por PnL REALIZADO (cerrado hoy) — no por unrealized
             if self._daily_pnl < -daily_limit:
-                return False, f"daily_drawdown(cerrado={self._daily_pnl:.2f} no_real={self._unrealized_pnl:.2f} total={self._daily_pnl+self._unrealized_pnl:.2f} < -{daily_limit:.2f}, limit={C.DAILY_LOSS_PCT}%)"
+                return False, f"daily_drawdown(pnl={self._daily_pnl:.2f} < -{daily_limit:.2f}, limit={C.DAILY_LOSS_PCT}%)"
             return True, ""
 
     def symbol_allowed(self, symbol: str) -> tuple[bool, str]:
@@ -97,13 +94,12 @@ class RiskManager:
             log.info("Trade cerrado — pnl=%.4f daily_pnl=%.4f open=%d",
                      pnl, self._daily_pnl, self._open_count)
 
-    async def update_open_count(self, real_count: int, unrealized_pnl: float = 0.0):
+    async def update_open_count(self, real_count: int):
         """Sincroniza con BingX real — fuente de verdad."""
         async with self._lock:
             if self._open_count != real_count:
                 log.debug("open_count %d → %d (BingX real)", self._open_count, real_count)
                 self._open_count = real_count
-            self._unrealized_pnl = unrealized_pnl
 
     # ── Kelly sizing con cap duro ─────────────────────────────────────────────
 
@@ -141,13 +137,11 @@ class RiskManager:
         self._check_reset()
         daily_limit = C.CAPITAL * (C.DAILY_LOSS_PCT / 100.0)
         return {
-            "open_trades":    self._open_count,
-            "daily_trades":   self._daily_trades,
-            "daily_pnl":      round(self._daily_pnl, 4),
-            "unrealized_pnl": round(self._unrealized_pnl, 4),
-            "total_pnl":      round(self._daily_pnl + self._unrealized_pnl, 4),
-            "daily_limit":    round(-daily_limit, 2),
-            "max_open":       C.MAX_OPEN_TRADES,
-            "max_daily":      C.MAX_DAILY_TRADES,
-            "mode":           C.MODE,
+            "open_trades":   self._open_count,
+            "daily_trades":  self._daily_trades,
+            "daily_pnl":     round(self._daily_pnl, 4),
+            "daily_limit":   round(-daily_limit, 2),
+            "max_open":      C.MAX_OPEN_TRADES,
+            "max_daily":     C.MAX_DAILY_TRADES,
+            "mode":          C.MODE,
         }
