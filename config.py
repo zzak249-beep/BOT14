@@ -89,7 +89,12 @@ BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.0)   # mover BE antes (
 
 # ── Trailing Stop ─────────────────────────────────────────────────────────────
 TRAIL_DISTANCE_ATR = _float("TRAIL_DISTANCE_ATR", 1.5)  # distancia del trailing SL en ATRs
-# Activa tras TP1: el SL sigue el precio para proteger ganancias
+
+# ── Tiempo máximo de exposición (v6.6 fix de mayor impacto) ───────────────────
+# 3/3 liquidaciones analizadas ocurrieron en trades abiertos 1h17m-29h.
+# Esta estrategia espera resolución en 5-15 min — si supera este límite,
+# cierre forzado por mercado independientemente de PnL.
+MAX_HOLD_MINUTES = _int("MAX_HOLD_MINUTES", 45)
 
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
 DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 4.0)  # subido de 2% — era demasiado restrictivo
