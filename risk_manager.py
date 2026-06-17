@@ -1,28 +1,11 @@
 """
-QF×JP Bot v7.1 — Risk Manager ANTI-LIQUIDACIÓN + DAILY LOSS REAL
-═══════════════════════════════════════════════════════════════════════════════
-FIXES vs v6.5:
+QF×JP Bot v6.5 — Risk Manager ANTI-LIQUIDACIÓN
+Fixes:
   - daily_loss_limit usa DAILY_LOSS_PCT (era 5%, ahora 2%)
   - Notional cap duro MAX_NOTIONAL_USDT
   - Cooldown 2h por símbolo tras pérdida
   - Límite 2 trades por símbolo al día
   - open_count sincronizado solo desde BingX real
-
-FIX v7.1 — DAILY LOSS REAL (incluye PnL no realizado):
-  ✅ can_trade() ahora acepta un parámetro opcional `unrealized_pnl`.
-     Antes: solo _daily_pnl (PnL CERRADO) se comparaba contra el límite
-     diario. Si había -300 USDT en posiciones ABIERTAS pero 0 cerradas
-     en pérdida, can_trade() seguía devolviendo True y el bot seguía
-     abriendo posiciones nuevas mientras el drawdown real ya superaba
-     el límite configurado.
-     Ahora: el chequeo usa (daily_pnl_cerrado + unrealized_pnl) contra
-     el límite. PositionManager debe pasar la suma de PnL no realizado
-     de todas las posiciones trackeadas en cada llamada a can_trade().
-
-  ✅ status() también reporta daily_pnl_total (cerrado + no realizado)
-     cuando se le pasa unrealized_pnl, para que /status refleje el
-     drawdown real de la cuenta, no solo lo cerrado.
-═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
 import logging
@@ -41,58 +24,40 @@ class RiskManager:
         self._open_count       = 0
         self._daily_trades     = 0
         self._daily_pnl        = 0.0
+        self._unrealized_pnl   = 0.0
         self._last_reset       = date.today()
         # Anti-overtrading y anti-liquidación
         self._symbol_loss_ts:    dict[str, float] = {}  # symbol → ts última pérdida
         self._symbol_trade_cnt:  dict[str, int]   = {}  # symbol → trades hoy
         self._LOSS_COOLDOWN    = 7200.0   # 2h cooldown tras pérdida en mismo par
         self._MAX_PER_SYMBOL   = 2        # máx 2 trades por par al día
-        # FIX v7.1: último PnL no realizado conocido (para status/logging)
-        self._last_unrealized  = 0.0
 
     # ── Reset diario ──────────────────────────────────────────────────────────
 
     def _check_reset(self):
         today = date.today()
         if today != self._last_reset:
-            log.info("Reset diario: trades=%d pnl_cerrado=%.2f pnl_no_real=%.2f",
-                     self._daily_trades, self._daily_pnl, self._last_unrealized)
+            log.info("Reset diario: trades=%d pnl=%.2f", self._daily_trades, self._daily_pnl)
             self._daily_trades     = 0
             self._daily_pnl        = 0.0
+            self._unrealized_pnl   = 0.0
             self._last_reset       = today
             self._symbol_trade_cnt = {}
-            self._last_unrealized  = 0.0
 
     # ── Consultas de permisos ─────────────────────────────────────────────────
 
-    async def can_trade(self, unrealized_pnl: float = 0.0) -> tuple[bool, str]:
-        """
-        Verifica si el bot puede abrir un nuevo trade.
-
-        FIX v7.1: `unrealized_pnl` es la suma del PnL no realizado de TODAS
-        las posiciones abiertas trackeadas (calculado por PositionManager
-        con el mark price actual). El límite de pérdida diaria ahora se
-        evalúa sobre (daily_pnl_cerrado + unrealized_pnl), no solo el
-        cerrado. Si no se pasa, se asume 0.0 (comportamiento legacy).
-        """
+    async def can_trade(self) -> tuple[bool, str]:
         async with self._lock:
             self._check_reset()
-            self._last_unrealized = unrealized_pnl
-
             if self._open_count >= C.MAX_OPEN_TRADES:
                 return False, f"max_open_trades({self._open_count}/{C.MAX_OPEN_TRADES})"
             if self._daily_trades >= C.MAX_DAILY_TRADES:
                 return False, f"max_daily_trades({self._daily_trades}/{C.MAX_DAILY_TRADES})"
-
-            # ── Daily loss limit: ahora incluye PnL no realizado ──────────────
-            daily_limit  = C.CAPITAL * (C.DAILY_LOSS_PCT / 100.0)
-            total_pnl    = self._daily_pnl + unrealized_pnl
-            if total_pnl < -daily_limit:
-                return False, (
-                    f"daily_drawdown(cerrado={self._daily_pnl:.2f} "
-                    f"no_real={unrealized_pnl:.2f} total={total_pnl:.2f} "
-                    f"< -{daily_limit:.2f}, limit={C.DAILY_LOSS_PCT}%)"
-                )
+            # Daily loss limit usa el porcentaje configurable
+            daily_limit = C.CAPITAL * (C.DAILY_LOSS_PCT / 100.0)
+            # Solo bloquear por PnL REALIZADO (cerrado hoy) — no por unrealized
+            if self._daily_pnl < -daily_limit:
+                return False, f"daily_drawdown(cerrado={self._daily_pnl:.2f} no_real={self._unrealized_pnl:.2f} total={self._daily_pnl+self._unrealized_pnl:.2f} < -{daily_limit:.2f}, limit={C.DAILY_LOSS_PCT}%)"
             return True, ""
 
     def symbol_allowed(self, symbol: str) -> tuple[bool, str]:
@@ -129,15 +94,16 @@ class RiskManager:
             if symbol and pnl < 0:
                 self._symbol_loss_ts[symbol] = time.time()
                 log.info("Cooldown 2h activado para %s (pérdida %.4f)", symbol, pnl)
-            log.info("Trade cerrado — pnl=%.4f daily_pnl_cerrado=%.4f open=%d",
+            log.info("Trade cerrado — pnl=%.4f daily_pnl=%.4f open=%d",
                      pnl, self._daily_pnl, self._open_count)
 
-    async def update_open_count(self, real_count: int):
+    async def update_open_count(self, real_count: int, unrealized_pnl: float = 0.0):
         """Sincroniza con BingX real — fuente de verdad."""
         async with self._lock:
             if self._open_count != real_count:
                 log.debug("open_count %d → %d (BingX real)", self._open_count, real_count)
                 self._open_count = real_count
+            self._unrealized_pnl = unrealized_pnl
 
     # ── Kelly sizing con cap duro ─────────────────────────────────────────────
 
@@ -171,23 +137,17 @@ class RiskManager:
 
     # ── Status ────────────────────────────────────────────────────────────────
 
-    def status(self, unrealized_pnl: float = None) -> dict:
+    def status(self) -> dict:
         self._check_reset()
         daily_limit = C.CAPITAL * (C.DAILY_LOSS_PCT / 100.0)
-
-        # FIX v7.1: si no se pasa unrealized_pnl explícito, usar el último
-        # valor conocido (actualizado en cada can_trade()).
-        unreal = unrealized_pnl if unrealized_pnl is not None else self._last_unrealized
-        total_pnl = self._daily_pnl + unreal
-
         return {
-            "open_trades":       self._open_count,
-            "daily_trades":      self._daily_trades,
-            "daily_pnl":         round(self._daily_pnl, 4),       # solo cerrado (compat legacy)
-            "daily_pnl_no_real": round(unreal, 4),                # FIX v7.1
-            "daily_pnl_total":   round(total_pnl, 4),             # FIX v7.1: cerrado + no realizado
-            "daily_limit":       round(-daily_limit, 2),
-            "max_open":          C.MAX_OPEN_TRADES,
-            "max_daily":         C.MAX_DAILY_TRADES,
-            "mode":              C.MODE,
+            "open_trades":    self._open_count,
+            "daily_trades":   self._daily_trades,
+            "daily_pnl":      round(self._daily_pnl, 4),
+            "unrealized_pnl": round(self._unrealized_pnl, 4),
+            "total_pnl":      round(self._daily_pnl + self._unrealized_pnl, 4),
+            "daily_limit":    round(-daily_limit, 2),
+            "max_open":       C.MAX_OPEN_TRADES,
+            "max_daily":      C.MAX_DAILY_TRADES,
+            "mode":           C.MODE,
         }
