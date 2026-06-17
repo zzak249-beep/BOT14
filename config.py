@@ -1,17 +1,10 @@
 """
-QF×JP Bot v6.6 — Config ANTI-LIQUIDACIÓN + MEJORAS
-Fixes críticos v6.5 (anti-liquidación):
+QF×JP Bot v6.5 — Config ANTI-LIQUIDACIÓN
+Fixes críticos basados en análisis de pérdidas:
   - Notional cap 200 USDT (era ilimitado → liquidaciones de -85, -104, -278 USDT)
   - SL_ATR_MULT 2.0 (era 1.2 → stop hunts en VANA, ILV, BANANA)
   - Daily loss limit 2% (era 5% → hyper perdió 278 USDT en un día)
   - MAX_OPEN_TRADES 3 (era 5-6 → acumula posiciones perdedoras)
-
-Mejoras v6.6 (ver bloque "v6.6 — Mejoras post-consolidación" más abajo):
-  - MAX_HOLD_MINUTES: cierre forzado por tiempo (fix de mayor impacto
-    según análisis de 33 páginas de historial — liquidaciones por
-    exposición prolongada, no por tamaño de posición)
-  - FUNDING_RATE_MAX_ABS, MAX_SPREAD_PCT: filtros anti-trampa (item 4)
-  - OBI_DEPTH: profundidad de order book configurable (item 1)
 """
 import os
 from dotenv import load_dotenv
@@ -92,46 +85,17 @@ CB_BARS     = _int("CB_BARS",       10)
 
 # ── Gestión de posiciones ─────────────────────────────────────────────────────
 POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
-BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.5)  # mover BE antes
+BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.0)   # mover BE antes (bajado de 1.5)
+
+# ── Trailing Stop ─────────────────────────────────────────────────────────────
+TRAIL_DISTANCE_ATR = _float("TRAIL_DISTANCE_ATR", 1.5)  # distancia del trailing SL en ATRs
+# Activa tras TP1: el SL sigue el precio para proteger ganancias
 
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
-DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)  # era 5% → 2% del capital
+DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 4.0)  # subido de 2% — era demasiado restrictivo
 
 # ── Notional máximo por trade ─────────────────────────────────────────────────
 MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)  # NUNCA subir sin justificación
-
-# ── v6.6 — Mejoras post-consolidación ──────────────────────────────────────────
-# Análisis de 33 páginas de historial (balance 855 USDT): 3 liquidaciones
-# (PIUSDT -49.91 tras 29h abierto, HUSDT -12.51 tras 1h42m a 6x, BEATUSDT
-# -0.58 tras 1h17m) explican casi toda la pérdida neta — sin ellas, los
-# 20 trades restantes son ~breakeven (-1.70 USDT). El edge existe; el
-# riesgo de cola viene de trades que no se resuelven a tiempo y quedan
-# expuestos horas a leverage alto. Item de mayor impacto: cierre forzado
-# por tiempo.
-
-# Cierre forzado si un trade lleva abierto más de N minutos sin resolver
-# por SL/TP/BE. 0 = desactivado. Esta estrategia está diseñada para
-# cierres en 5-15 min; superar esto largamente indica que el mercado no
-# se mueve como se esperaba — mejor cortar que esperar una liquidación.
-MAX_HOLD_MINUTES = _int("MAX_HOLD_MINUTES", 180)   # 3h por defecto
-
-# Item 4 — filtros anti-trampa
-# Funding rate extremo: no abrir EN LA DIRECCIÓN que ya está abarrotada
-# (funding muy positivo = longs pagan mucho = lado long sobrepoblado →
-# bloquea abrir LONG; funding muy negativo bloquea SHORT). Distinto del
-# bonus de composite_score, que premia ir CONTRA el funding extremo —
-# este es un techo duro para no perseguir un movimiento ya exhausto.
-FUNDING_RATE_MAX_ABS = _float("FUNDING_RATE_MAX_ABS", 0.0005)  # 0.05%
-
-# Spread máximo (bid-ask) como % del mid price. Por encima de esto el
-# par se considera demasiado ilíquido para entrar con garantías de
-# ejecución cercana al precio esperado.
-MAX_SPREAD_PCT = _float("MAX_SPREAD_PCT", 0.15)   # 0.15%
-
-# Profundidad del order book para el cálculo de OBI (Order Book
-# Imbalance). Antes fijo a 5 niveles; ahora configurable, default 20
-# para una lectura más representativa de la presión real del libro.
-OBI_DEPTH = _int("OBI_DEPTH", 20)
 
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)
