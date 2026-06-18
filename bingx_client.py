@@ -596,23 +596,27 @@ class BingXClient:
         direction:  str,
         qty:        float,
         price:      float,
-        timeout_s:  int = 15,
+        timeout_s:  int = 25,
     ) -> dict:
         """
-        Intenta entrar con orden límite (taker fee 0.02% vs 0.05% market).
-        Si no se llena en timeout_s segundos, cancela y devuelve {} para que
-        el caller use market order como fallback.
+        Orden límite real MAKER (fee 0.02% vs 0.05% taker = ahorro 60%).
 
-        Precio límite:
-          LONG:  price * 1.0000 (exactamente mark price — post-only no cross)
-          SHORT: price * 1.0000
-        El mercado de futuros es muy líquido; una limit al mark price se
-        llena en segundos si la tendencia continúa. Si revierte, no entra.
+        Precio:
+          LONG:  price * 0.9995 (0.05% bajo el mark) → añade liquidez = MAKER
+          SHORT: price * 1.0005 (0.05% sobre el mark) → añade liquidez = MAKER
+
+        Si no se llena en timeout_s cancela y devuelve {} para fallback a market.
+        Con mercados en tendencia se llena en 2-5 segundos.
         """
         qty_r     = self._round_qty(symbol, qty)
         side_open = "BUY" if direction == "LONG" else "SELL"
-        prec      = self._precision_map.get(symbol, 4)
-        lmt_price = round(price, max(0, prec + 2))
+        prec      = max(self._precision_map.get(symbol, 4), 2)
+
+        # Precio ligeramente mejor que el mark → garantiza maker
+        if direction == "LONG":
+            lmt_price = round(price * 0.9995, prec + 2)
+        else:
+            lmt_price = round(price * 1.0005, prec + 2)
 
         params = {
             "symbol":       symbol,
@@ -625,7 +629,8 @@ class BingXClient:
         }
         resp = await self._post("/openApi/swap/v2/trade/order", params)
         if isinstance(resp, dict) and resp.get("code", -1) != 0:
-            log.debug("[%s] limit entry rechazado: %s", symbol, resp.get("msg", ""))
+            log.debug("[%s] limit entry rechazado (code=%s): %s",
+                      symbol, resp.get("code"), resp.get("msg", ""))
             return {}
 
         order_id = str(
@@ -635,25 +640,26 @@ class BingXClient:
         if not order_id:
             return {}
 
-        log.info("[%s] Limit entry @ %.6f — esperando fill (%ds)", symbol, lmt_price, timeout_s)
+        log.info("[%s] 📋 Limit entry @ %.6f (maker) — esperando fill (%ds)",
+                 symbol, lmt_price, timeout_s)
 
         # Polling hasta timeout
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             try:
                 orders = await self.get_open_orders(symbol)
                 still_open = any(str(o.get("orderId")) == order_id for o in orders)
                 if not still_open:
-                    log.info("[%s] Limit LLENA ✅", symbol)
-                    return resp   # llena — devolver respuesta de entrada
+                    log.info("[%s] ✅ Limit LLENA — fee maker 0.02%%", symbol)
+                    return resp
             except Exception:
                 pass
 
-        # Timeout — cancelar y señalizar fallback a market
+        # Timeout — cancelar y fallback a market
         try:
             await self.cancel_order(symbol, order_id)
-            log.info("[%s] Limit timeout — cancelada, usando market order", symbol)
+            log.info("[%s] Limit timeout (%ds) — cancelada → market order", symbol, timeout_s)
         except Exception as e:
-            log.debug("[%s] cancel limit error: %s", symbol, e)
-        return {}   # vacío = caller debe usar market
+            log.debug("[%s] cancel limit: %s", symbol, e)
+        return {}   # vacío = caller usa market

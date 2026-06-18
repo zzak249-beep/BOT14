@@ -196,3 +196,22 @@ async def notify_limit_filled(symbol: str, direction: str, price: float, qty: fl
         f"_Fee maker 0.02% en vez de 0.05% taker_"
     )
     await send(msg)
+
+
+async def notify_time_stop(
+    symbol: str, direction: str, entry: float, mark: float,
+    elapsed_min: int, progress: float
+) -> None:
+    """
+    Trade cerrado por time stop — sin progreso tras MAX_HOLD_MINUTES.
+    Previene el patrón FHEU/SXT/LDO: horas open con pérdida silenciosa.
+    """
+    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    pnl_pct  = (mark - entry) / entry * 100 if direction == "LONG" else (entry - mark) / entry * 100
+    msg = (
+        f"⏱ *TIME STOP* — {symbol} {dir_icon}\n"
+        f"Cerrado tras `{elapsed_min}min` sin progreso\n"
+        f"Entry: `{entry:.6f}` → Mark: `{mark:.6f}` (`{pnl_pct:+.2f}%`)\n"
+        f"_Previene el patrón FHEU/SXT/LDO_"
+    )
+    await send(msg)

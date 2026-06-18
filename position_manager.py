@@ -39,6 +39,7 @@ EJEMPLO con ATR=0.010, entry=1.000 USDT, LONG:
 """
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 import config as C
@@ -116,6 +117,9 @@ class OpenTrade:
 
     # ── FIX v7.1: anti-loop de retries idénticos ─────────────────────────────
     last_failed_sl:   float = 0.0    # último new_sl que fue inválido/rechazado
+
+    # ── Time Stop (previene FHEU/SXT/LDO: horas open sin progresar) ─────────
+    opened_at:        float = 0.0    # timestamp apertura (0 = usar tiempo actual)
 
 
 # ── Manager ───────────────────────────────────────────────────────────────────
@@ -215,6 +219,9 @@ class PositionManager:
     # ── Registro ──────────────────────────────────────────────────────────────
 
     async def register_trade(self, trade: OpenTrade):
+        # Marcar timestamp de apertura para el time-stop
+        if trade.opened_at == 0.0:
+            trade.opened_at = time.time()
         async with self._lock:
             self._trades[trade.symbol] = trade
         await self.risk.on_trade_opened(symbol=trade.symbol, direction=trade.direction)
@@ -324,6 +331,13 @@ class PositionManager:
                 if tp1_hit:
                     trade.tp1_hit = True
                     log.info("[%s] TP1 alcanzado @ %.6f", symbol, mark)
+
+            # ── TIME STOP ─────────────────────────────────────────────────────
+            # Previene el patrón FHEU/SXT/LDO: posiciones LONG abiertas 9-11h
+            # que bajaban lentamente sin llegar al SL (demasiado ancho a 2.0 ATR).
+            # Si MAX_HOLD_MINUTES sin progreso mínimo Y trailing no activo → cierre.
+            if await self._check_time_stop(trade, mark, symbol):
+                continue
 
             # ── Trailing Stop ─────────────────────────────────────────────────
             if not trade.trailing_active:
@@ -649,6 +663,53 @@ class PositionManager:
             trade.peak_price     = new_peak
             trade.last_failed_sl = new_sl
             log.error("[%s] _update_trail error: %s", symbol, e)
+
+    # ── Time Stop ─────────────────────────────────────────────────────────────
+
+    async def _check_time_stop(self, trade: OpenTrade, mark: float, symbol: str) -> bool:
+        """
+        TIME STOP — cierra trades sin progreso tras MAX_HOLD_MINUTES.
+
+        Caso real prevenido:
+          SXT-USDT  Long 10X: 09:29 → 20:45 (11h16m) → -8.87 USDT
+          LDO-USDT  Long 10X: 11:48 → 20:45 ( 8h57m) → -9.50 USDT
+          FHE-USDT  Long 10X: 11:34 → 20:45 ( 9h11m) → -5.10 USDT
+          XNY-USDT  Long 10X: 17:51 → 21:30 ( 3h39m) → -4.49 USDT
+
+        Regla:
+        - Si trailing_active=True (ya va ganando) → NUNCA cierra por tiempo
+        - Si no ha pasado MAX_HOLD_MINUTES → no evalúa aún
+        - Si ha pasado y el precio no avanzó TIME_STOP_MIN_PROGRESS_ATR*ATR → cierra
+
+        Retorna True si cerró (el caller debe hacer `continue`).
+        """
+        if trade.trailing_active:
+            return False  # el trailing se encarga
+
+        if trade.opened_at <= 0:
+            trade.opened_at = time.time()
+            return False
+
+        elapsed_min = (time.time() - trade.opened_at) / 60.0
+        max_hold    = getattr(C, 'MAX_HOLD_MINUTES', 60)
+        if elapsed_min < max_hold:
+            return False
+
+        atr      = trade.atr if trade.atr > 0 else mark * 0.005
+        progress = (mark - trade.entry) if trade.direction == "LONG" else (trade.entry - mark)
+        min_prog = atr * getattr(C, 'TIME_STOP_MIN_PROGRESS_ATR', 0.5)
+
+        if progress >= min_prog:
+            return False  # va avanzando, aunque lento
+
+        log.warning(
+            "[%s] ⏱ TIME STOP — %.0fmin sin progreso (prog=%.6f < min=%.6f). Cerrando.",
+            symbol, elapsed_min, progress, min_prog,
+        )
+        await tg.notify_time_stop(symbol, trade.direction, trade.entry, mark,
+                                   int(elapsed_min), progress)
+        await self.close_position_emergency(symbol, reason="time_stop")
+        return True
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
 
