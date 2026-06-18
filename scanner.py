@@ -1,15 +1,22 @@
 """
-QF×JP Bot v6.5 — Scanner CORREGIDO
-Fixes:
-  - symbol_allowed check (cooldown + límite/día)
-  - OBI boost desde order book
-  - Funding rate como filtro de sesgo
-  - Batch 20, pausa 0.2s
+QF×JP Bot v7.2 — Scanner
+Fixes vs v7.1:
+  - DIAGNÓSTICO DE RECHAZO: indicators.py ya calculaba sig.reason
+    (no_tl_break, htf_not_aligned(x/y), insufficient_data, invalid_atr...)
+    pero scanner.py lo descartaba siempre en el camino sig.direction=="NONE".
+    Resultado: "0 señales" en los logs sin ninguna pista de POR QUÉ.
+    Ahora se acumula un Counter por iteración completa y se loguea +
+    se manda a Telegram cada N iteraciones, para saber exactamente
+    qué puerta está bloqueando todo (TL break, HTF alignment, tier...).
+
+FIX v7.1 (sin cambios):
+  ✅ can_trade() recibe unrealized_pnl (PnL no realizado de PositionManager)
+     para que el límite de pérdida diaria no ignore drawdown abierto.
 """
 import asyncio
 import logging
 import time
-from collections import deque, defaultdict
+from collections import Counter
 from typing import Optional
 
 import config as C
@@ -52,21 +59,25 @@ def _obi(ob: dict) -> float:
         return 0.0
 
 
-async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
+async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional[Signal]:
     if pos_mgr.is_trading(symbol):
+        diag["counts"]["already_trading"] += 1
         return None
 
     now = time.time()
     if symbol in _cb_blacklist and now - _cb_blacklist[symbol] < CB_COOLDOWN:
+        diag["counts"]["cb_cooldown"] += 1
         return None
 
     try:
         k3m, k15m, k1h, k4h, ob, fr = await _fetch_all(client, symbol)
     except Exception as e:
         log.debug("[%s] fetch error: %s", symbol, e)
+        diag["counts"]["fetch_error"] += 1
         return None
 
     if len(k3m) < 60:
+        diag["counts"]["insufficient_data"] += 1
         return None
 
     obi = _obi(ob)
@@ -75,10 +86,21 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         sig = analyze(symbol, k3m, k15m, k1h, k4h, funding_rate=fr)
     except Exception as e:
         log.warning("[%s] analyze error: %s", symbol, e)
+        diag["counts"]["analyze_error"] += 1
         return None
 
     if sig.direction == "NONE":
+        # FIX v7.2: surface el motivo real (antes se perdía silenciosamente)
+        diag["counts"][sig.reason or "no_direction"] += 1
         return None
+
+    # Hubo dirección — registrar score para saber qué tan cerca estamos del umbral
+    diag["score_n"]   += 1
+    diag["score_sum"] += sig.score
+    if sig.score > diag["score_max"]:
+        diag["score_max"]        = sig.score
+        diag["score_max_symbol"] = symbol
+        diag["score_max_dir"]    = sig.direction
 
     # OBI boost
     if abs(obi) > 0.1:
@@ -94,11 +116,14 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     if sig.circuit_breaker:
         _cb_blacklist[symbol] = now
         await tg.notify_circuit_breaker(symbol)
+        diag["counts"]["circuit_breaker"] += 1
         return None
 
     if not risk.tier_ok(sig.tier):
+        diag["counts"][f"tier_bajo({sig.tier})"] += 1
         return None
 
+    diag["counts"]["signal_qualified"] += 1
     log.info("[%s] Señal %s tier=%s score=%.1f fr=%.4f",
              symbol, sig.direction, sig.tier, sig.score, fr)
 
@@ -107,15 +132,21 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         return sig
 
     # ── LIVE ──────────────────────────────────────────────────────────────────
-    can, reason = await risk.can_trade()
+    # FIX v7.1: incluir PnL no realizado en el chequeo de riesgo diario.
+    # Sin esto, can_trade() solo veía PnL cerrado y seguía aprobando trades
+    # nuevos mientras el drawdown no realizado ya superaba DAILY_LOSS_PCT.
+    unrealized = await pos_mgr.get_unrealized_pnl()
+    can, reason = await risk.can_trade(unrealized_pnl=unrealized)
     if not can:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
+        diag["counts"]["risk_blocked"] += 1
         return None
 
     # Cooldown por símbolo
     sym_ok, sym_reason = risk.symbol_allowed(symbol)
     if not sym_ok:
         log.debug("[%s] Bloqueado por símbolo: %s", symbol, sym_reason)
+        diag["counts"]["symbol_blocked"] += 1
         return None
 
     try:
@@ -150,6 +181,15 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     if entry_resp.get("code", -1) != 0:
         log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
         await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
+        # FIX: si BingX rechaza por error de firma (100001) para ESTE símbolo,
+        # no sabemos aún la causa raíz exacta — pero insistir cada iteración
+        # con el mismo resultado es ruido inútil. Blacklist temporal (10 min,
+        # mismo cooldown que el circuit breaker) para dar margen a investigar
+        # sin que el bot siga golpeando el mismo error en bucle.
+        if entry_resp.get("code") == 100001:
+            _cb_blacklist[symbol] = time.time()
+            log.warning("[%s] code=100001 (firma) — blacklist %ds para evitar reintentos ciegos",
+                        symbol, CB_COOLDOWN)
         return None
 
     order_id = str(
@@ -161,15 +201,25 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         symbol=symbol, direction=sig.direction,
         entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
         qty=qty, atr=sig.atr, order_id=order_id,
-        tier=sig.tier, score=sig.score,
     )
     await pos_mgr.register_trade(trade)
     await tg.notify_trade_opened(sig, qty, order_id)
     return sig
 
 
-async def scan_loop(client, risk, pos_mgr):
-    log.info("Scanner v6.5 | Modo=%s | Interval=%ds | Batch=20",
+def _new_diag() -> dict:
+    return {
+        "counts":          Counter(),
+        "score_n":         0,
+        "score_sum":       0.0,
+        "score_max":       0.0,
+        "score_max_symbol": "",
+        "score_max_dir":   "",
+    }
+
+
+async def scan_loop(client, risk, pos_mgr, complement=None):
+    log.info("Scanner v7.2 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
@@ -177,13 +227,19 @@ async def scan_loop(client, risk, pos_mgr):
     while True:
         start = time.time()
         iteration += 1
+        diag = _new_diag()
 
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
-                new = await client.get_all_symbols()
-                if new:
-                    symbols = new
-                    log.info("Símbolos activos: %d", len(symbols))
+                all_syms = await client.get_all_symbols()
+                if all_syms:
+                    # Si complement activo: usar solo símbolos exclusivos de joyful-art
+                    if complement and complement.get_exclusive_symbols():
+                        symbols = complement.get_exclusive_symbols()
+                        log.info("Modo EXCLUSIVO: %d símbolos (top por volumen)", len(symbols))
+                    else:
+                        symbols = all_syms
+                        log.info("Símbolos activos: %d", len(symbols))
                 else:
                     log.warning("get_all_symbols vacío (iter=%d)", iteration)
             except Exception as e:
@@ -199,7 +255,8 @@ async def scan_loop(client, risk, pos_mgr):
         if iteration % 20 == 0:
             try:
                 balance = await client.get_balance()
-                await tg.notify_status(risk.status(), balance, len(symbols))
+                unrealized = await pos_mgr.get_unrealized_pnl()
+                await tg.notify_status(risk.status(unrealized_pnl=unrealized), balance, len(symbols))
             except Exception:
                 pass
 
@@ -208,7 +265,7 @@ async def scan_loop(client, risk, pos_mgr):
         for i in range(0, len(symbols), BATCH):
             batch   = symbols[i:i+BATCH]
             results = await asyncio.gather(
-                *[_process_symbol(s, client, risk, pos_mgr) for s in batch],
+                *[_process_symbol(s, client, risk, pos_mgr, diag) for s in batch],
                 return_exceptions=True,
             )
             for r in results:
@@ -217,71 +274,30 @@ async def scan_loop(client, risk, pos_mgr):
             await asyncio.sleep(0.2)
 
         elapsed = time.time() - start
-        log.info("Iter %d | %d símbolos | %d señales | %.1fs",
-                 iteration, len(symbols), signals_found, elapsed)
+
+        # ── FIX v7.2: diagnóstico de rechazo ───────────────────────────────────
+        top5     = diag["counts"].most_common(5)
+        avg_sc   = diag["score_sum"] / diag["score_n"] if diag["score_n"] else 0.0
+        top_str  = " | ".join(f"{k}={v}" for k, v in top5) if top5 else "—"
+
+        log.info(
+            "Iter %d | %d símbolos | %d señales | %.1fs | "
+            "direccionales=%d avg_score=%.1f max_score=%.1f(%s %s) | %s",
+            iteration, len(symbols), signals_found, elapsed,
+            diag["score_n"], avg_sc, diag["score_max"],
+            diag["score_max_symbol"], diag["score_max_dir"], top_str,
+        )
+
+        # Cada 5 iteraciones, mandar el diagnóstico también a Telegram
+        # (más fácil de revisar desde el móvil que entrar a Railway)
+        if iteration % 5 == 0 and signals_found == 0:
+            try:
+                await tg.notify_diagnostics(
+                    iteration, len(symbols), diag["score_n"], avg_sc,
+                    diag["score_max"], diag["score_max_symbol"], diag["score_max_dir"],
+                    top5,
+                )
+            except Exception:
+                pass
 
         await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# v6.6 — Trade log en memoria para /stats (win-rate por símbolo/tier/hora)
-# ══════════════════════════════════════════════════════════════════════════
-_trade_log: deque = deque(maxlen=200)
-
-
-def log_closed_trade(symbol: str, tier: str, score: float, direction: str,
-                      pnl: float, reason: str, hold_minutes: float) -> None:
-    """
-    Callback invocado por PositionManager.remove_trade en cada cierre real.
-    No persiste entre redeploys — es estadística de sesión.
-    """
-    _trade_log.append({
-        "symbol":       symbol,
-        "tier":         tier or "?",
-        "score":        score,
-        "direction":    direction,
-        "pnl":          pnl,
-        "won":          pnl > 0,
-        "reason":       reason,
-        "hold_minutes": round(hold_minutes, 1),
-        "closed_at":    time.time(),
-        "hour_utc":     time.gmtime().tm_hour,
-    })
-
-
-def get_stats() -> dict:
-    """Win-rate agregado por símbolo, tier y hora UTC de los últimos 200 trades."""
-    trades = list(_trade_log)
-    if not trades:
-        return {"trades": 0}
-
-    def _agg(key_fn):
-        groups: dict = defaultdict(list)
-        for t in trades:
-            groups[key_fn(t)].append(t)
-        out = {}
-        for k, ts in groups.items():
-            wins = sum(1 for t in ts if t["won"])
-            out[k] = {
-                "trades":  len(ts),
-                "wins":    wins,
-                "winrate": round(wins / len(ts), 3),
-                "pnl":     round(sum(t["pnl"] for t in ts), 4),
-            }
-        return out
-
-    wins      = sum(1 for t in trades if t["won"])
-    total_pnl = sum(t["pnl"] for t in trades)
-
-    return {
-        "trades":     len(trades),
-        "wins":       wins,
-        "losses":     len(trades) - wins,
-        "winrate":    round(wins / len(trades), 3),
-        "total_pnl":  round(total_pnl, 4),
-        "avg_pnl":    round(total_pnl / len(trades), 4),
-        "by_symbol":  _agg(lambda t: t["symbol"]),
-        "by_tier":    _agg(lambda t: t["tier"]),
-        "by_hour":    _agg(lambda t: t["hour_utc"]),
-        "by_reason":  _agg(lambda t: t["reason"]),
-    }
