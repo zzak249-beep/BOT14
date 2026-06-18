@@ -20,6 +20,7 @@ from scanner import scan_loop
 import telegram_client as tg
 from copier_client import MasterClient
 from complement_engine import ComplementEngine
+from trade_journal import TradeJournal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,11 +35,12 @@ risk:       RiskManager       = None
 pos_mgr:    PositionManager   = None
 master:     MasterClient      = None
 complement: ComplementEngine   = None
+journal:    TradeJournal       = None
 
 
 async def _run_scanner():
     try:
-        await scan_loop(client, risk, pos_mgr, complement)
+        await scan_loop(client, risk, pos_mgr, complement, journal)
     except Exception as e:
         log.critical("Scanner crash: %s", e, exc_info=True)
         await tg.notify_error("scanner_crash", str(e))
@@ -70,10 +72,10 @@ async def _run_complement():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, risk, pos_mgr, master, complement
+    global client, risk, pos_mgr, master, complement, journal
 
     log.info("═" * 54)
-    log.info("  QF×JP Bot v7.1 — TRAILING STOP + DAILY LOSS REAL")
+    log.info("  QF×JP Bot v7.7 — ROADMAP COMPLETO")
     log.info("  Modo: %s | Capital: %.2f USDT", C.MODE, C.CAPITAL)
     log.info("  Leverage: %dx | Min tier: %s", C.LEVERAGE, C.MIN_TIER)
     log.info("  Max notional: %.0f USDT | Daily loss: %.1f%%",
@@ -81,11 +83,15 @@ async def lifespan(app: FastAPI):
     log.info("  SL mult: %.1f | Trail activation: %.1f ATR | Trail dist: %.1f ATR",
              C.SL_ATR_MULT, C.BREAKEVEN_ATR_MULT, C.TRAIL_DISTANCE_ATR)
     log.info("  Max open: %d | Max daily: %d", C.MAX_OPEN_TRADES, C.MAX_DAILY_TRADES)
+    log.info("  Session: %02d:00-%02d:00 UTC | Limit orders: %s",
+             getattr(C, 'TRADE_START_UTC', 0), getattr(C, 'TRADE_END_UTC', 24),
+             getattr(C, 'LIMIT_ORDERS_ENABLED', False))
     log.info("═" * 54)
 
+    journal    = TradeJournal()
     client     = BingXClient()
     risk       = RiskManager()
-    pos_mgr    = PositionManager(client, risk)
+    pos_mgr    = PositionManager(client, risk, journal=journal)
     master     = MasterClient()
     complement = ComplementEngine(client, risk, pos_mgr, master)
 

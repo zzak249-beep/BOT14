@@ -1,19 +1,17 @@
 """
-QF×JP Bot v7.6 — Risk Manager ANTI-LIQUIDACIÓN + DAILY LOSS REAL + CORRELATION GUARD
+QF×JP Bot v7.7 — Risk Manager COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
-FIXES vs v7.1:
-  ✅ Correlation Guard: direction_allowed() limita trades en la misma
-     dirección (LONG o SHORT) dentro de CORRELATION_WINDOW_SEC.
-     Evita apilar el mismo riesgo de mercado (caso FHEU+XNY: dos LONG
-     abiertos casi a la vez, cerrados juntos por el mismo movimiento bajista).
-  ✅ on_trade_opened() acepta direction= para registrar la dirección en
-     _direction_ts (necesario para que el guard funcione)
+NUEVO en v7.7:
+  ✅ direction_allowed() — Correlation Guard (evita FHEU+XNY: 2 LONG correlados)
+  ✅ on_trade_opened() acepta direction= para registrar en correlation guard
+  ✅ record_result() — TradeJournal llama esto para alimentar umbral adaptativo
+  ✅ min_score_effective() — MIN_SCORE + offset adaptativo del journal
 
 SIN CAMBIOS vs v7.1:
   ✅ daily_loss_limit incluye PnL no realizado (unrealized_pnl)
   ✅ Notional cap duro MAX_NOTIONAL_USDT
   ✅ Cooldown 2h por símbolo tras pérdida
-  ✅ open_count sincronizado solo desde BingX real
+  ✅ open_count sincronizado solo desde BingX real (solo posiciones propias)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio

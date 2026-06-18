@@ -564,3 +564,96 @@ class BingXClient:
                             log.info("[%s] SL OK (retry) @ %.6f", symbol, sl_price)
 
         return results
+
+    # ── Open Interest ─────────────────────────────────────────────────────────
+
+    async def get_open_interest(self, symbol: str) -> float:
+        """
+        Retorna el Open Interest actual en USD del símbolo.
+        Endpoint: /openApi/swap/v2/quote/openInterest
+        El OI creciente en dirección de la señal confirma la tendencia;
+        OI decreciente sugiere que las posiciones se están cerrando (trampa).
+        """
+        try:
+            data = await self._get(
+                "/openApi/swap/v2/quote/openInterest",
+                {"symbol": symbol},
+                signed=False,
+            )
+            raw = data.get("data", {})
+            if isinstance(raw, dict):
+                oi = float(raw.get("openInterest", raw.get("openInterestValue", 0)) or 0)
+                return oi
+        except Exception as e:
+            log.debug("[%s] get_open_interest error: %s", symbol, e)
+        return 0.0
+
+    # ── Limit order con timeout → fallback market ─────────────────────────────
+
+    async def place_limit_entry(
+        self,
+        symbol:     str,
+        direction:  str,
+        qty:        float,
+        price:      float,
+        timeout_s:  int = 15,
+    ) -> dict:
+        """
+        Intenta entrar con orden límite (taker fee 0.02% vs 0.05% market).
+        Si no se llena en timeout_s segundos, cancela y devuelve {} para que
+        el caller use market order como fallback.
+
+        Precio límite:
+          LONG:  price * 1.0000 (exactamente mark price — post-only no cross)
+          SHORT: price * 1.0000
+        El mercado de futuros es muy líquido; una limit al mark price se
+        llena en segundos si la tendencia continúa. Si revierte, no entra.
+        """
+        qty_r     = self._round_qty(symbol, qty)
+        side_open = "BUY" if direction == "LONG" else "SELL"
+        prec      = self._precision_map.get(symbol, 4)
+        lmt_price = round(price, max(0, prec + 2))
+
+        params = {
+            "symbol":       symbol,
+            "side":         side_open,
+            "positionSide": direction,
+            "type":         "LIMIT",
+            "price":        str(lmt_price),
+            "quantity":     str(qty_r),
+            "timeInForce":  "GTC",
+        }
+        resp = await self._post("/openApi/swap/v2/trade/order", params)
+        if isinstance(resp, dict) and resp.get("code", -1) != 0:
+            log.debug("[%s] limit entry rechazado: %s", symbol, resp.get("msg", ""))
+            return {}
+
+        order_id = str(
+            resp.get("data", {}).get("order", {}).get("orderId", "")
+            or resp.get("data", {}).get("orderId", "")
+        )
+        if not order_id:
+            return {}
+
+        log.info("[%s] Limit entry @ %.6f — esperando fill (%ds)", symbol, lmt_price, timeout_s)
+
+        # Polling hasta timeout
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                orders = await self.get_open_orders(symbol)
+                still_open = any(str(o.get("orderId")) == order_id for o in orders)
+                if not still_open:
+                    log.info("[%s] Limit LLENA ✅", symbol)
+                    return resp   # llena — devolver respuesta de entrada
+            except Exception:
+                pass
+
+        # Timeout — cancelar y señalizar fallback a market
+        try:
+            await self.cancel_order(symbol, order_id)
+            log.info("[%s] Limit timeout — cancelada, usando market order", symbol)
+        except Exception as e:
+            log.debug("[%s] cancel limit error: %s", symbol, e)
+        return {}   # vacío = caller debe usar market

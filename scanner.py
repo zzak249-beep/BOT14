@@ -1,21 +1,39 @@
 """
-QF×JP Bot v7.2 — Scanner
-Fixes vs v7.1:
-  - DIAGNÓSTICO DE RECHAZO: indicators.py ya calculaba sig.reason
-    (no_tl_break, htf_not_aligned(x/y), insufficient_data, invalid_atr...)
-    pero scanner.py lo descartaba siempre en el camino sig.direction=="NONE".
-    Resultado: "0 señales" en los logs sin ninguna pista de POR QUÉ.
-    Ahora se acumula un Counter por iteración completa y se loguea +
-    se manda a Telegram cada N iteraciones, para saber exactamente
-    qué puerta está bloqueando todo (TL break, HTF alignment, tier...).
+QF×JP Bot v7.3 — Scanner COMPLETO
+═══════════════════════════════════════════════════════════════════════════════
+NUEVO en v7.3 (todas las mejoras del roadmap de anticipación):
 
-FIX v7.1 (sin cambios):
-  ✅ can_trade() recibe unrealized_pnl (PnL no realizado de PositionManager)
-     para que el límite de pérdida diaria no ignore drawdown abierto.
+  1. SESSION FILTER — evita operar en horas de bajo volumen (00:00-08:00 UTC)
+     donde las pérdidas se concentran. Variables: TRADE_START_UTC / TRADE_END_UTC
+
+  2. FUNDING RATE EXTREMO como señal:
+     - FR > FR_EXTREME_THR: longs sobrecomprados → bloquea LONG, boosta SHORT +8
+     - FR < -FR_EXTREME_THR: shorts sobrecomprados → bloquea SHORT, boosta LONG +8
+     Anticipa la reversión ANTES de que el precio lo muestre.
+
+  3. OPEN INTEREST DELTA como filtro de confirmación:
+     - OI subiendo en dirección de señal = tendencia respaldada por posiciones reales
+     - OI bajando = cierre de posiciones, trampa probable → bloquea la señal
+     Cache de OI por símbolo con decay de 2 minutos.
+
+  4. TRADE JOURNAL integrado:
+     - on_open() al registrar cada trade
+     - Aplica adaptive offset sobre MIN_SCORE según win rate reciente
+
+  5. LIMIT ORDERS con fallback a market:
+     - Si LIMIT_ORDERS_ENABLED=true: intenta entrada límite al mark price
+     - Si no se llena en LIMIT_TIMEOUT_SECS: usa market (sin dejar posición
+       sin protección)
+     Ahorra ~60% en comisiones cuando el mercado coopera.
+
+  6. CORRELATION GUARD (ya existente, sin cambios)
+  7. DIAGNÓSTICO Telegram cada 5 iter sin señales (ya existente, sin cambios)
+═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
 import logging
 import time
+import datetime
 from collections import Counter
 from typing import Optional
 
@@ -31,6 +49,10 @@ log = logging.getLogger("scanner")
 _cb_blacklist: dict[str, float] = {}
 CB_COOLDOWN = 600
 
+# Cache de Open Interest: symbol → (oi_value, timestamp)
+_oi_cache: dict[str, tuple[float, float]] = {}
+OI_CACHE_TTL = 120  # segundos
+
 
 async def _fetch_all(client: BingXClient, symbol: str):
     results = await asyncio.gather(
@@ -45,8 +67,8 @@ async def _fetch_all(client: BingXClient, symbol: str):
     def _l(r): return r if isinstance(r, list) else []
     def _d(r): return r if isinstance(r, dict) else {}
     def _f(r): return r if isinstance(r, float) else 0.0
-    return _l(results[0]), _l(results[1]), _l(results[2]), _l(results[3]), \
-           _d(results[4]), _f(results[5])
+    return (_l(results[0]), _l(results[1]), _l(results[2]), _l(results[3]),
+            _d(results[4]), _f(results[5]))
 
 
 def _obi(ob: dict) -> float:
@@ -59,9 +81,77 @@ def _obi(ob: dict) -> float:
         return 0.0
 
 
-async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional[Signal]:
+async def _get_oi_delta(client: BingXClient, symbol: str) -> float:
+    """
+    Retorna el delta normalizado del OI:
+      >0: OI creciendo (posiciones abriéndose) — tendencia confirmada
+      <0: OI bajando  (posiciones cerrándose) — trampa posible
+      0:  sin datos o sin cambio
+
+    Usa cache de 120s para no spammear la API con 683 símbolos.
+    """
+    if not getattr(C, 'OI_FILTER_ENABLED', False):
+        return 0.0
+    now = time.time()
+    prev_oi, prev_ts = _oi_cache.get(symbol, (0.0, 0.0))
+    try:
+        oi = await client.get_open_interest(symbol)
+        _oi_cache[symbol] = (oi, now)
+        if prev_oi > 0 and (now - prev_ts) < OI_CACHE_TTL * 3:
+            return (oi - prev_oi) / prev_oi  # delta relativo
+    except Exception:
+        pass
+    return 0.0
+
+
+def _session_allowed() -> bool:
+    """Retorna True si la hora UTC actual está dentro de la ventana de trading."""
+    start = getattr(C, 'TRADE_START_UTC', 0)
+    end   = getattr(C, 'TRADE_END_UTC',   24)
+    if start == 0 and end == 24:
+        return True  # desactivado = operar 24h
+    h = datetime.datetime.utcnow().hour
+    if start < end:
+        return start <= h < end
+    else:  # wrap sobre medianoche, ej: 20:00-08:00
+        return h >= start or h < end
+
+
+def _fr_boost_block(fr: float, direction: str) -> tuple[float, bool]:
+    """
+    Funding rate extremo como señal de reversión anticipada.
+    Retorna (boost_pts, blocked).
+    """
+    thr = getattr(C, 'FR_EXTREME_THR', 0.0005)  # 0.05% por defecto
+    if thr <= 0:
+        return 0.0, False
+    if fr > thr:
+        # Longs sobrecomprados: bloquear LONG, boostear SHORT
+        if direction == "LONG":
+            return 0.0, True
+        if direction == "SHORT":
+            return 8.0, False  # confirmación adicional del SHORT
+    if fr < -thr:
+        # Shorts sobrecomprados: bloquear SHORT, boostear LONG
+        if direction == "SHORT":
+            return 0.0, True
+        if direction == "LONG":
+            return 8.0, False
+    return 0.0, False
+
+
+async def _process_symbol(
+    symbol, client, risk, pos_mgr, diag: dict,
+    journal=None,
+) -> Optional[Signal]:
+
     if pos_mgr.is_trading(symbol):
         diag["counts"]["already_trading"] += 1
+        return None
+
+    # ── 1. Session filter ───────────────────────────────────────────────────
+    if not _session_allowed():
+        diag["counts"]["session_filter"] += 1
         return None
 
     now = time.time()
@@ -90,17 +180,16 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
         return None
 
     if sig.direction == "NONE":
-        # FIX v7.2: surface el motivo real (antes se perdía silenciosamente)
         diag["counts"][sig.reason or "no_direction"] += 1
         return None
 
-    # Hubo dirección — registrar score para saber qué tan cerca estamos del umbral
+    # Registrar score para diagnóstico
     diag["score_n"]   += 1
     diag["score_sum"] += sig.score
     if sig.score > diag["score_max"]:
-        diag["score_max"]        = sig.score
-        diag["score_max_symbol"] = symbol
-        diag["score_max_dir"]    = sig.direction
+        diag["score_max"]         = sig.score
+        diag["score_max_symbol"]  = symbol
+        diag["score_max_dir"]     = sig.direction
 
     # OBI boost
     if abs(obi) > 0.1:
@@ -113,10 +202,27 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
             sig.score = min(sig.score + boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
 
+    # ── 2. Funding Rate extremo ─────────────────────────────────────────────
+    fr_boost, fr_blocked = _fr_boost_block(fr, sig.direction)
+    if fr_blocked:
+        diag["counts"]["fr_extreme_block"] += 1
+        return None
+    if fr_boost > 0:
+        sig.score = min(sig.score + fr_boost, 100.0)
+        sig.tier  = score_to_tier(sig.score)
+        diag["counts"]["fr_extreme_boost"] += 1
+
     if sig.circuit_breaker:
         _cb_blacklist[symbol] = now
         await tg.notify_circuit_breaker(symbol)
         diag["counts"]["circuit_breaker"] += 1
+        return None
+
+    # ── 3. Adaptive threshold (feed del TradeJournal) ──────────────────────
+    adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
+    effective_min   = C.MIN_SCORE + adaptive_offset
+    if sig.score < effective_min:
+        diag["counts"]["score_bajo"] += 1
         return None
 
     if not risk.tier_ok(sig.tier):
@@ -124,17 +230,14 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
         return None
 
     diag["counts"]["signal_qualified"] += 1
-    log.info("[%s] Señal %s tier=%s score=%.1f fr=%.4f",
-             symbol, sig.direction, sig.tier, sig.score, fr)
+    log.info("[%s] Señal %s tier=%s score=%.1f fr=%.4f obi=%.2f",
+             symbol, sig.direction, sig.tier, sig.score, fr, obi)
 
     if C.MODE == "SIGNAL":
         await tg.notify_signal(sig)
         return sig
 
-    # ── LIVE ──────────────────────────────────────────────────────────────────
-    # FIX v7.1: incluir PnL no realizado en el chequeo de riesgo diario.
-    # Sin esto, can_trade() solo veía PnL cerrado y seguía aprobando trades
-    # nuevos mientras el drawdown no realizado ya superaba DAILY_LOSS_PCT.
+    # ── LIVE ─────────────────────────────────────────────────────────────────
     unrealized = await pos_mgr.get_unrealized_pnl()
     can, reason = await risk.can_trade(unrealized_pnl=unrealized)
     if not can:
@@ -142,20 +245,30 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
         diag["counts"]["risk_blocked"] += 1
         return None
 
-    # Cooldown por símbolo
     sym_ok, sym_reason = risk.symbol_allowed(symbol)
     if not sym_ok:
         log.debug("[%s] Bloqueado por símbolo: %s", symbol, sym_reason)
         diag["counts"]["symbol_blocked"] += 1
         return None
 
-    # Correlation Guard — evita apilar varios LONG o SHORT simultáneos
-    # que se mueven juntos (caso FHEU+XNY)
+    # Correlation guard
     dir_ok, dir_reason = risk.direction_allowed(sig.direction)
     if not dir_ok:
         log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
         diag["counts"]["correlation_blocked"] += 1
         return None
+
+    # ── 4. Open Interest delta ───────────────────────────────────────────────
+    oi_delta = await _get_oi_delta(client, symbol)
+    if getattr(C, 'OI_FILTER_ENABLED', False) and oi_delta < -0.05:
+        # OI bajando >5%: posiciones cerrándose — señal de trampa
+        log.info("[%s] OI delta negativo (%.2f) — señal descartada", symbol, oi_delta)
+        diag["counts"]["oi_declining"] += 1
+        return None
+    if oi_delta > 0.02:
+        # OI creciendo: boost leve de confirmación
+        sig.score = min(sig.score + 3, 100.0)
+        sig.tier  = score_to_tier(sig.score)
 
     try:
         balance = await client.get_balance()
@@ -175,17 +288,32 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
     log.info("[%s] qty=%.6f notional=%.2f USDT", symbol, qty, qty * sig.entry)
     await tg.notify_signal(sig)
 
-    try:
-        results = await client.open_trade(
-            symbol=symbol, direction=sig.direction, quantity=qty,
-            sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
+    # ── 5. Limit order con fallback a market ─────────────────────────────────
+    entry_resp = {}
+    used_limit = False
+    if getattr(C, 'LIMIT_ORDERS_ENABLED', False):
+        lmt_resp = await client.place_limit_entry(
+            symbol, sig.direction, qty, sig.entry,
+            timeout_s=getattr(C, 'LIMIT_TIMEOUT_SECS', 15),
         )
-    except Exception as e:
-        log.error("[%s] open_trade error: %s", symbol, e)
-        await tg.notify_error(f"open_trade({symbol})", str(e))
-        return None
+        if lmt_resp.get("code", -1) == 0:
+            entry_resp = lmt_resp
+            used_limit = True
+            log.info("[%s] Entrada LÍMITE OK ✅ (fee ahorro 60%%)", symbol)
+            await tg.notify_limit_filled(symbol, sig.direction, sig.entry, qty)
 
-    entry_resp = results.get("entry", {})
+    if not used_limit:
+        try:
+            results = await client.open_trade(
+                symbol=symbol, direction=sig.direction, quantity=qty,
+                sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
+            )
+        except Exception as e:
+            log.error("[%s] open_trade error: %s", symbol, e)
+            await tg.notify_error(f"open_trade({symbol})", str(e))
+            return None
+        entry_resp = results.get("entry", {})
+
     if entry_resp.get("code", -1) != 0:
         log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
         await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
@@ -203,22 +331,27 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
     )
     await pos_mgr.register_trade(trade)
     await tg.notify_trade_opened(sig, qty, order_id)
+
+    # Registrar en journal
+    if journal:
+        journal.on_open(
+            symbol=symbol, direction=sig.direction, tier=sig.tier,
+            score=sig.score, fr=fr, obi=obi, oi_delta=oi_delta,
+            htf_score=sig.htf_score, adx=sig.adx,
+        )
+
     return sig
 
 
 def _new_diag() -> dict:
     return {
-        "counts":          Counter(),
-        "score_n":         0,
-        "score_sum":       0.0,
-        "score_max":       0.0,
-        "score_max_symbol": "",
-        "score_max_dir":   "",
+        "counts": Counter(), "score_n": 0, "score_sum": 0.0,
+        "score_max": 0.0, "score_max_symbol": "", "score_max_dir": "",
     }
 
 
-async def scan_loop(client, risk, pos_mgr, complement=None):
-    log.info("Scanner v7.2 | Modo=%s | Interval=%ds | Batch=20",
+async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
+    log.info("Scanner v7.3 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
@@ -232,7 +365,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
             try:
                 all_syms = await client.get_all_symbols()
                 if all_syms:
-                    # Si complement activo: usar solo símbolos exclusivos de joyful-art
                     if complement and complement.get_exclusive_symbols():
                         symbols = complement.get_exclusive_symbols()
                         log.info("Modo EXCLUSIVO: %d símbolos (top por volumen)", len(symbols))
@@ -253,7 +385,7 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
 
         if iteration % 20 == 0:
             try:
-                balance = await client.get_balance()
+                balance    = await client.get_balance()
                 unrealized = await pos_mgr.get_unrealized_pnl()
                 await tg.notify_status(risk.status(unrealized_pnl=unrealized), balance, len(symbols))
             except Exception:
@@ -264,7 +396,8 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
         for i in range(0, len(symbols), BATCH):
             batch   = symbols[i:i+BATCH]
             results = await asyncio.gather(
-                *[_process_symbol(s, client, risk, pos_mgr, diag) for s in batch],
+                *[_process_symbol(s, client, risk, pos_mgr, diag, journal)
+                  for s in batch],
                 return_exceptions=True,
             )
             for r in results:
@@ -274,21 +407,26 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
 
         elapsed = time.time() - start
 
-        # ── FIX v7.2: diagnóstico de rechazo ───────────────────────────────────
-        top5     = diag["counts"].most_common(5)
-        avg_sc   = diag["score_sum"] / diag["score_n"] if diag["score_n"] else 0.0
-        top_str  = " | ".join(f"{k}={v}" for k, v in top5) if top5 else "—"
+        # Diagnóstico de rechazo
+        top5    = diag["counts"].most_common(5)
+        avg_sc  = diag["score_sum"] / diag["score_n"] if diag["score_n"] else 0.0
+        top_str = " | ".join(f"{k}={v}" for k, v in top5) if top5 else "—"
+
+        # Adaptive offset del journal
+        adaptive_str = ""
+        if journal and journal.get_adaptive_offset() != 0.0:
+            adaptive_str = f" | adaptive_offset={journal.get_adaptive_offset():+.0f}"
 
         log.info(
             "Iter %d | %d símbolos | %d señales | %.1fs | "
-            "direccionales=%d avg_score=%.1f max_score=%.1f(%s %s) | %s",
+            "direccionales=%d avg_score=%.1f max_score=%.1f(%s %s)%s | %s",
             iteration, len(symbols), signals_found, elapsed,
             diag["score_n"], avg_sc, diag["score_max"],
-            diag["score_max_symbol"], diag["score_max_dir"], top_str,
+            diag["score_max_symbol"], diag["score_max_dir"],
+            adaptive_str, top_str,
         )
 
-        # Cada 5 iteraciones, mandar el diagnóstico también a Telegram
-        # (más fácil de revisar desde el móvil que entrar a Railway)
+        # Telegram: diagnóstico cada 5 iter sin señales
         if iteration % 5 == 0 and signals_found == 0:
             try:
                 await tg.notify_diagnostics(
@@ -296,6 +434,13 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
                     diag["score_max"], diag["score_max_symbol"], diag["score_max_dir"],
                     top5,
                 )
+            except Exception:
+                pass
+
+        # Telegram: journal report cada 50 iter (si hay datos)
+        if journal and iteration % 50 == 0 and journal.total_closed() > 0:
+            try:
+                await tg.notify_journal_report(journal.stats())
             except Exception:
                 pass
 

@@ -151,3 +151,48 @@ async def notify_diagnostics(
         f"Top razones de rechazo:\n{reasons_str}"
     )
     await send(msg)
+
+
+# ── Trade Journal ─────────────────────────────────────────────────────────────
+
+async def notify_journal_report(stats: dict) -> None:
+    """Reporte periódico del Trade Journal — win rate, tier, mejores horas."""
+    if not stats or stats.get("total", 0) == 0:
+        return
+    n          = stats["total"]
+    wr         = stats.get("win_rate", 0)
+    recent_wr  = stats.get("recent_wr", 0)
+    pnl        = stats.get("total_pnl", 0)
+    opt_score  = stats.get("opt_score", 0)
+    offset     = stats.get("adaptive_offset", 0)
+    best_hours = stats.get("best_hours_utc", [])
+
+    # Tier breakdown
+    tier_lines = []
+    for tier, d in stats.get("by_tier", {}).items():
+        tier_lines.append(f"  `{tier}`: wr={d['wr']}% | pnl={d['pnl']:+.4f} | n={d['n']}")
+    tier_str = "\n".join(tier_lines) if tier_lines else "  —"
+
+    hours_str = ", ".join(f"{h}:00" for h in best_hours) or "—"
+    offset_str = f"\nScore adaptativo: `{offset:+.0f} pts`" if offset != 0 else ""
+
+    msg = (
+        f"📖 *TRADE JOURNAL* — {n} trades\n"
+        f"Win rate: `{wr}%` | Últimas 20: `{recent_wr}%`\n"
+        f"PnL total: `{pnl:+.4f} USDT`\n"
+        f"Score óptimo empírico: `{opt_score:.1f}`{offset_str}\n"
+        f"Mejores horas UTC: `{hours_str}`\n"
+        f"Por tier:\n{tier_str}"
+    )
+    await send(msg)
+
+
+async def notify_limit_filled(symbol: str, direction: str, price: float, qty: float) -> None:
+    """Orden límite llenada — ahorro de comisiones."""
+    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    msg = (
+        f"💰 *LIMIT FILLED* — {symbol} {dir_icon}\n"
+        f"Precio: `{price:.6f}` | Qty: `{qty}`\n"
+        f"_Fee maker 0.02% en vez de 0.05% taker_"
+    )
+    await send(msg)

@@ -121,9 +121,10 @@ class OpenTrade:
 # ── Manager ───────────────────────────────────────────────────────────────────
 
 class PositionManager:
-    def __init__(self, client: BingXClient, risk: RiskManager):
-        self.client  = client
-        self.risk    = risk
+    def __init__(self, client: BingXClient, risk: RiskManager, journal=None):
+        self.client   = client
+        self.risk     = risk
+        self._journal = journal   # TradeJournal opcional — notifica W/L al cerrar
         self._trades: dict[str, OpenTrade] = {}
         self._lock   = asyncio.Lock()
         # Throttle Telegram: notificar trail solo cada 1 ATR de mejora por símbolo
@@ -228,6 +229,9 @@ class PositionManager:
         if existed:
             self._trail_last_notify.pop(symbol, None)
             await self.risk.on_trade_closed(pnl=pnl, symbol=symbol)
+            # Notificar al journal para win rate adaptativo
+            if self._journal is not None:
+                self._journal.on_close(symbol, pnl)
 
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
