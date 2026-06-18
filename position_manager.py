@@ -1,7 +1,14 @@
 """
-QF×JP Bot v7.1 — Position Manager TRAILING STOP DINÁMICO (FIX 110412 loop)
+QF×JP Bot v7.2 — Position Manager TRAILING STOP DINÁMICO (FIX cuenta compartida)
 ═══════════════════════════════════════════════════════════════════════════════
-FIXES vs v7.0:
+FIX v7.2:
+  ✅ open_count YA NO cuenta toda la cuenta BingX — solo las posiciones que
+     ESTE bot trackea. Antes, con renewed-love + joyful-art + GEMMI
+     compartiendo la misma cuenta/API, cada bot veía las posiciones de
+     los OTROS bots reflejadas en su propio MAX_OPEN_TRADES, causando
+     bloqueos (o desbloqueos) por actividad ajena al bot.
+
+FIXES vs v7.0 (sin cambios):
   ✅ Loop infinito 110412 en pares de bajo precio (CATI-USDT, etc.):
      - Margen de _sl_valid ampliado 0.2% → 0.5% (cubre spread/tick/latencia)
      - Re-fetch de mark price justo antes de enviar el STOP_MARKET en
@@ -51,6 +58,17 @@ def _extract_order_id(resp: dict) -> str:
         oid = (data.get("order") or {}).get("orderId") or data.get("orderId", "")
         return str(oid) if oid else ""
     return ""
+
+
+def _is_position_closed_error(resp: dict) -> bool:
+    """
+    BingX error 109420: 'position not exist' — la posición ya fue cerrada
+    externamente (SL/TP disparado) pero el tracker interno aún no lo sabe.
+    Detectar esto permite auto-limpiar el trade en vez de seguir reintentando.
+    También captura 110025 (order would trigger immediately) como señal de cierre.
+    """
+    code = resp.get("code", 0) if isinstance(resp, dict) else 0
+    return code in (109420, 110025)
 
 
 def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
@@ -198,7 +216,7 @@ class PositionManager:
     async def register_trade(self, trade: OpenTrade):
         async with self._lock:
             self._trades[trade.symbol] = trade
-        await self.risk.on_trade_opened(symbol=trade.symbol)
+        await self.risk.on_trade_opened(symbol=trade.symbol, direction=trade.direction)
         log.info("[%s] Trade registrado %s @ %.6f", trade.symbol, trade.direction, trade.entry)
 
     async def remove_trade(self, symbol: str, pnl: float = 0.0):
@@ -236,7 +254,19 @@ class PositionManager:
             p["symbol"]: p for p in real_positions
             if p.get("symbol") and float(p.get("positionAmt", 0)) != 0
         }
-        await self.risk.update_open_count(len(real_map))
+
+        # ── FIX v7.2: open_count solo de ESTE bot, no de la cuenta entera ──────
+        # get_open_positions() devuelve TODAS las posiciones de la cuenta BingX,
+        # incluidas las de OTROS bots (renewed-love, joyful-art, GEMMI comparten
+        # la misma cuenta/API). Antes: update_open_count(len(real_map)) contaba
+        # posiciones de otros bots contra el MAX_OPEN_TRADES de este — podía
+        # bloquear (o desbloquear) trades por actividad ajena.
+        # Ahora: solo cuenta cuántos símbolos que ESTE bot trackea siguen
+        # realmente abiertos en BingX (intersección tracked ∩ real).
+        async with self._lock:
+            own_symbols = set(self._trades.keys())
+        own_open_count = len(own_symbols & set(real_map.keys()))
+        await self.risk.update_open_count(own_open_count)
 
         async with self._lock:
             tracked = dict(self._trades)
@@ -376,6 +406,18 @@ class PositionManager:
                     )
                     return
 
+                # FIX v7.3: 109420 en el BE path = posición ya cerrada
+                if _is_position_closed_error(resp):
+                    log.info("[%s] Trail BE: posición ya cerrada (109420) — "
+                             "limpiando tracker", symbol)
+                    pnl = self._calc_pnl(trade, mark)
+                    await tg.notify_trade_closed(
+                        symbol, trade.direction, trade.entry,
+                        mark, trade.qty, "sl_tp_auto(trail_detect)", pnl,
+                    )
+                    await self.remove_trade(symbol, pnl)
+                    return
+
                 # ── SL en breakeven falló: fallback a offset de mark ──────────
                 log.warning("[%s] BE @ entry falló: %s — probando SL offset", symbol, resp)
 
@@ -426,6 +468,19 @@ class PositionManager:
                         f"🎯 *TRAIL ACTIVADO* (emergencia) — `{symbol}`\n"
                         f"SL @ `{em_sl:.6f}` | Mark: `{mark:.6f}`"
                     )
+                elif _is_position_closed_error(em_resp):
+                    # FIX v7.3: BingX 109420 = posición ya cerrada externamente
+                    # El SL/TP original se disparó antes de que llegáramos aquí.
+                    # Auto-limpiar el trade del tracker — el monitor lo habría
+                    # detectado en el siguiente ciclo de todas formas.
+                    log.info("[%s] Trail activation: posición ya cerrada (109420) — "
+                             "limpiando tracker", symbol)
+                    pnl = self._calc_pnl(trade, mark)
+                    await tg.notify_trade_closed(
+                        symbol, trade.direction, trade.entry,
+                        mark, trade.qty, "sl_tp_auto(trail_detect)", pnl,
+                    )
+                    await self.remove_trade(symbol, pnl)
                 else:
                     log.error("[%s] Trail activation: SL emergencia FALLIDO: %s — "
                               "posición sin protección, monitorizar manual", symbol, em_resp)
@@ -569,6 +624,17 @@ class PositionManager:
                     )
 
             else:
+                # FIX v7.3: detectar 109420 = posición ya cerrada
+                if _is_position_closed_error(resp):
+                    log.info("[%s] Trail update: posición ya cerrada (109420) — "
+                             "limpiando tracker", symbol)
+                    pnl = self._calc_pnl(trade, fresh_mark)
+                    await tg.notify_trade_closed(
+                        symbol, trade.direction, trade.entry,
+                        fresh_mark, trade.qty, "sl_tp_auto(trail_detect)", pnl,
+                    )
+                    await self.remove_trade(symbol, pnl)
+                    return
                 # Fallo al actualizar trail — no es crítico, el SL viejo sigue activo
                 trade.peak_price     = new_peak   # guardar peak, reintentar próximo ciclo
                 trade.last_failed_sl = new_sl     # FIX v7.1: recordar para anti-spam

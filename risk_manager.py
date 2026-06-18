@@ -1,27 +1,19 @@
 """
-QF×JP Bot v7.1 — Risk Manager ANTI-LIQUIDACIÓN + DAILY LOSS REAL
+QF×JP Bot v7.6 — Risk Manager ANTI-LIQUIDACIÓN + DAILY LOSS REAL + CORRELATION GUARD
 ═══════════════════════════════════════════════════════════════════════════════
-FIXES vs v6.5:
-  - daily_loss_limit usa DAILY_LOSS_PCT (era 5%, ahora 2%)
-  - Notional cap duro MAX_NOTIONAL_USDT
-  - Cooldown 2h por símbolo tras pérdida
-  - Límite 2 trades por símbolo al día
-  - open_count sincronizado solo desde BingX real
+FIXES vs v7.1:
+  ✅ Correlation Guard: direction_allowed() limita trades en la misma
+     dirección (LONG o SHORT) dentro de CORRELATION_WINDOW_SEC.
+     Evita apilar el mismo riesgo de mercado (caso FHEU+XNY: dos LONG
+     abiertos casi a la vez, cerrados juntos por el mismo movimiento bajista).
+  ✅ on_trade_opened() acepta direction= para registrar la dirección en
+     _direction_ts (necesario para que el guard funcione)
 
-FIX v7.1 — DAILY LOSS REAL (incluye PnL no realizado):
-  ✅ can_trade() ahora acepta un parámetro opcional `unrealized_pnl`.
-     Antes: solo _daily_pnl (PnL CERRADO) se comparaba contra el límite
-     diario. Si había -300 USDT en posiciones ABIERTAS pero 0 cerradas
-     en pérdida, can_trade() seguía devolviendo True y el bot seguía
-     abriendo posiciones nuevas mientras el drawdown real ya superaba
-     el límite configurado.
-     Ahora: el chequeo usa (daily_pnl_cerrado + unrealized_pnl) contra
-     el límite. PositionManager debe pasar la suma de PnL no realizado
-     de todas las posiciones trackeadas en cada llamada a can_trade().
-
-  ✅ status() también reporta daily_pnl_total (cerrado + no realizado)
-     cuando se le pasa unrealized_pnl, para que /status refleje el
-     drawdown real de la cuenta, no solo lo cerrado.
+SIN CAMBIOS vs v7.1:
+  ✅ daily_loss_limit incluye PnL no realizado (unrealized_pnl)
+  ✅ Notional cap duro MAX_NOTIONAL_USDT
+  ✅ Cooldown 2h por símbolo tras pérdida
+  ✅ open_count sincronizado solo desde BingX real
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -49,6 +41,8 @@ class RiskManager:
         self._MAX_PER_SYMBOL   = 2        # máx 2 trades por par al día
         # FIX v7.1: último PnL no realizado conocido (para status/logging)
         self._last_unrealized  = 0.0
+        # Correlation Guard: timestamps de apertura por dirección
+        self._direction_ts: dict[str, list] = {"LONG": [], "SHORT": []}
 
     # ── Reset diario ──────────────────────────────────────────────────────────
 
@@ -107,20 +101,42 @@ class RiskManager:
             return False, f"max_trades_symbol({symbol},{cnt}/{self._MAX_PER_SYMBOL})"
         return True, ""
 
+    def direction_allowed(self, direction: str) -> tuple[bool, str]:
+        """
+        Correlation Guard — evita apilar el mismo riesgo de mercado.
+        Caso real: FHEU+XNY, dos LONG abiertos casi a la vez que cerraron
+        juntos por el mismo movimiento bajista — no eran independientes.
+
+        Limita cuántos trades en la misma dirección (LONG o SHORT) se pueden
+        abrir dentro de CORRELATION_WINDOW_SEC. Si ya hay MAX_SAME_DIRECTION
+        recientes, bloquea nuevas entradas en esa dirección.
+        """
+        now = time.time()
+        ts_list = self._direction_ts.get(direction, [])
+        # Purgar timestamps fuera de la ventana
+        ts_list = [t for t in ts_list if now - t < C.CORRELATION_WINDOW_SEC]
+        self._direction_ts[direction] = ts_list
+        if len(ts_list) >= C.MAX_SAME_DIRECTION:
+            mins = int(C.CORRELATION_WINDOW_SEC / 60)
+            return False, f"correlation_guard({direction},{len(ts_list)}/{C.MAX_SAME_DIRECTION} en {mins}min)"
+        return True, ""
+
     def tier_ok(self, tier: str) -> bool:
         order = {"NONE": 0, "STD": 1, "FUEL": 2, "SUP": 3}
         return order.get(tier, 0) >= order.get(C.MIN_TIER, 1)
 
     # ── Eventos ───────────────────────────────────────────────────────────────
 
-    async def on_trade_opened(self, symbol: str = ""):
+    async def on_trade_opened(self, symbol: str = "", direction: str = ""):
         async with self._lock:
             self._open_count   += 1
             self._daily_trades += 1
             if symbol:
                 self._symbol_trade_cnt[symbol] = self._symbol_trade_cnt.get(symbol, 0) + 1
-            log.info("Trade abierto — open=%d daily=%d symbol=%s",
-                     self._open_count, self._daily_trades, symbol)
+            if direction in ("LONG", "SHORT"):
+                self._direction_ts.setdefault(direction, []).append(time.time())
+            log.info("Trade abierto — open=%d daily=%d symbol=%s dir=%s",
+                     self._open_count, self._daily_trades, symbol, direction)
 
     async def on_trade_closed(self, pnl: float = 0.0, symbol: str = ""):
         async with self._lock:

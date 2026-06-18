@@ -1,6 +1,7 @@
 """
-QF×JP Bot v6.5.2 — Telegram Client
-Añade notify_pre_signal para anticipación de entradas.
+QF×JP Bot v6.4 — Telegram Client
+Envía notificaciones al canal configurado.
+Todas las funciones son fire-and-forget (no bloquean el bot).
 """
 import asyncio
 import logging
@@ -13,7 +14,10 @@ log = logging.getLogger("telegram")
 
 _BASE = f"https://api.telegram.org/bot{C.TELEGRAM_TOKEN}/sendMessage"
 
+# ── Envío base ────────────────────────────────────────────────────────────────
+
 async def send(text: str, parse_mode: str = "Markdown") -> bool:
+    """Envía un mensaje al chat configurado. Silencia errores para no romper el bot."""
     if not C.TELEGRAM_TOKEN or not C.TELEGRAM_CHAT_ID:
         log.debug("Telegram no configurado — skip")
         return False
@@ -32,12 +36,13 @@ async def send(text: str, parse_mode: str = "Markdown") -> bool:
         log.warning("Telegram send error: %s", e)
         return False
 
+# ── Notificaciones específicas ────────────────────────────────────────────────
 
 async def notify_signal(sig) -> None:
+    """Señal detectada (modo SIGNAL o antes de abrir en LIVE)."""
     tier_icon = {"SUP": "🔥🔥", "FUEL": "🔥", "STD": "⚡"}.get(sig.tier, "📡")
     dir_icon  = "🟢" if sig.direction == "LONG" else "🔴"
-    sweep_txt = f"Sweep: `{sig.sweep}`\n" if getattr(sig, "sweep", "NONE") != "NONE" else ""
-    sq_txt    = "SQ Fire ⚡\n" if getattr(sig, "squeeze_fire", False) else ""
+
     msg = (
         f"{tier_icon} *{sig.symbol}* {dir_icon} `{sig.direction}`\n"
         f"Score: `{sig.score:.1f}` | Tier: `{sig.tier}`\n"
@@ -47,54 +52,35 @@ async def notify_signal(sig) -> None:
         f"TP2:   `{sig.tp2:.6f}`\n"
         f"ADX: `{sig.adx:.1f}` | MFI: `{sig.mfi:.1f}` | CVD: `{sig.cvd:.3f}`\n"
         f"Estructura: `{sig.structure}` | TL: `{sig.tl_break}`\n"
-        f"{sweep_txt}{sq_txt}"
         f"HTF: `{sig.htf_score:.2f}` | FR: `{sig.funding_rate:.4f}`"
     )
     await send(msg)
 
 
-async def notify_pre_signal(sig) -> None:
-    """[ANT] Pre-señal — condiciones formando, score insuficiente aún."""
-    dir_icon  = "🟢" if sig.direction == "LONG" else "🔴"
-    sweep_txt = f"Sweep: `{sig.sweep}`\n" if getattr(sig, "sweep", "NONE") != "NONE" else ""
-    sq_txt    = ("SQ Fire ⚡\n" if getattr(sig, "squeeze_fire", False)
-                 else "SQ Comprimido 🔋\n" if getattr(sig, "squeeze", False) else "")
-    rsi_txt   = ("RSI3 ↑ consenso\n" if getattr(sig, "rsi_consensus", 0) == 1
-                 else "RSI3 ↓ consenso\n" if getattr(sig, "rsi_consensus", 0) == -1 else "")
-    vwap_dev  = getattr(sig, "vwap_dev", 0.0)
-    vwap_txt  = f"VWAP dev: `{vwap_dev:+.2f}` ATR\n" if abs(vwap_dev) > 0.8 else ""
-    fvg_txt   = f"FVG: `{sig.fvg_active}`\n" if getattr(sig, "fvg_active", "NONE") not in ("NONE", "") else ""
-
-    msg = (
-        f"⚡ *PRE-SEÑAL* — `{sig.symbol}` {dir_icon} `{sig.direction}`\n"
-        f"Pre-score: `{sig.pre_score:.1f}` | Score actual: `{sig.score:.1f}`\n"
-        f"Entry≈: `{sig.entry:.6f}`\n"
-        f"{sweep_txt}{sq_txt}{rsi_txt}{vwap_txt}{fvg_txt}"
-        f"Estructura: `{sig.structure}`\n"
-        f"CVD: `{sig.cvd:.3f}` | VDI: `{sig.vdi:.2f}` | FR: `{sig.funding_rate:.4f}`"
-    )
-    await send(msg)
-
-
 async def notify_trade_opened(sig, qty: float, order_id: str) -> None:
+    """Trade abierto en BingX."""
     dir_icon = "🟢 LONG" if sig.direction == "LONG" else "🔴 SHORT"
-    sweep_txt = f"Sweep: `{sig.sweep}` ✓\n" if getattr(sig, "sweep", "NONE") != "NONE" else ""
     msg = (
         f"✅ *TRADE ABIERTO* — {sig.symbol}\n"
         f"Dirección: {dir_icon}\n"
         f"Entry: `{sig.entry:.6f}` | Qty: `{qty}`\n"
         f"SL: `{sig.sl:.6f}` | TP1: `{sig.tp1:.6f}` | TP2: `{sig.tp2:.6f}`\n"
         f"Score: `{sig.score:.1f}` ({sig.tier})\n"
-        f"{sweep_txt}"
         f"Order ID: `{order_id}`"
     )
     await send(msg)
 
 
 async def notify_trade_closed(
-    symbol: str, direction: str, entry: float,
-    close_price: float, qty: float, reason: str, pnl: float,
+    symbol: str,
+    direction: str,
+    entry: float,
+    close_price: float,
+    qty: float,
+    reason: str,
+    pnl: float,
 ) -> None:
+    """Trade cerrado (SL/TP auto o manual)."""
     pnl_icon = "💚" if pnl >= 0 else "💔"
     dir_icon = "🟢" if direction == "LONG" else "🔴"
     msg = (
@@ -112,18 +98,56 @@ async def notify_circuit_breaker(symbol: str) -> None:
 
 
 async def notify_status(status: dict, balance: float, n_symbols: int) -> None:
+    """Status periódico del bot — incluye PnL no realizado (v7.1)."""
+    pnl_total = status.get("daily_pnl_total", status.get("daily_pnl", 0))
+    pnl_real  = status.get("daily_pnl", 0)
+    pnl_unrealized = status.get("daily_pnl_no_real", 0)
+    limit     = status.get("daily_limit", 0)
+    pnl_icon  = "💚" if pnl_total >= 0 else "💔"
     msg = (
-        f"📊 *STATUS QF×JP Bot v6.5.2*\n"
+        f"📊 *STATUS QF×JP Bot*\n"
         f"Modo: `{status.get('mode', '?')}`\n"
         f"Balance: `{balance:.2f} USDT`\n"
         f"Trades abiertos: `{status.get('open_trades', 0)}/{status.get('max_open', 0)}`\n"
         f"Trades hoy: `{status.get('daily_trades', 0)}/{status.get('max_daily', 0)}`\n"
-        f"PnL diario: `{status.get('daily_pnl', 0):+.4f} USDT`\n"
+        f"{pnl_icon} PnL cerrado: `{pnl_real:+.4f}` | No realizado: `{pnl_unrealized:+.4f}` | Total: `{pnl_total:+.4f} USDT`\n"
+        f"Límite diario: `{limit:.2f} USDT`\n"
         f"Símbolos escaneados: `{n_symbols}`"
     )
     await send(msg)
 
 
 async def notify_error(context: str, error: str) -> None:
-    msg = f"🚨 *ERROR* — `{context}`\n`{error[:300]}`"
+    """Error interno del bot."""
+    msg = (
+        f"🚨 *ERROR* — `{context}`\n"
+        f"`{error[:300]}`"
+    )
+    await send(msg)
+
+
+async def notify_diagnostics(
+    iteration: int,
+    n_symbols: int,
+    n_direccionales: int,
+    avg_score: float,
+    max_score: float,
+    max_symbol: str,
+    max_dir: str,
+    top_reasons: list,
+) -> None:
+    """
+    FIX v7.2 — Diagnóstico de 0 señales.
+    Se envía cada 5 iteraciones SOLO cuando no se abrió ningún trade,
+    para ver desde el móvil exactamente qué puerta está bloqueando todo
+    (TL break, alineación HTF, tier insuficiente, etc.) sin entrar a Railway.
+    """
+    reasons_str = "\n".join(f"  • `{k}`: {v}" for k, v in top_reasons) if top_reasons else "  • (sin datos)"
+    msg = (
+        f"🔍 *DIAGNÓSTICO* — Iter {iteration}\n"
+        f"Símbolos: `{n_symbols}` | Con dirección: `{n_direccionales}`\n"
+        f"Score prom: `{avg_score:.1f}` | Score máx: `{max_score:.1f}` "
+        f"({max_symbol} {max_dir})\n"
+        f"Top razones de rechazo:\n{reasons_str}"
+    )
     await send(msg)

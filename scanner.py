@@ -1,21 +1,22 @@
 """
-QF×JP Bot v6.6 — Scanner
-Fixes vs v6.5:
-  - symbol_allowed check (cooldown + límite/día)
-  - OBI boost desde order book
-  - Funding rate como filtro de sesgo
-  - Batch 20, pausa 0.2s
+QF×JP Bot v7.2 — Scanner
+Fixes vs v7.1:
+  - DIAGNÓSTICO DE RECHAZO: indicators.py ya calculaba sig.reason
+    (no_tl_break, htf_not_aligned(x/y), insufficient_data, invalid_atr...)
+    pero scanner.py lo descartaba siempre en el camino sig.direction=="NONE".
+    Resultado: "0 señales" en los logs sin ninguna pista de POR QUÉ.
+    Ahora se acumula un Counter por iteración completa y se loguea +
+    se manda a Telegram cada N iteraciones, para saber exactamente
+    qué puerta está bloqueando todo (TL break, HTF alignment, tier...).
 
-FIX v7.1 (acompaña a risk_manager.py v7.1):
-  ✅ can_trade() ahora recibe unrealized_pnl (suma de PnL no realizado de
-     todas las posiciones trackeadas en PositionManager). Antes el chequeo
-     de daily loss solo miraba PnL cerrado, permitiendo seguir abriendo
-     trades nuevos aunque el drawdown no realizado ya superara el límite
-     diario configurado (DAILY_LOSS_PCT).
+FIX v7.1 (sin cambios):
+  ✅ can_trade() recibe unrealized_pnl (PnL no realizado de PositionManager)
+     para que el límite de pérdida diaria no ignore drawdown abierto.
 """
 import asyncio
 import logging
 import time
+from collections import Counter
 from typing import Optional
 
 import config as C
@@ -58,21 +59,25 @@ def _obi(ob: dict) -> float:
         return 0.0
 
 
-async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
+async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional[Signal]:
     if pos_mgr.is_trading(symbol):
+        diag["counts"]["already_trading"] += 1
         return None
 
     now = time.time()
     if symbol in _cb_blacklist and now - _cb_blacklist[symbol] < CB_COOLDOWN:
+        diag["counts"]["cb_cooldown"] += 1
         return None
 
     try:
         k3m, k15m, k1h, k4h, ob, fr = await _fetch_all(client, symbol)
     except Exception as e:
         log.debug("[%s] fetch error: %s", symbol, e)
+        diag["counts"]["fetch_error"] += 1
         return None
 
     if len(k3m) < 60:
+        diag["counts"]["insufficient_data"] += 1
         return None
 
     obi = _obi(ob)
@@ -81,10 +86,21 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         sig = analyze(symbol, k3m, k15m, k1h, k4h, funding_rate=fr)
     except Exception as e:
         log.warning("[%s] analyze error: %s", symbol, e)
+        diag["counts"]["analyze_error"] += 1
         return None
 
     if sig.direction == "NONE":
+        # FIX v7.2: surface el motivo real (antes se perdía silenciosamente)
+        diag["counts"][sig.reason or "no_direction"] += 1
         return None
+
+    # Hubo dirección — registrar score para saber qué tan cerca estamos del umbral
+    diag["score_n"]   += 1
+    diag["score_sum"] += sig.score
+    if sig.score > diag["score_max"]:
+        diag["score_max"]        = sig.score
+        diag["score_max_symbol"] = symbol
+        diag["score_max_dir"]    = sig.direction
 
     # OBI boost
     if abs(obi) > 0.1:
@@ -100,11 +116,14 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     if sig.circuit_breaker:
         _cb_blacklist[symbol] = now
         await tg.notify_circuit_breaker(symbol)
+        diag["counts"]["circuit_breaker"] += 1
         return None
 
     if not risk.tier_ok(sig.tier):
+        diag["counts"][f"tier_bajo({sig.tier})"] += 1
         return None
 
+    diag["counts"]["signal_qualified"] += 1
     log.info("[%s] Señal %s tier=%s score=%.1f fr=%.4f",
              symbol, sig.direction, sig.tier, sig.score, fr)
 
@@ -120,12 +139,22 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     can, reason = await risk.can_trade(unrealized_pnl=unrealized)
     if not can:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
+        diag["counts"]["risk_blocked"] += 1
         return None
 
     # Cooldown por símbolo
     sym_ok, sym_reason = risk.symbol_allowed(symbol)
     if not sym_ok:
         log.debug("[%s] Bloqueado por símbolo: %s", symbol, sym_reason)
+        diag["counts"]["symbol_blocked"] += 1
+        return None
+
+    # Correlation Guard — evita apilar varios LONG o SHORT simultáneos
+    # que se mueven juntos (caso FHEU+XNY)
+    dir_ok, dir_reason = risk.direction_allowed(sig.direction)
+    if not dir_ok:
+        log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
+        diag["counts"]["correlation_blocked"] += 1
         return None
 
     try:
@@ -177,8 +206,19 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     return sig
 
 
+def _new_diag() -> dict:
+    return {
+        "counts":          Counter(),
+        "score_n":         0,
+        "score_sum":       0.0,
+        "score_max":       0.0,
+        "score_max_symbol": "",
+        "score_max_dir":   "",
+    }
+
+
 async def scan_loop(client, risk, pos_mgr, complement=None):
-    log.info("Scanner v6.6 | Modo=%s | Interval=%ds | Batch=20",
+    log.info("Scanner v7.2 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
@@ -186,6 +226,7 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
     while True:
         start = time.time()
         iteration += 1
+        diag = _new_diag()
 
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
@@ -223,7 +264,7 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
         for i in range(0, len(symbols), BATCH):
             batch   = symbols[i:i+BATCH]
             results = await asyncio.gather(
-                *[_process_symbol(s, client, risk, pos_mgr) for s in batch],
+                *[_process_symbol(s, client, risk, pos_mgr, diag) for s in batch],
                 return_exceptions=True,
             )
             for r in results:
@@ -232,7 +273,30 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
             await asyncio.sleep(0.2)
 
         elapsed = time.time() - start
-        log.info("Iter %d | %d símbolos | %d señales | %.1fs",
-                 iteration, len(symbols), signals_found, elapsed)
+
+        # ── FIX v7.2: diagnóstico de rechazo ───────────────────────────────────
+        top5     = diag["counts"].most_common(5)
+        avg_sc   = diag["score_sum"] / diag["score_n"] if diag["score_n"] else 0.0
+        top_str  = " | ".join(f"{k}={v}" for k, v in top5) if top5 else "—"
+
+        log.info(
+            "Iter %d | %d símbolos | %d señales | %.1fs | "
+            "direccionales=%d avg_score=%.1f max_score=%.1f(%s %s) | %s",
+            iteration, len(symbols), signals_found, elapsed,
+            diag["score_n"], avg_sc, diag["score_max"],
+            diag["score_max_symbol"], diag["score_max_dir"], top_str,
+        )
+
+        # Cada 5 iteraciones, mandar el diagnóstico también a Telegram
+        # (más fácil de revisar desde el móvil que entrar a Railway)
+        if iteration % 5 == 0 and signals_found == 0:
+            try:
+                await tg.notify_diagnostics(
+                    iteration, len(symbols), diag["score_n"], avg_sc,
+                    diag["score_max"], diag["score_max_symbol"], diag["score_max_dir"],
+                    top5,
+                )
+            except Exception:
+                pass
 
         await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
