@@ -215,3 +215,43 @@ async def notify_time_stop(
         f"_Previene el patrón FHEU/SXT/LDO_"
     )
     await send(msg)
+
+
+async def notify_harvest_opportunity(
+    symbol: str, direction: str, fr: float,
+    yield_pct: float, hours_to_funding: float,
+) -> None:
+    """
+    Funding Harvest detectado — abre posición aprovechando el cierre de
+    posiciones apalancadas antes del pago de funding.
+    """
+    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    daily_yield = yield_pct * 3 * 100  # 3 pagos/día × yield por pago
+    msg = (
+        f"🌾 *HARVEST* — {symbol} {dir_icon} {direction}\n"
+        f"FR: `{fr*100:+.4f}%/8h` | Yield estimado: `{yield_pct*100:.3f}%/8h`\n"
+        f"Pago de funding en: `{hours_to_funding:.1f}h`\n"
+        f"Potencial: `~{daily_yield:.2f}%/día` en modo market-neutral\n"
+        f"_Posición pequeña (25% del notional normal)_"
+    )
+    await send(msg)
+
+
+async def notify_regime_alert(
+    symbol: str, regime: str, window: str,
+    fr: float, short_boost: float, long_boost: float,
+    hours_to_funding: float,
+) -> None:
+    """Alerta de cambio de régimen de funding importante."""
+    regime_icons = {
+        "EXTREME": "🔥", "SQUEEZE": "⚠️",
+        "STRESS":  "❄️", "CARRY": "💸", "NEUTRAL": "⚪",
+    }
+    icon = regime_icons.get(regime, "💰")
+    msg = (
+        f"{icon} *FUNDING REGIME* — {symbol}\n"
+        f"Régimen: `{regime}` | Ventana: `{window}`\n"
+        f"FR: `{fr*100:+.4f}%/8h` | Funding en: `{hours_to_funding:.1f}h`\n"
+        f"Boost SHORT: `{short_boost:+.0f}` | Boost LONG: `{long_boost:+.0f}`"
+    )
+    await send(msg)

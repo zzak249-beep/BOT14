@@ -42,6 +42,7 @@ from bingx_client import BingXClient
 from indicators import analyze, Signal, score_to_tier
 from risk_manager import RiskManager
 from position_manager import PositionManager, OpenTrade
+from funding_regime import regime_engine, Regime, Window
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
@@ -202,7 +203,26 @@ async def _process_symbol(
             sig.score = min(sig.score + boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
 
-    # ── 2. Funding Rate extremo ─────────────────────────────────────────────
+    # ── 2. FUNDING REGIME — el edge profesional ─────────────────────────────
+    # Actualizar historia del FR y obtener boosts de régimen + timing
+    regime_sig = regime_engine.update(symbol, fr)
+    regime_boost = (
+        regime_sig.short_boost if sig.direction == "SHORT"
+        else regime_sig.long_boost
+    )
+    if regime_boost != 0:
+        sig.score = max(0.0, min(sig.score + regime_boost, 100.0))
+        sig.tier  = score_to_tier(sig.score)
+        if abs(regime_boost) >= 8:
+            log.info("[%s] 💰 Regime boost %+.0f (%s) → score=%.1f",
+                     symbol, regime_boost, regime_sig.reason, sig.score)
+        diag["counts"][f"regime_{regime_sig.regime.lower()}"] += 1
+        if regime_boost < -5:
+            # Señal penalizada fuertemente → descartar
+            diag["counts"]["regime_block"] += 1
+            return None
+
+    # ── 3. Funding Rate extremo (filtro binario original + regime) ──────────
     fr_boost, fr_blocked = _fr_boost_block(fr, sig.direction)
     if fr_blocked:
         diag["counts"]["fr_extreme_block"] += 1
@@ -218,7 +238,7 @@ async def _process_symbol(
         diag["counts"]["circuit_breaker"] += 1
         return None
 
-    # ── 3. Adaptive threshold (feed del TradeJournal) ──────────────────────
+    # ── 4. Adaptive threshold (feed del TradeJournal) ──────────────────────
     adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
     effective_min   = C.MIN_SCORE + adaptive_offset
     if sig.score < effective_min:
@@ -350,6 +370,144 @@ def _new_diag() -> dict:
     }
 
 
+async def _harvest_scan(
+    symbols: list, client: BingXClient,
+    risk: RiskManager, pos_mgr: PositionManager,
+    diag: dict, journal=None,
+):
+    """
+    Funding Harvest Scanner — ejecuta cada 8 iteraciones (~8 min).
+
+    Busca símbolos con:
+      - FR > HARVEST_FR_THR (0.10%/8h) → oportunidad SHORT pre-funding
+      - FR < -HARVEST_FR_THR/2          → oportunidad LONG pre-funding
+
+    El harvest aprovecha que los traders apalancados CIERRAN posiciones
+    en las 2h previas al pago de funding → movimiento predecible.
+    Sizing más pequeño que señales normales, SL más ajustado (1.0 ATR).
+    """
+    harvest_thr = getattr(C, 'HARVEST_FR_THR', 0.0010)
+    if harvest_thr <= 0:
+        return
+
+    window = regime_engine._classify_window()
+    if window not in (Window.PREFUND_MAX, Window.PREFUND_PREP):
+        return  # Solo activo en ventana pre-funding
+
+    htf = regime_engine.hours_to_next_funding()
+    log.info("🌾 Harvest scan — ventana %s (%.1fh hasta funding) | %d símbolos",
+             window, htf, len(symbols))
+
+    candidates = []
+    for symbol in symbols[:30]:
+        if pos_mgr.is_trading(symbol):
+            continue
+        try:
+            fr = await client.get_funding_rate(symbol)
+        except Exception:
+            continue
+        is_harv, direction, yield_pct = regime_engine.is_harvest_opportunity(
+            symbol, fr, harvest_thr
+        )
+        if is_harv:
+            candidates.append((symbol, direction, fr, yield_pct))
+
+    if not candidates:
+        return
+
+    # Ordenar por yield y tomar el mejor
+    candidates.sort(key=lambda x: x[3], reverse=True)
+    log.info("🌾 Harvest candidates: %s",
+             [(s, d, f'{fr*100:.3f}%') for s, d, fr, _ in candidates[:3]])
+
+    # Solo abrir el mejor candidato por scan (no apilar harvests)
+    symbol, direction, fr, yield_pct = candidates[0]
+
+    # Check de riesgo
+    unrealized = await pos_mgr.get_unrealized_pnl()
+    can, reason = await risk.can_trade(unrealized_pnl=unrealized)
+    if not can:
+        log.debug("Harvest bloqueado por risk: %s", reason)
+        return
+
+    try:
+        balance = await client.get_balance()
+    except Exception:
+        return
+    if balance < 5:
+        balance = C.CAPITAL
+
+    # Klines para ATR
+    try:
+        k3m = await client.get_klines(symbol, C.TIMEFRAME, 50)
+        if len(k3m) < 20:
+            return
+        import numpy as np
+        highs  = np.array([c[2] for c in k3m[-20:]])
+        lows   = np.array([c[3] for c in k3m[-20:]])
+        closes = np.array([c[4] for c in k3m[-20:]])
+        tr = np.maximum(highs - lows,
+             np.maximum(abs(highs - np.roll(closes, 1)),
+                        abs(lows  - np.roll(closes, 1))))
+        atr   = float(np.mean(tr[1:]))
+        price = float(k3m[-1][4])
+    except Exception as e:
+        log.debug("Harvest klines error: %s", e)
+        return
+
+    # Sizing harvest: MAX_NOTIONAL * 0.25 (más pequeño que señales normales)
+    harvest_notional = getattr(C, 'MAX_NOTIONAL_USDT', 200) * 0.25
+    qty = harvest_notional / price / C.LEVERAGE
+    qty = client._round_qty(symbol, qty)
+    if qty <= 0:
+        return
+
+    # SL más ajustado para harvest (1.0 ATR vs 2.0 de señales normales)
+    sl_mult = 1.0
+    if direction == "LONG":
+        sl_price  = price - atr * sl_mult
+        tp1_price = price + atr * 1.0
+        tp2_price = price + atr * 2.0
+    else:
+        sl_price  = price + atr * sl_mult
+        tp1_price = price - atr * 1.0
+        tp2_price = price - atr * 2.0
+
+    log.info("🌾 HARVEST %s %s @ %.6f | yield=%.3f%%/8h | SL @ %.6f",
+             symbol, direction, price, yield_pct*100, sl_price)
+
+    await tg.notify_harvest_opportunity(symbol, direction, fr, yield_pct, htf)
+
+    try:
+        results = await client.open_trade(
+            symbol=symbol, direction=direction, quantity=qty,
+            sl_price=sl_price, tp1_price=tp1_price, tp2_price=tp2_price,
+        )
+    except Exception as e:
+        log.error("Harvest open_trade error: %s", e)
+        return
+
+    entry_resp = results.get("entry", {})
+    if entry_resp.get("code", -1) != 0:
+        log.warning("Harvest entrada rechazada: %s", entry_resp)
+        return
+
+    order_id = str(
+        entry_resp.get("data", {}).get("order", {}).get("orderId", "harvest")
+        or "harvest"
+    )
+    trade = OpenTrade(
+        symbol=symbol, direction=direction,
+        entry=price, sl=sl_price, tp1=tp1_price, tp2=tp2_price,
+        qty=qty, atr=atr, order_id=order_id,
+    )
+    await pos_mgr.register_trade(trade)
+    if journal:
+        journal.on_open(symbol=symbol, direction=direction, tier="HARVEST",
+                        score=90.0, fr=fr, obi=0.0, oi_delta=0.0)
+    diag["counts"]["harvest_opened"] += 1
+
+
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
     log.info("Scanner v7.3 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
@@ -443,5 +601,11 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
                 await tg.notify_journal_report(journal.stats())
             except Exception:
                 pass
+
+        # ── HARVEST SCAN — funding market-neutral (cada 8 iteraciones) ─────
+        # Busca símbolos con FR extremo + ventana pre-funding para capturar
+        # el movimiento de longs/shorts que cierran antes del pago.
+        if iteration % 8 == 0 and C.MODE == "LIVE":
+            await _harvest_scan(symbols[:50], client, risk, pos_mgr, diag, journal)
 
         await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
