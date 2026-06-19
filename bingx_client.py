@@ -241,7 +241,13 @@ class BingXClient:
                 continue
             if "-" not in sym and sym.endswith("USDT"):
                 sym = sym[:-4] + "-USDT"
-            if not sym.endswith("-USDT") or sym in C.BLACKLIST:
+            # FIX CRÍTICO: BLACKLIST se configura SIN sufijo ("SYN", "ESPORTS")
+            # pero `sym` aquí ya está normalizado CON sufijo ("SYN-USDT").
+            # `sym in C.BLACKLIST` nunca coincidía → el blacklist nunca filtró
+            # nada, ni siquiera ESPORTS pese a estar añadido explícitamente.
+            # Se compara contra ambas formas para cubrir cualquier config.
+            base_sym = sym.replace("-USDT", "")
+            if not sym.endswith("-USDT") or base_sym in C.BLACKLIST or sym in C.BLACKLIST:
                 continue
             if any(sym.replace("-USDT", "").startswith(p) for p in _bad):
                 continue
