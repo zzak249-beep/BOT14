@@ -212,6 +212,15 @@ class PositionManager:
         Coloca SL inmediato en todas las posiciones reconciliadas.
         SL calculado desde mark price actual con 2% offset → siempre válido.
         Guarda el orderId para el sistema de trailing.
+
+        FIX CRÍTICO: esta función se ejecuta en CADA reconcile_on_startup(),
+        es decir, en CADA redeploy del bot. Antes NO cancelaba las órdenes
+        previas antes de colocar la nueva SL de emergencia — cada redeploy
+        apilaba una orden más sin limpiar las anteriores. Con las decenas
+        de redeploys de una sesión de desarrollo activa, esto acumuló 75
+        órdenes huérfanas para solo 5 posiciones reales (~15 por símbolo).
+        Ahora cancela TODO lo pendiente del símbolo antes de colocar la
+        SL nueva — igual que ya hacía correctamente _activate_trail().
         """
         async with self._lock:
             trades = dict(self._trades)
@@ -224,6 +233,15 @@ class PositionManager:
 
                 side_close = "SELL" if trade.direction == "LONG" else "BUY"
                 sl_price   = mark * 0.98 if trade.direction == "LONG" else mark * 1.02
+
+                # FIX: limpiar órdenes huérfanas de redeploys anteriores
+                # ANTES de colocar la nueva — evita la acumulación de
+                # decenas de SL/TP fantasma a lo largo de muchos restarts.
+                try:
+                    await self.client.cancel_all_orders(sym)
+                    await asyncio.sleep(0.3)
+                except Exception as ce:
+                    log.debug("[%s] cancel_all_orders previo a SL emergencia: %s", sym, ce)
 
                 log.info("[%s] SL emergencia: mark=%.6f sl=%.6f", sym, mark, sl_price)
 
