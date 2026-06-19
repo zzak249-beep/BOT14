@@ -140,6 +140,20 @@ class ComplementEngine:
             (para no duplicar análisis propios)
           - FIX v1.1: el trade del master NO está ya en pérdida
             (pnl_pct del master >= COPY_MAX_ADVERSE_PCT, default 0%)
+          - FIX v1.2 CRÍTICO: el símbolo NO está en BLACKLIST.
+            Antes este modo copiaba CIEGAMENTE cualquier símbolo que el
+            master tuviera abierto, sin revisar BLACKLIST en absoluto.
+            Causó pérdidas reales: SYNUSDT -20.06 USDT y -8.96 USDT,
+            ESPORTSUSDT -3.69 USDT y -0.49 USDT, todos copiados pese a
+            estar explícitamente bloqueados en la config de joyful-art.
+          - FIX v1.2: can_trade() y direction_allowed() ahora se llaman
+            POR CADA SÍMBOLO dentro del loop (antes se llamaba can_trade()
+            UNA sola vez fuera del loop, así que un solo chequeo permitía
+            copiar 5+ trades de golpe sin volver a verificar el límite
+            real de posiciones abiertas — el mismo patrón de race
+            condition arreglado en scanner.py, pero aquí ni siquiera
+            hacía falta concurrencia para que fallara: bastaba con que
+            el master tuviera varios SUP trades en la misma pasada).
         """
         now = time.time()
         if now - self._last_copy < 30:   # revisar cada 30s
@@ -148,10 +162,6 @@ class ComplementEngine:
 
         master_trades = await self.master.get_master_trades()
         if not master_trades:
-            return
-
-        can, reason = await self.risk.can_trade()
-        if not can:
             return
 
         for symbol, trade_data in master_trades.items():
@@ -164,6 +174,15 @@ class ComplementEngine:
                 continue
             # No copiar si es símbolo exclusivo propio (joyful-art lo analizará solo)
             if symbol in self._exclusive_syms:
+                continue
+
+            # ── FIX v1.2 CRÍTICO: BLACKLIST ──────────────────────────────────
+            # Mismo patrón que bingx_client.py: comparar el símbolo BASE
+            # (sin sufijo -USDT) porque BLACKLIST se configura sin sufijo
+            # ("SYN", "ESPORTS"), no con él ("SYN-USDT").
+            base_sym = symbol.replace("-USDT", "").replace("USDT", "")
+            if base_sym in C.BLACKLIST or symbol.replace("-USDT", "") in C.BLACKLIST:
+                log.info("[COPY] %s en BLACKLIST — NO copiar", symbol)
                 continue
 
             direction = trade_data.get("direction", "")
@@ -191,22 +210,37 @@ class ComplementEngine:
                          symbol, pnl_pct, COPY_MAX_ADVERSE_PCT)
                 continue
 
-            # Tamaño: 40% del master pero respetando nuestro propio cap
-            master_qty = float(trade_data.get("qty", 0))
-            qty = master_qty * COPY_SIZE_MULT
-
-            # Verificar cap notional propio
-            notional = qty * entry
-            if notional > C.MAX_NOTIONAL_USDT:
-                qty = C.MAX_NOTIONAL_USDT / entry
-
-            if qty <= 0:
+            # ── FIX v1.2: reserva atómica POR SÍMBOLO, no una vez para todo
+            # el batch — evita copiar más trades de los que el límite real
+            # permite cuando el master tiene varios SUP trades a la vez.
+            can, reason = await self.risk.can_trade()
+            if not can:
+                log.debug("[COPY] %s bloqueado por risk: %s", symbol, reason)
                 continue
 
-            log.info("[COPY] %s %s qty=%.4f (40%% del master, master_pnl=%.2f%%) notional=%.1f",
-                     symbol, direction, qty, pnl_pct, qty * entry)
+            dir_ok, dir_reason = self.risk.direction_allowed(direction)
+            if not dir_ok:
+                log.debug("[COPY] %s bloqueado por correlación: %s", symbol, dir_reason)
+                await self.risk.release_reservation()
+                continue
 
+            trade_confirmed = False
             try:
+                # Tamaño: 40% del master pero respetando nuestro propio cap
+                master_qty = float(trade_data.get("qty", 0))
+                qty = master_qty * COPY_SIZE_MULT
+
+                # Verificar cap notional propio
+                notional = qty * entry
+                if notional > C.MAX_NOTIONAL_USDT:
+                    qty = C.MAX_NOTIONAL_USDT / entry
+
+                if qty <= 0:
+                    continue
+
+                log.info("[COPY] %s %s qty=%.4f (40%% del master, master_pnl=%.2f%%) notional=%.1f",
+                         symbol, direction, qty, pnl_pct, qty * entry)
+
                 results = await self.client.open_trade(
                     symbol=symbol, direction=direction, quantity=qty,
                     sl_price=sl, tp1_price=tp1, tp2_price=tp2,
@@ -233,11 +267,18 @@ class ComplementEngine:
                         f"Entry: `{entry:.6f}` | SL: `{sl:.6f}`\n"
                         f"Qty: `{qty:.4f}` notional: `{qty*entry:.1f}` USDT"
                     )
-                    await self.risk.on_trade_opened(symbol=symbol)
+                    await self.risk.on_trade_opened(symbol=symbol, direction=direction)
+                    trade_confirmed = True
                 else:
                     log.warning("[COPY] %s entrada rechazada: %s", symbol, entry_resp)
             except Exception as e:
                 log.error("[COPY] %s error: %s", symbol, e)
+            finally:
+                # FIX v1.2: liberar la reserva si el trade no se concretó —
+                # mismo principio que scanner.py, evita contadores inflados.
+                if not trade_confirmed:
+                    await self.risk.release_reservation()
+                    self.risk.release_direction_reservation(direction)
 
             await asyncio.sleep(0.5)
 
@@ -410,6 +451,10 @@ class ComplementEngine:
                  "(longs=%d shorts=%d) — abriendo %s BTCUSDT",
                  total_losing, HEDGE_LOSS_PCT, len(losing_longs), len(losing_shorts), hedge_dir)
 
+        # FIX v1.2: try/finally para liberar la reserva de can_trade() si el
+        # hedge finalmente no se concreta (ticker inválido, entrada
+        # rechazada, excepción) — mismo patrón que scanner.py y run_copy_mode.
+        trade_confirmed = False
         try:
             ticker = await self.client.get_ticker("BTCUSDT")
             btc_price = float(ticker.get("lastPrice", 0))
@@ -451,8 +496,15 @@ class ComplementEngine:
                     f"(longs={len(losing_longs)}, shorts={len(losing_shorts)})\n"
                     f"Notional: `{hedge_notional:.0f}` USDT | SL: `{sl:.0f}`"
                 )
+                await self.risk.on_trade_opened(symbol="BTCUSDT", direction=hedge_dir)
+                trade_confirmed = True
+            else:
+                log.warning("[HEDGE] entrada rechazada: %s", results.get("entry", {}))
         except Exception as e:
             log.error("[HEDGE] error: %s", e)
+        finally:
+            if not trade_confirmed:
+                await self.risk.release_reservation()
 
     # ══════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL

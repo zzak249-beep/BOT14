@@ -62,6 +62,25 @@ class RiskManager:
         """
         Verifica si el bot puede abrir un nuevo trade.
 
+        FIX v7.8 — RACE CONDITION CRÍTICA: el scanner procesa hasta 20
+        símbolos en paralelo (asyncio.gather). Antes, este método solo
+        CHEQUEABA open_count < MAX_OPEN_TRADES, y el incremento real
+        ocurría mucho después (en on_trade_opened(), tras el round-trip
+        de red a BingX). Eso dejaba una ventana en la que 5+ símbolos
+        concurrentes podían ver TODOS "open_count=3<5", pasar el check
+        a la vez, y abrir 5+ trades de golpe — superando el límite
+        configurado (caso real: "Trades abiertos: 6/5" en producción).
+
+        FIX: si todos los chequeos pasan, el slot se RESERVA de inmediato
+        (incrementando open_count/daily_trades) DENTRO del mismo lock,
+        antes de devolver True. Así, la siguiente llamada concurrente ve
+        el contador ya actualizado y se bloquea correctamente.
+
+        Si el trade finalmente NO se concreta (entrada rechazada, qty=0,
+        excepción, etc.), el caller DEBE llamar a release_reservation()
+        para liberar el slot reservado — si no, el contador queda
+        inflado y bloquea trades válidos el resto del día.
+
         FIX v7.1: `unrealized_pnl` es la suma del PnL no realizado de TODAS
         las posiciones abiertas trackeadas (calculado por PositionManager
         con el mark price actual). El límite de pérdida diaria ahora se
@@ -86,7 +105,24 @@ class RiskManager:
                     f"no_real={unrealized_pnl:.2f} total={total_pnl:.2f} "
                     f"< -{daily_limit:.2f}, limit={C.DAILY_LOSS_PCT}%)"
                 )
+
+            # FIX: reserva atómica — incrementar AQUÍ, dentro del lock,
+            # antes de soltar el control a otra corrutina concurrente.
+            self._open_count   += 1
+            self._daily_trades += 1
             return True, ""
+
+    async def release_reservation(self):
+        """
+        Libera un slot reservado por can_trade() cuando el trade
+        finalmente NO se concreta. Llamar SIEMPRE que can_trade()
+        devolvió True pero el flujo termina sin abrir la posición real.
+        """
+        async with self._lock:
+            self._open_count   = max(0, self._open_count - 1)
+            self._daily_trades = max(0, self._daily_trades - 1)
+            log.debug("Reserva liberada (trade no concretado) — open=%d daily=%d",
+                     self._open_count, self._daily_trades)
 
     def symbol_allowed(self, symbol: str) -> tuple[bool, str]:
         """Verifica cooldown y límite de trades por símbolo."""
@@ -109,16 +145,36 @@ class RiskManager:
         Limita cuántos trades en la misma dirección (LONG o SHORT) se pueden
         abrir dentro de CORRELATION_WINDOW_SEC. Si ya hay MAX_SAME_DIRECTION
         recientes, bloquea nuevas entradas en esa dirección.
+
+        FIX v7.8: misma race condition que can_trade() — antes el chequeo
+        y el registro (en on_trade_opened) estaban separados por el
+        round-trip de red, permitiendo que el batch concurrente de hasta
+        20 símbolos abriera varios LONG/SHORT "correlacionados" a la vez,
+        justo el escenario que este guard debía prevenir. Ahora reserva
+        el timestamp INMEDIATAMENTE si pasa el check.
+
+        Si el trade finalmente no se concreta, llamar a
+        release_direction_reservation(direction) para liberar el cupo.
         """
         now = time.time()
         ts_list = self._direction_ts.get(direction, [])
         # Purgar timestamps fuera de la ventana
         ts_list = [t for t in ts_list if now - t < C.CORRELATION_WINDOW_SEC]
-        self._direction_ts[direction] = ts_list
         if len(ts_list) >= C.MAX_SAME_DIRECTION:
+            self._direction_ts[direction] = ts_list
             mins = int(C.CORRELATION_WINDOW_SEC / 60)
             return False, f"correlation_guard({direction},{len(ts_list)}/{C.MAX_SAME_DIRECTION} en {mins}min)"
+        # FIX: reservar de inmediato — no esperar a on_trade_opened()
+        ts_list.append(now)
+        self._direction_ts[direction] = ts_list
         return True, ""
+
+    def release_direction_reservation(self, direction: str):
+        """Libera una reserva de dirección cuando el trade no se concreta."""
+        ts_list = self._direction_ts.get(direction, [])
+        if ts_list:
+            ts_list.pop()  # quita la más reciente (la que reservamos ahora)
+            self._direction_ts[direction] = ts_list
 
     def tier_ok(self, tier: str) -> bool:
         order = {"NONE": 0, "STD": 1, "FUEL": 2, "SUP": 3}
@@ -127,14 +183,20 @@ class RiskManager:
     # ── Eventos ───────────────────────────────────────────────────────────────
 
     async def on_trade_opened(self, symbol: str = "", direction: str = ""):
+        """
+        Llamar cuando el trade se CONFIRMA realmente abierto en BingX.
+
+        FIX v7.8: open_count, daily_trades y direction_ts YA se reservaron
+        atómicamente en can_trade()/direction_allowed() cuando pasaron el
+        check — incrementarlos otra vez aquí los duplicaría. Esta función
+        ahora solo registra el cooldown por símbolo (symbol_trade_cnt),
+        que no tiene el mismo riesgo de carrera porque cada símbolo se
+        procesa una sola vez por ciclo de scan.
+        """
         async with self._lock:
-            self._open_count   += 1
-            self._daily_trades += 1
             if symbol:
                 self._symbol_trade_cnt[symbol] = self._symbol_trade_cnt.get(symbol, 0) + 1
-            if direction in ("LONG", "SHORT"):
-                self._direction_ts.setdefault(direction, []).append(time.time())
-            log.info("Trade abierto — open=%d daily=%d symbol=%s dir=%s",
+            log.info("Trade confirmado — open=%d daily=%d symbol=%s dir=%s",
                      self._open_count, self._daily_trades, symbol, direction)
 
     async def on_trade_closed(self, pnl: float = 0.0, symbol: str = ""):

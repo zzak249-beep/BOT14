@@ -231,7 +231,12 @@ class BingXClient:
         symbols      = []
         vol_map:     dict[str, float] = {}
         vol_detected = 0
-        _bad = ("BEAR", "BULL", "PUMP", "NCS")
+        # FIX: filtro estructural de instrumentos no-cripto (commodities/forex
+        # que BingX lista en el mismo universo USDT-M). Capa extra junto al
+        # BLACKLIST manual — detectados en cuenta real: "Oil WTI", "Oil Brent",
+        # EURUSD, SILVER, todos con leverage 10x como si fueran altcoins.
+        _bad = ("BEAR", "BULL", "PUMP", "NCS",
+                "OIL", "WTI", "BRENT", "XAU", "XAG", "EUR", "GBP", "JPY")
 
         for item in raw:
             if not isinstance(item, dict):

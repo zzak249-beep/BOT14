@@ -44,6 +44,8 @@ from risk_manager import RiskManager
 from position_manager import PositionManager, OpenTrade
 from funding_regime import regime_engine, Regime, Window
 from volatility_regime import vol_engine, Regime as VolRegime
+from edge_filters import candle_turn_boost, multi_tf_slope_alignment
+from btc_correlation import compute_correlation, btc_guard
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
@@ -144,7 +146,7 @@ def _fr_boost_block(fr: float, direction: str) -> tuple[float, bool]:
 
 async def _process_symbol(
     symbol, client, risk, pos_mgr, diag: dict,
-    journal=None,
+    journal=None, btc_klines: list = None,
 ) -> Optional[Signal]:
 
     if pos_mgr.is_trading(symbol):
@@ -260,7 +262,42 @@ async def _process_symbol(
         diag["counts"]["circuit_breaker"] += 1
         return None
 
-    # ── 4. Adaptive threshold (feed del TradeJournal) ──────────────────────
+    # ── 4. Turn-of-Candle boost (conservador, solo LONG) ────────────────────
+    if getattr(C, 'CANDLE_TURN_ENABLED', True):
+        ct_boost, ct_reason = candle_turn_boost(
+            sig.direction,
+            tolerance_min=getattr(C, 'CANDLE_TURN_TOLERANCE_MIN', 1),
+            boost=getattr(C, 'CANDLE_TURN_BOOST', 3.0),
+        )
+        if ct_boost > 0:
+            sig.score = min(sig.score + ct_boost, 100.0)
+            sig.tier  = score_to_tier(sig.score)
+            diag["counts"]["candle_turn_boost"] += 1
+            log.debug("[%s] %s", symbol, ct_reason)
+
+    # ── 5. Slope Multi-Timeframe — confluencia + anti-whipsaw ───────────────
+    if getattr(C, 'SLOPE_FILTER_ENABLED', True):
+        slope_adj, slope_reason, slope_block = multi_tf_slope_alignment(
+            k15m, k1h, k4h, sig.direction
+        )
+        if slope_block:
+            log.info("[%s] 🚫 Slope whipsaw block: %s", symbol, slope_reason)
+            diag["counts"]["slope_block"] += 1
+            return None
+        if slope_adj != 0:
+            sig.score = max(0.0, min(sig.score + slope_adj, 100.0))
+            sig.tier  = score_to_tier(sig.score)
+            diag["counts"][f"slope_adj_{slope_adj:+.0f}"] += 1
+            if slope_adj >= 10:
+                log.info("[%s] 📈 %s → score=%.1f", symbol, slope_reason, sig.score)
+
+    # ── 6. BTC Correlation Guard se evalúa DENTRO del bloque LIVE (más abajo)
+    # — moverlo aquí causaba fuga de reserva si MODE=SIGNAL o si score/tier
+    # rechazaban la señal después, ya que esos `return` ocurren ANTES del
+    # try/finally que libera la reserva. Solo importa si de verdad se va a
+    # abrir una posición real, así que solo se calcula y reserva en LIVE.
+
+    # ── 7. Adaptive threshold (feed del TradeJournal) ──────────────────────
     adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
     effective_min   = C.MIN_SCORE + adaptive_offset
     if sig.score < effective_min:
@@ -287,102 +324,144 @@ async def _process_symbol(
         diag["counts"]["risk_blocked"] += 1
         return None
 
-    sym_ok, sym_reason = risk.symbol_allowed(symbol)
-    if not sym_ok:
-        log.debug("[%s] Bloqueado por símbolo: %s", symbol, sym_reason)
-        diag["counts"]["symbol_blocked"] += 1
-        return None
-
-    # Correlation guard
-    dir_ok, dir_reason = risk.direction_allowed(sig.direction)
-    if not dir_ok:
-        log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
-        diag["counts"]["correlation_blocked"] += 1
-        return None
-
-    # ── 4. Open Interest delta ───────────────────────────────────────────────
-    oi_delta = await _get_oi_delta(client, symbol)
-    if getattr(C, 'OI_FILTER_ENABLED', False) and oi_delta < -0.05:
-        # OI bajando >5%: posiciones cerrándose — señal de trampa
-        log.info("[%s] OI delta negativo (%.2f) — señal descartada", symbol, oi_delta)
-        diag["counts"]["oi_declining"] += 1
-        return None
-    if oi_delta > 0.02:
-        # OI creciendo: boost leve de confirmación
-        sig.score = min(sig.score + 3, 100.0)
-        sig.tier  = score_to_tier(sig.score)
+    # FIX v7.8: can_trade() YA reservó open_count/daily_trades atómicamente.
+    # A partir de aquí, CUALQUIER salida sin completar el trade DEBE liberar
+    # esa reserva (y la de dirección, si llega a hacerse) — si no, el
+    # contador queda inflado y bloquea trades válidos el resto del día.
+    # El try/finally garantiza la liberación sin tener que repetir el
+    # release en cada uno de los ~7 puntos de salida posibles.
+    trade_confirmed  = False
+    dir_reserved     = False
+    btc_corr         = 0.0
+    btc_reserved     = False
 
     try:
-        balance = await client.get_balance()
-    except Exception as e:
-        log.error("[%s] get_balance error: %s", symbol, e)
-        return None
-
-    if balance < 5.0:
-        log.warning("Balance=%.4f — usando CAPITAL=%.2f", balance, C.CAPITAL)
-        balance = C.CAPITAL
-
-    qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier, symbol=symbol)
-    if qty <= 0:
-        log.warning("[%s] qty=0, skip", symbol)
-        return None
-
-    log.info("[%s] qty=%.6f notional=%.2f USDT", symbol, qty, qty * sig.entry)
-    await tg.notify_signal(sig)
-
-    # ── 5. Limit order con fallback a market ─────────────────────────────────
-    entry_resp = {}
-    used_limit = False
-    if getattr(C, 'LIMIT_ORDERS_ENABLED', False):
-        lmt_resp = await client.place_limit_entry(
-            symbol, sig.direction, qty, sig.entry,
-            timeout_s=getattr(C, 'LIMIT_TIMEOUT_SECS', 15),
-        )
-        if lmt_resp.get("code", -1) == 0:
-            entry_resp = lmt_resp
-            used_limit = True
-            log.info("[%s] Entrada LÍMITE OK ✅ (fee ahorro 60%%)", symbol)
-            await tg.notify_limit_filled(symbol, sig.direction, sig.entry, qty)
-
-    if not used_limit:
-        try:
-            results = await client.open_trade(
-                symbol=symbol, direction=sig.direction, quantity=qty,
-                sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
-            )
-        except Exception as e:
-            log.error("[%s] open_trade error: %s", symbol, e)
-            await tg.notify_error(f"open_trade({symbol})", str(e))
+        sym_ok, sym_reason = risk.symbol_allowed(symbol)
+        if not sym_ok:
+            log.debug("[%s] Bloqueado por símbolo: %s", symbol, sym_reason)
+            diag["counts"]["symbol_blocked"] += 1
             return None
-        entry_resp = results.get("entry", {})
 
-    if entry_resp.get("code", -1) != 0:
-        log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
-        await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
-        return None
+        # Correlation guard — reserva atómica si pasa (fix v7.8)
+        dir_ok, dir_reason = risk.direction_allowed(sig.direction)
+        if not dir_ok:
+            log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
+            diag["counts"]["correlation_blocked"] += 1
+            return None
+        dir_reserved = True
 
-    order_id = str(
-        entry_resp.get("data", {}).get("order", {}).get("orderId", "unknown")
-        or entry_resp.get("data", {}).get("orderId", "unknown")
-    )
+        # BTC Correlation Guard — evita apilar la MISMA apuesta sobre BTC.
+        # Caso real: SXT+LDO+FHE, 3 símbolos "distintos" LONG, todos
+        # correlacionados con BTC, cerrados juntos con -23.47 USDT.
+        # Se calcula AQUÍ (dentro del try/finally) para que la reserva
+        # quede cubierta por la liberación automática si algo falla después.
+        if btc_klines and getattr(C, 'BTC_CORR_ENABLED', True) and symbol != "BTC-USDT":
+            btc_corr = compute_correlation(k3m, btc_klines)
+            btc_guard.threshold  = getattr(C, 'BTC_CORR_THRESHOLD', 0.5)
+            btc_guard.window_sec = getattr(C, 'BTC_CORR_WINDOW_SEC', 1800)
+            btc_guard.max_same   = getattr(C, 'BTC_CORR_MAX_SAME', 3)
+            btc_reserved = abs(btc_corr) >= btc_guard.threshold
+            if btc_reserved:
+                btc_ok, btc_reason = btc_guard.allowed(sig.direction, btc_corr)
+                if not btc_ok:
+                    log.info("[%s] 🔗 %s", symbol, btc_reason)
+                    diag["counts"]["btc_correlation_blocked"] += 1
+                    btc_reserved = False  # allowed() no reservó si devolvió False
+                    return None
 
-    trade = OpenTrade(
-        symbol=symbol, direction=sig.direction,
-        entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
-        qty=qty, atr=sig.atr, order_id=order_id,
-    )
-    await pos_mgr.register_trade(trade)
-    await tg.notify_trade_opened(sig, qty, order_id)
+        # ── 4. Open Interest delta ───────────────────────────────────────────
+        oi_delta = await _get_oi_delta(client, symbol)
+        if getattr(C, 'OI_FILTER_ENABLED', False) and oi_delta < -0.05:
+            log.info("[%s] OI delta negativo (%.2f) — señal descartada", symbol, oi_delta)
+            diag["counts"]["oi_declining"] += 1
+            return None
+        if oi_delta > 0.02:
+            sig.score = min(sig.score + 3, 100.0)
+            sig.tier  = score_to_tier(sig.score)
 
-    # Registrar en journal
-    if journal:
-        journal.on_open(
-            symbol=symbol, direction=sig.direction, tier=sig.tier,
-            score=sig.score, fr=fr, obi=obi, oi_delta=oi_delta,
-            htf_score=sig.htf_score, adx=sig.adx,
+        try:
+            balance = await client.get_balance()
+        except Exception as e:
+            log.error("[%s] get_balance error: %s", symbol, e)
+            return None
+
+        if balance < 5.0:
+            log.warning("Balance=%.4f — usando CAPITAL=%.2f", balance, C.CAPITAL)
+            balance = C.CAPITAL
+
+        qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier, symbol=symbol)
+        if qty <= 0:
+            log.warning("[%s] qty=0, skip", symbol)
+            return None
+
+        log.info("[%s] qty=%.6f notional=%.2f USDT", symbol, qty, qty * sig.entry)
+        await tg.notify_signal(sig)
+
+        # ── 5. Limit order con fallback a market ─────────────────────────────
+        entry_resp = {}
+        used_limit = False
+        if getattr(C, 'LIMIT_ORDERS_ENABLED', False):
+            lmt_resp = await client.place_limit_entry(
+                symbol, sig.direction, qty, sig.entry,
+                timeout_s=getattr(C, 'LIMIT_TIMEOUT_SECS', 15),
+            )
+            if lmt_resp.get("code", -1) == 0:
+                entry_resp = lmt_resp
+                used_limit = True
+                log.info("[%s] Entrada LÍMITE OK ✅ (fee ahorro 60%%)", symbol)
+                await tg.notify_limit_filled(symbol, sig.direction, sig.entry, qty)
+
+        if not used_limit:
+            try:
+                results = await client.open_trade(
+                    symbol=symbol, direction=sig.direction, quantity=qty,
+                    sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
+                )
+            except Exception as e:
+                log.error("[%s] open_trade error: %s", symbol, e)
+                await tg.notify_error(f"open_trade({symbol})", str(e))
+                return None
+            entry_resp = results.get("entry", {})
+
+        if entry_resp.get("code", -1) != 0:
+            log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
+            await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
+            return None
+
+        order_id = str(
+            entry_resp.get("data", {}).get("order", {}).get("orderId", "unknown")
+            or entry_resp.get("data", {}).get("orderId", "unknown")
         )
 
-    return sig
+        trade = OpenTrade(
+            symbol=symbol, direction=sig.direction,
+            entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
+            qty=qty, atr=sig.atr, order_id=order_id,
+        )
+        await pos_mgr.register_trade(trade)
+        await tg.notify_trade_opened(sig, qty, order_id)
+        trade_confirmed = True
+
+        # Registrar en journal
+        if journal:
+            journal.on_open(
+                symbol=symbol, direction=sig.direction, tier=sig.tier,
+                score=sig.score, fr=fr, obi=obi, oi_delta=oi_delta,
+                htf_score=sig.htf_score, adx=sig.adx,
+            )
+
+        return sig
+
+    finally:
+        # FIX v7.8: si el trade NO se confirmó, liberar TODAS las reservas
+        # hechas en el camino (open_count/daily_trades, dirección, BTC corr)
+        # para que no queden contadores inflados bloqueando trades válidos.
+        if not trade_confirmed:
+            await risk.release_reservation()
+            if dir_reserved:
+                risk.release_direction_reservation(sig.direction)
+            if btc_reserved:
+                btc_guard.release(sig.direction, btc_corr)
 
 
 def _new_diag() -> dict:
@@ -571,12 +650,21 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             except Exception:
                 pass
 
+        # ── BTC klines — UNA sola llamada por iteración, reutilizada por
+        # todos los símbolos del scan vía BTC Correlation Guard. ───────────
+        btc_klines = None
+        if getattr(C, 'BTC_CORR_ENABLED', True):
+            try:
+                btc_klines = await client.get_klines("BTC-USDT", C.TIMEFRAME, 80)
+            except Exception as e:
+                log.debug("BTC klines fetch error: %s", e)
+
         BATCH = 20
         signals_found = 0
         for i in range(0, len(symbols), BATCH):
             batch   = symbols[i:i+BATCH]
             results = await asyncio.gather(
-                *[_process_symbol(s, client, risk, pos_mgr, diag, journal)
+                *[_process_symbol(s, client, risk, pos_mgr, diag, journal, btc_klines)
                   for s in batch],
                 return_exceptions=True,
             )
