@@ -46,6 +46,7 @@ from funding_regime import regime_engine, Regime, Window
 from volatility_regime import vol_engine, Regime as VolRegime
 from edge_filters import candle_turn_boost, multi_tf_slope_alignment
 from btc_correlation import compute_correlation, btc_guard
+from ws_market_data import ws_cache
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
@@ -58,9 +59,25 @@ _oi_cache: dict[str, tuple[float, float]] = {}
 OI_CACHE_TTL = 120  # segundos
 
 
+async def _get_k_primary(client: BingXClient, symbol: str):
+    """
+    Timeframe principal (TIMEFRAME, ej. 3m) — el más sensible a latencia,
+    usado para timing de entrada. Si WS_ENABLED y hay datos frescos en
+    caché (>=20 velas, <90s de antigüedad), los usa en vez de REST.
+
+    Comportamiento por defecto SIN CAMBIOS: WS_ENABLED=False → siempre
+    REST, exactamente igual que antes de este módulo existir.
+    """
+    if getattr(C, 'WS_ENABLED', False):
+        cached = ws_cache.get_latest(symbol, C.TIMEFRAME)
+        if cached is not None:
+            return cached
+    return await client.get_klines(symbol, C.TIMEFRAME, 200)
+
+
 async def _fetch_all(client: BingXClient, symbol: str):
     results = await asyncio.gather(
-        client.get_klines(symbol, C.TIMEFRAME,      200),
+        _get_k_primary(client, symbol),
         client.get_klines(symbol, C.HTF_TIMEFRAME,  100),
         client.get_klines(symbol, C.HTF2_TIMEFRAME, 100),
         client.get_klines(symbol, C.HTF5_TIMEFRAME, 100),
@@ -609,6 +626,17 @@ async def _harvest_scan(
     diag["counts"]["harvest_opened"] += 1
 
 
+# Lista de símbolos activos del scan más reciente — leída por ws_market_data
+# para saber a qué símbolos suscribirse en el WebSocket. Actualizada
+# automáticamente cada vez que scan_loop refresca su universo.
+_current_symbols: list[str] = []
+
+
+def get_current_symbols() -> list[str]:
+    """Callback para ws_market_data.run_ws_client(). Nunca lanza excepción."""
+    return list(_current_symbols)
+
+
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
     log.info("Scanner v7.3 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
@@ -630,6 +658,7 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
                     else:
                         symbols = all_syms
                         log.info("Símbolos activos: %d", len(symbols))
+                    _current_symbols[:] = symbols  # sincronizar para el WS client
                 else:
                     log.warning("get_all_symbols vacío (iter=%d)", iteration)
             except Exception as e:
