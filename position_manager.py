@@ -154,10 +154,37 @@ class PositionManager:
             amt = float(pos.get("positionAmt", 0) or 0)
             if not sym or amt == 0:
                 continue
-            direction = "LONG" if amt > 0 else "SHORT"
+            direction_from_amt = "LONG" if amt > 0 else "SHORT"
             pos_side  = pos.get("positionSide", "BOTH")
             if pos_side not in ("LONG", "SHORT", "BOTH"):
                 pos_side = "BOTH"
+
+            # ── FIX CRÍTICO ──────────────────────────────────────────────────
+            # En modo Hedge, BingX puede reportar positionAmt SIEMPRE positivo
+            # sin importar si la posición es LONG o SHORT — la dirección real
+            # vive en positionSide, no en el signo de positionAmt. Usar solo
+            # `amt > 0` causó que posiciones SHORT reconciliadas (tras CADA
+            # redeploy) se trackearan internamente como LONG, invirtiendo la
+            # lógica de profit/pérdida del trailing stop y dejando posiciones
+            # sin protección real. Caso confirmado: HYPE-USDT SHORT trackeado
+            # como LONG → trail activation se disparó con el precio SUBIENDO
+            # (pérdida real para un SHORT) creyendo que era ganancia →
+            # SL de breakeven calculado al revés → BingX rechazó con 110412
+            # en bucle → posición corrió sin protección real → -6.84 USDT.
+            #
+            # positionSide es la fuente de verdad cuando es LONG/SHORT
+            # explícito (Hedge mode). Solo se usa el signo de amt como
+            # fallback cuando viene "BOTH" (One-Way mode, donde sí es fiable).
+            if pos_side in ("LONG", "SHORT"):
+                direction = pos_side
+                if direction != direction_from_amt:
+                    log.warning(
+                        "[%s] ⚠️ Discrepancia dirección: amt sugiere %s pero "
+                        "positionSide=%s (Hedge mode) — usando positionSide",
+                        sym, direction_from_amt, pos_side,
+                    )
+            else:
+                direction = direction_from_amt
             entry = float(pos.get("avgPrice", pos.get("entryPrice", 0)) or 0)
             qty   = abs(amt)
             sl    = entry * (0.99 if direction == "LONG" else 1.01)
@@ -238,7 +265,7 @@ class PositionManager:
             await self.risk.on_trade_closed(pnl=pnl, symbol=symbol)
             # Notificar al journal para win rate adaptativo
             if self._journal is not None:
-                self._journal.on_close(symbol, pnl)
+                await self._journal.on_close(symbol, pnl)
 
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
