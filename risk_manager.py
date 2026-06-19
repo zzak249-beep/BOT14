@@ -232,7 +232,24 @@ class RiskManager:
 
         risk_usdt = balance * (C.RISK_PCT / 100) * kelly
         sl_dist   = abs(entry - sl)
-        qty       = (risk_usdt * C.LEVERAGE) / (sl_dist * entry) if sl_dist * entry > 0 else 0.0
+
+        # ── FIX CRÍTICO: bug dimensional de sizing ────────────────────────────
+        # Fórmula anterior: qty = (risk_usdt * LEVERAGE) / (sl_dist * entry)
+        # Esto dividía por `entry` dentro Y por `LEVERAGE/entry` de forma
+        # implícita, haciendo que la pérdida REAL al tocar SL dependiera del
+        # precio del token — verificado con números reales: para el MISMO
+        # risk_usdt configurado, SUI-USDT (precio ~0.71) arriesgaba 17.8x más
+        # dólares reales que LAB-USDT (precio ~12.6) al tocar el stop loss.
+        # Por eso LAB abría con qty=0.3 (notional ~3.8 USDT, margen <1 USDT)
+        # mientras símbolos baratos abrían posiciones proporcionalmente
+        # enormes para el mismo "riesgo" nominal.
+        #
+        # FIX: sizing por riesgo correcto y estándar — qty = risk_usdt / sl_dist.
+        # Esto garantiza que CUALQUIER símbolo, sin importar su precio en
+        # USDT, pierda exactamente risk_usdt si toca el SL. El leverage NO
+        # debe multiplicar la qty (solo determina cuánto margen hace falta
+        # para abrir esa qty, vía notional/leverage — ver cap más abajo).
+        qty = risk_usdt / sl_dist if sl_dist > 0 else 0.0
 
         # ── VOLATILITY TARGETING ─────────────────────────────────────────────
         # Ajusta el size de forma inversa al régimen de volatilidad del símbolo:
@@ -256,6 +273,19 @@ class RiskManager:
             log.info("[sizing] %s notional %.0f→%.0f USDT (cap=%.0f)",
                      tier, notional, cap, cap)
             qty = cap / entry
+            notional = cap
+
+        # ── PISO MÍNIMO DE NOTIONAL ────────────────────────────────────────────
+        # Con la fórmula corregida, símbolos caros + riesgo conservador pueden
+        # seguir dando posiciones diminutas donde las comisiones (0.02-0.05%
+        # por lado) se comen una fracción enorme del edge real. Si el notional
+        # calculado no llega al mínimo configurado, NO merece la pena abrir
+        # — mejor saltarse la señal que pagar fees por una posición simbólica.
+        min_notional = getattr(C, 'MIN_NOTIONAL_USDT', 5.0)
+        if notional < min_notional:
+            log.info("[sizing] %s notional %.2f < mínimo %.2f USDT — skip (fees dominarían)",
+                     tier, notional, min_notional)
+            return 0.0
 
         log.info("[sizing] %s score=%.1f risk=%.4f USDT qty=%.6f notional=%.2f USDT",
                  tier, score, risk_usdt, qty, qty * entry)
