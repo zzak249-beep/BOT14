@@ -314,6 +314,19 @@ async def _process_symbol(
     # try/finally que libera la reserva. Solo importa si de verdad se va a
     # abrir una posición real, así que solo se calcula y reserva en LIVE.
 
+    # ── 6b. Auto-blacklist por símbolo + Streak Breaker global ───────────────
+    # Aprendido de pérdidas reales, no requiere mantenimiento manual.
+    if journal:
+        auto_bl, auto_bl_reason = journal.is_symbol_auto_blacklisted(symbol)
+        if auto_bl:
+            diag["counts"]["auto_blacklist"] += 1
+            return None
+
+        streak_paused, streak_reason = journal.is_streak_paused()
+        if streak_paused:
+            diag["counts"]["streak_breaker"] += 1
+            return None
+
     # ── 7. Adaptive threshold (feed del TradeJournal) ──────────────────────
     adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
     effective_min   = C.MIN_SCORE + adaptive_offset

@@ -22,6 +22,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
+import telegram_client as tg
+
 log = logging.getLogger("journal")
 
 
@@ -58,8 +60,26 @@ class TradeJournal:
         self._open:   dict[str, TradeRecord] = {}   # symbol → TradeRecord abierto
         self._closed: list[TradeRecord]      = []   # trades cerrados (histórico)
         # Umbrales adaptativos
-        self._recent_wins:  list[bool]  = []        # últimas N (W/L)
+        self._recent_wins:  list[bool]  = []        # últimas N (W/L) — global
         self._adaptive_min_score: float = 0.0       # 0 = usar config, >0 = override
+
+        # ── Auto-blacklist por símbolo (aprendido de pérdidas reales) ────────────
+        # El caso SYN/ESPORTS demostró que el BLACKLIST manual siempre va un
+        # paso por detrás: hace falta perder dinero primero para añadir un
+        # símbolo. Esto detecta símbolos tóxicos automáticamente con datos
+        # propios, sin esperar a que alguien los añada a mano.
+        self._symbol_pnl:     dict[str, float] = {}   # PnL acumulado por símbolo
+        self._symbol_losses:  dict[str, int]   = {}   # pérdidas consecutivas por símbolo
+        self._auto_blacklist: dict[str, float] = {}   # symbol → timestamp de bloqueo
+
+        # ── Circuit breaker por racha de pérdidas (independiente del $ diario) ──
+        # El límite de pérdida diaria en USDT puede tardar en activarse si las
+        # pérdidas son pequeñas pero consecutivas — una racha de 5+ pérdidas
+        # seguidas suele indicar que el régimen de mercado actual no encaja
+        # con la estrategia, incluso si el total en USDT aún no es grande.
+        self._consecutive_losses: int   = 0
+        self._streak_pause_until: float = 0.0
+
         log.info("TradeJournal iniciado")
 
     # ── Apertura ──────────────────────────────────────────────────────────────
@@ -88,7 +108,14 @@ class TradeJournal:
 
     # ── Cierre ────────────────────────────────────────────────────────────────
 
-    def on_close(self, symbol: str, pnl: float, reason: str = ""):
+    # ── Configuración del auto-blacklist y circuit breaker de racha ─────────────
+    AUTO_BLACKLIST_MIN_TRADES   = 3      # mínimo de trades antes de evaluar un símbolo
+    AUTO_BLACKLIST_LOSS_STREAK  = 3      # 3 pérdidas consecutivas en el MISMO símbolo
+    AUTO_BLACKLIST_DURATION_S   = 86400  # 24h de bloqueo automático
+    STREAK_BREAKER_THRESHOLD    = 5      # 5 pérdidas consecutivas GLOBALES
+    STREAK_BREAKER_PAUSE_S      = 3600   # pausa 1h tras racha mala
+
+    async def on_close(self, symbol: str, pnl: float, reason: str = ""):
         rec = self._open.pop(symbol, None)
         if rec is None:
             return
@@ -103,10 +130,80 @@ class TradeJournal:
         if len(self._recent_wins) > 20:
             self._recent_wins.pop(0)
 
+        # ── Auto-blacklist por símbolo ────────────────────────────────────────
+        self._symbol_pnl[symbol] = self._symbol_pnl.get(symbol, 0.0) + pnl
+        if rec.won:
+            self._symbol_losses[symbol] = 0
+        else:
+            self._symbol_losses[symbol] = self._symbol_losses.get(symbol, 0) + 1
+            n_trades_symbol = sum(1 for t in self._closed if t.symbol == symbol)
+            if (n_trades_symbol >= self.AUTO_BLACKLIST_MIN_TRADES and
+                    self._symbol_losses[symbol] >= self.AUTO_BLACKLIST_LOSS_STREAK and
+                    symbol not in self._auto_blacklist):
+                self._auto_blacklist[symbol] = time.time()
+                log.warning(
+                    "[journal] 🚫 AUTO-BLACKLIST: %s — %d pérdidas consecutivas "
+                    "(PnL acumulado símbolo: %.4f) — bloqueado %dh",
+                    symbol, self._symbol_losses[symbol], self._symbol_pnl[symbol],
+                    self.AUTO_BLACKLIST_DURATION_S // 3600,
+                )
+                try:
+                    await tg.notify_auto_blacklist(
+                        symbol, self._symbol_losses[symbol], self._symbol_pnl[symbol],
+                        self.AUTO_BLACKLIST_DURATION_S // 3600,
+                    )
+                except Exception:
+                    pass
+
+        # ── Circuit breaker por racha de pérdidas GLOBAL ──────────────────────
+        if rec.won:
+            self._consecutive_losses = 0
+        else:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= self.STREAK_BREAKER_THRESHOLD:
+                already_paused = time.time() < self._streak_pause_until
+                self._streak_pause_until = time.time() + self.STREAK_BREAKER_PAUSE_S
+                log.warning(
+                    "[journal] ⏸️ STREAK BREAKER: %d pérdidas consecutivas — "
+                    "pausa de %dmin (independiente del límite $ diario)",
+                    self._consecutive_losses, self.STREAK_BREAKER_PAUSE_S // 60,
+                )
+                if not already_paused:
+                    try:
+                        await tg.notify_streak_breaker(
+                            self._consecutive_losses, self.STREAK_BREAKER_PAUSE_S // 60,
+                        )
+                    except Exception:
+                        pass
+
         # Recalcular umbral adaptativo
         self._recalculate_adaptive()
         log.info("[journal] cerrado: %s pnl=%.4f won=%s (total=%d)",
                  symbol, pnl, rec.won, len(self._closed))
+
+    def is_symbol_auto_blacklisted(self, symbol: str) -> tuple[bool, str]:
+        """
+        Chequea si un símbolo está auto-bloqueado por pérdidas consecutivas
+        recientes. Expira solo tras AUTO_BLACKLIST_DURATION_S — dale al
+        símbolo una segunda oportunidad cuando el régimen de mercado cambie.
+        """
+        ts = self._auto_blacklist.get(symbol)
+        if ts is None:
+            return False, ""
+        elapsed = time.time() - ts
+        if elapsed > self.AUTO_BLACKLIST_DURATION_S:
+            del self._auto_blacklist[symbol]
+            self._symbol_losses[symbol] = 0  # reset tras expirar
+            return False, ""
+        remaining_h = (self.AUTO_BLACKLIST_DURATION_S - elapsed) / 3600
+        return True, f"auto_blacklist({symbol}, {remaining_h:.1f}h restantes)"
+
+    def is_streak_paused(self) -> tuple[bool, str]:
+        """Chequea si el circuit breaker de racha global está activo."""
+        if time.time() < self._streak_pause_until:
+            remaining_min = (self._streak_pause_until - time.time()) / 60
+            return True, f"streak_breaker({self._consecutive_losses} pérdidas, {remaining_min:.0f}min restantes)"
+        return False, ""
 
     # ── Umbral adaptativo ─────────────────────────────────────────────────────
 

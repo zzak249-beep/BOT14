@@ -255,3 +255,23 @@ async def notify_regime_alert(
         f"Boost SHORT: `{short_boost:+.0f}` | Boost LONG: `{long_boost:+.0f}`"
     )
     await send(msg)
+
+
+async def notify_auto_blacklist(symbol: str, losses: int, pnl_acumulado: float, hours: int) -> None:
+    """Símbolo auto-bloqueado por pérdidas consecutivas reales."""
+    msg = (
+        f"🚫 *AUTO-BLACKLIST* — `{symbol}`\n"
+        f"{losses} pérdidas consecutivas | PnL acumulado: `{pnl_acumulado:+.4f}` USDT\n"
+        f"Bloqueado `{hours}h` — el sistema aprendió de esto solo, sin BLACKLIST manual"
+    )
+    await send(msg)
+
+
+async def notify_streak_breaker(consecutive_losses: int, pause_minutes: int) -> None:
+    """Circuit breaker de racha de pérdidas global activado."""
+    msg = (
+        f"⏸️ *STREAK BREAKER* activado\n"
+        f"{consecutive_losses} pérdidas consecutivas (sin importar el $ total)\n"
+        f"Pausa de `{pause_minutes}min` — el régimen actual no encaja con la estrategia"
+    )
+    await send(msg)
