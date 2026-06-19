@@ -21,6 +21,7 @@ import telegram_client as tg
 from copier_client import MasterClient
 from complement_engine import ComplementEngine
 from trade_journal import TradeJournal
+from ws_market_data import run_ws_client, ws_cache
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,6 +120,12 @@ async def lifespan(app: FastAPI):
     monitor_task    = asyncio.create_task(_run_monitor())
     complement_task = asyncio.create_task(_run_complement())
     log.info("Loops iniciados (scanner + monitor + complement)")
+
+    ws_task = None
+    if getattr(C, 'WS_ENABLED', False):
+        import scanner as _scanner_mod
+        ws_task = asyncio.create_task(run_ws_client(_scanner_mod.get_current_symbols, C.TIMEFRAME))
+        log.info("WS Market Data activado — streaming en tiempo real (WS_ENABLED=true)")
 
     yield
 
