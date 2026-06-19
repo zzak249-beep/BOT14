@@ -43,6 +43,7 @@ from indicators import analyze, Signal, score_to_tier
 from risk_manager import RiskManager
 from position_manager import PositionManager, OpenTrade
 from funding_regime import regime_engine, Regime, Window
+from volatility_regime import vol_engine, Regime as VolRegime
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
@@ -184,6 +185,27 @@ async def _process_symbol(
         diag["counts"][sig.reason or "no_direction"] += 1
         return None
 
+    # ── VOLATILITY REGIME — ajusta SL/TP según percentil de ATR propio ───────
+    vol_sig = vol_engine.update(symbol, sig.atr, sig.entry)
+    if getattr(C, 'VOL_REGIME_ENABLED', True):
+        if vol_sig.block_entry:
+            diag["counts"]["vol_extreme_block"] += 1
+            return None
+        if vol_sig.regime != VolRegime.NORMAL:
+            # Reescalar distancias SL/TP según régimen de volatilidad
+            sl_dist  = abs(sig.entry - sig.sl)  * vol_sig.sl_mult
+            tp1_dist = abs(sig.tp1   - sig.entry) * vol_sig.tp_mult
+            tp2_dist = abs(sig.tp2   - sig.entry) * vol_sig.tp_mult
+            if sig.direction == "LONG":
+                sig.sl  = sig.entry - sl_dist
+                sig.tp1 = sig.entry + tp1_dist
+                sig.tp2 = sig.entry + tp2_dist
+            else:
+                sig.sl  = sig.entry + sl_dist
+                sig.tp1 = sig.entry - tp1_dist
+                sig.tp2 = sig.entry - tp2_dist
+            diag["counts"][f"vol_{vol_sig.regime.lower()}"] += 1
+
     # Registrar score para diagnóstico
     diag["score_n"]   += 1
     diag["score_sum"] += sig.score
@@ -300,7 +322,7 @@ async def _process_symbol(
         log.warning("Balance=%.4f — usando CAPITAL=%.2f", balance, C.CAPITAL)
         balance = C.CAPITAL
 
-    qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier)
+    qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier, symbol=symbol)
     if qty <= 0:
         log.warning("[%s] qty=0, skip", symbol)
         return None

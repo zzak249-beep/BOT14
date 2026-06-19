@@ -21,6 +21,7 @@ import math
 from datetime import date
 
 import config as C
+from volatility_regime import vol_engine
 
 log = logging.getLogger("risk")
 
@@ -156,19 +157,34 @@ class RiskManager:
     # ── Kelly sizing con cap duro ─────────────────────────────────────────────
 
     def kelly_position_size(self, balance: float, entry: float,
-                             sl: float, score: float, tier: str) -> float:
+                             sl: float, score: float, tier: str,
+                             symbol: str = "") -> float:
         if entry <= 0 or sl <= 0 or abs(entry - sl) < 1e-12:
             return 0.0
 
         w = C.KELLY_WIN_RATE
         r = C.KELLY_RR
         kelly = max(0.0, (w * r - (1 - w)) / r) * C.KELLY_FRACTION
-        tier_mult = {"STD": 1.0, "FUEL": 1.2, "SUP": 1.5}.get(tier, 1.0)
+        tier_mult = {"STD": 1.0, "FUEL": 1.2, "SUP": 1.5, "HARVEST": 0.5}.get(tier, 1.0)
         kelly *= tier_mult
 
         risk_usdt = balance * (C.RISK_PCT / 100) * kelly
         sl_dist   = abs(entry - sl)
         qty       = (risk_usdt * C.LEVERAGE) / (sl_dist * entry) if sl_dist * entry > 0 else 0.0
+
+        # ── VOLATILITY TARGETING ─────────────────────────────────────────────
+        # Ajusta el size de forma inversa al régimen de volatilidad del símbolo:
+        # COMPRESSED (ATR% bajo relativo a su historia) → +15% size
+        # EXPANDED   (ATR% alto)                         → -30% size
+        # EXTREME    (ATR% muy alto, posible cascada)    → -60% size
+        vol_mult = 1.0
+        if symbol and getattr(C, 'VOL_REGIME_ENABLED', True):
+            vol_sig  = vol_engine.get_signal(symbol)
+            vol_mult = vol_sig.size_mult
+            if vol_mult != 1.0:
+                log.info("[sizing] %s vol_regime=%s mult=%.2f",
+                         symbol, vol_sig.regime, vol_mult)
+        qty *= vol_mult
 
         # ── CAP DURO ANTI-LIQUIDACIÓN ─────────────────────────────────────────
         # ILV -43%, ADA -52%, PI -35% → posiciones demasiado grandes
