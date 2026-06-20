@@ -1,11 +1,31 @@
 """
-QF×JP Bot v7.4 — Scanner COMPLETO
+QF×JP Bot v7.7 — Scanner COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
+FIX v7.7:
+  ✅ Cada señal acumula filter_tags{} con los filtros de confirmación que
+     dispararon (stc_asym, stc_vol_slope, price_action) y se pasa a
+     journal.on_open(). Permite a trade_journal.py v7.8 medir, con datos
+     reales, si cada filtro nuevo aporta win rate o solo añade ruido —
+     ver _filter_breakdown() en trade_journal.py.
+
+FIX v7.6:
+  ✅ Nuevo filtro opcional Price Action Framework (Large Bodies / Wicks
+     Into Levels / Grindy Staircase / Choppy Range) — ver
+     price_action_framework.py. Reutiliza k3m, sin llamada extra a la
+     API. Desactivado por defecto (PRICE_ACTION_ENABLED=False). Solo
+     para test en MODE=SIGNAL por ahora, no comprometido a ningún bot
+     en vivo todavía.
+
+FIX v7.5:
+  ✅ Nuevo filtro opcional STC + Asimetría de precio (1m) — ver
+     stc_asymmetry.py para el detalle completo y el aviso de que la
+     fórmula de asimetría está sin verificar contra el Pine real.
+     Desactivado por defecto (STC_ASYM_ENABLED=False).
+
 FIX v7.4:
   ✅ place_limit_entry() ahora recibe sl_price/tp1_price/tp2_price — son
      obligatorios desde bingx_client.py v7.7, que coloca SL+TP1+TP2 en
-     cuanto la entrada límite se llena (antes ese camino dejaba el trade
-     sin ninguna protección — ver bingx_client.py para el detalle completo).
+     cuanto la entrada límite se llena.
 
 NUEVO en v7.3 (todas las mejoras del roadmap de anticipación):
 
@@ -52,6 +72,8 @@ from funding_regime import regime_engine, Regime, Window
 from volatility_regime import vol_engine, Regime as VolRegime
 from edge_filters import candle_turn_boost, multi_tf_slope_alignment
 from btc_correlation import compute_correlation, btc_guard
+from stc_asymmetry import stc_asymmetry_filter, stc_volume_slope_filter
+from price_action_framework import price_action_filter
 from ws_market_data import ws_cache
 import telegram_client as tg
 
@@ -299,6 +321,10 @@ async def _process_symbol(
             log.debug("[%s] %s", symbol, ct_reason)
 
     # ── 5. Slope Multi-Timeframe — confluencia + anti-whipsaw ───────────────
+    # FIX v7.5: slope_adj/slope_block ahora con default (0.0, False) ANTES
+    # del if — el paso 5c (STC+Volumen+Slope) los necesita aunque
+    # SLOPE_FILTER_ENABLED esté desactivado, para no fallar con NameError.
+    slope_adj, slope_block = 0.0, False
     if getattr(C, 'SLOPE_FILTER_ENABLED', True):
         slope_adj, slope_reason, slope_block = multi_tf_slope_alignment(
             k15m, k1h, k4h, sig.direction
@@ -313,6 +339,111 @@ async def _process_symbol(
             diag["counts"][f"slope_adj_{slope_adj:+.0f}"] += 1
             if slope_adj >= 10:
                 log.info("[%s] 📈 %s → score=%.1f", symbol, slope_reason, sig.score)
+
+    # ── FIX v7.7: acumula qué filtros de confirmación dispararon esta señal
+    # — se pasa al journal en on_open() para medir después si cada filtro
+    # nuevo aporta de verdad (ver trade_journal.py v7.8, _filter_breakdown).
+    filter_tags: dict = {}
+
+    # ── 5b. STC + Asimetría de precio (1m) — confirmación de giro ───────────
+    # FIX v7.5: filtro nuevo, desactivado por defecto. Ver stc_asymmetry.py
+    # para el aviso completo sobre la fórmula de asimetría sin verificar
+    # contra el Pine real ("QF×JP v3.6 PREDATOR"). Activar solo después de
+    # confirmar en logs que el ratio calculado coincide con el panel.
+    if getattr(C, 'STC_ASYM_ENABLED', False):
+        try:
+            k1m = await client.get_klines(symbol, "1m", 100)
+        except Exception as e:
+            k1m = []
+            log.debug("[%s] k1m fetch error: %s", symbol, e)
+        if len(k1m) >= 60:
+            stc_boost, stc_reason, stc_block = stc_asymmetry_filter(
+                k1m, sig.direction,
+                stc_length=getattr(C, 'STC_LENGTH', 10),
+                stc_fast=getattr(C, 'STC_FAST', 23),
+                stc_slow=getattr(C, 'STC_SLOW', 50),
+                stc_factor=getattr(C, 'STC_FACTOR', 0.5),
+                stc_oversold=getattr(C, 'STC_OVERSOLD', 25.0),
+                stc_overbought=getattr(C, 'STC_OVERBOUGHT', 75.0),
+                asym_window=getattr(C, 'ASYM_WINDOW', 20),
+                asym_veto_threshold=getattr(C, 'ASYM_VETO_THRESHOLD', 1.5),
+                asym_boost_per_x=getattr(C, 'ASYM_BOOST_PER_X', 3.0),
+                asym_boost_max=getattr(C, 'ASYM_BOOST_MAX', 12.0),
+            )
+            if stc_block:
+                log.info("[%s] 🚫 STC/Asimetría veto: %s", symbol, stc_reason)
+                diag["counts"]["stc_asym_veto"] += 1
+                return None
+            if stc_boost > 0:
+                sig.score = min(sig.score + stc_boost, 100.0)
+                sig.tier  = score_to_tier(sig.score)
+                diag["counts"]["stc_asym_boost"] += 1
+                filter_tags["stc_asym"] = stc_reason
+                log.info("[%s] 🌀 %s", symbol, stc_reason)
+
+    # ── 5c. STC + Volumen + Slope (1m) — confirmación alternativa ───────────
+    # FIX v7.5: alternativa a 5b sin ninguna fórmula adivinada — volumen es
+    # directo del kline, slope reutiliza multi_tf_slope_alignment ya
+    # calculado arriba (no se duplica el cálculo). Desactivado por defecto,
+    # independiente de STC_ASYM_ENABLED — puedes activar este, el otro, o
+    # ninguno.
+    if getattr(C, 'STC_VOL_SLOPE_ENABLED', False):
+        try:
+            k1m_vs = await client.get_klines(symbol, "1m", 100)
+        except Exception as e:
+            k1m_vs = []
+            log.debug("[%s] k1m (vol/slope) fetch error: %s", symbol, e)
+        if len(k1m_vs) >= 60:
+            vs_boost, vs_reason, vs_block = stc_volume_slope_filter(
+                k1m_vs, sig.direction,
+                slope_adj=slope_adj, slope_block=slope_block,
+                stc_length=getattr(C, 'STC_LENGTH', 10),
+                stc_fast=getattr(C, 'STC_FAST', 23),
+                stc_slow=getattr(C, 'STC_SLOW', 50),
+                stc_factor=getattr(C, 'STC_FACTOR', 0.5),
+                stc_oversold=getattr(C, 'STC_OVERSOLD', 25.0),
+                stc_overbought=getattr(C, 'STC_OVERBOUGHT', 75.0),
+                vol_window=getattr(C, 'STC_VOL_WINDOW', 20),
+                vol_recent_n=getattr(C, 'STC_VOL_RECENT_N', 3),
+                vol_min_ratio=getattr(C, 'STC_VOL_MIN_RATIO', 1.3),
+                vol_boost_max=getattr(C, 'STC_VOL_BOOST_MAX', 8.0),
+                slope_boost_mult=getattr(C, 'STC_SLOPE_BOOST_MULT', 0.5),
+            )
+            if vs_block:
+                log.info("[%s] 🚫 STC/Vol/Slope veto: %s", symbol, vs_reason)
+                diag["counts"]["stc_vol_slope_veto"] += 1
+                return None
+            if vs_boost > 0:
+                sig.score = min(sig.score + vs_boost, 100.0)
+                sig.tier  = score_to_tier(sig.score)
+                diag["counts"]["stc_vol_slope_boost"] += 1
+                filter_tags["stc_vol_slope"] = vs_reason
+                log.info("[%s] 🌀 %s", symbol, vs_reason)
+
+    # ── 5d. Price Action Framework (Zero Complexity Trading) ────────────────
+    # NUEVO — solo para test en MODE=SIGNAL, no comprometido a ningún bot
+    # en vivo todavía. Reutiliza k3m (ya fetcheado), sin llamada extra a la
+    # API. Ver price_action_framework.py para el detalle de los 4 patrones.
+    if getattr(C, 'PRICE_ACTION_ENABLED', False):
+        pa_boost, pa_reason, pa_block = price_action_filter(
+            k3m, sig.direction,
+            lookback=getattr(C, 'PA_LOOKBACK', 20),
+            body_mult=getattr(C, 'PA_BODY_MULT', 2.0),
+            wick_mult=getattr(C, 'PA_WICK_MULT', 1.5),
+            touch_tol_pct=getattr(C, 'PA_TOUCH_TOL_PCT', 0.1),
+            min_touches=getattr(C, 'PA_MIN_TOUCHES', 3),
+            boost_amount=getattr(C, 'PA_BOOST_AMOUNT', 6.0),
+        )
+        if pa_block:
+            log.info("[%s] 🚫 Price Action veto: %s", symbol, pa_reason)
+            diag["counts"]["price_action_veto"] += 1
+            return None
+        if pa_boost > 0:
+            sig.score = min(sig.score + pa_boost, 100.0)
+            sig.tier  = score_to_tier(sig.score)
+            diag["counts"]["price_action_boost"] += 1
+            filter_tags["price_action"] = pa_reason
+            log.info("[%s] 📐 %s", symbol, pa_reason)
 
     # ── 6. BTC Correlation Guard se evalúa DENTRO del bloque LIVE (más abajo)
     # — moverlo aquí causaba fuga de reserva si MODE=SIGNAL o si score/tier
@@ -437,10 +568,9 @@ async def _process_symbol(
         entry_resp = {}
         used_limit = False
         if getattr(C, 'LIMIT_ORDERS_ENABLED', False):
-            # FIX v7.4: ahora se pasan sl_price/tp1_price/tp2_price — desde
-            # bingx_client.py v7.7, place_limit_entry() los EXIGE para poder
-            # colocar la protección en cuanto la entrada se llena. Antes
-            # esta llamada no los pasaba y el trade abría sin SL ni TP.
+            # FIX v7.4: se pasan sl_price/tp1_price/tp2_price — desde
+            # bingx_client.py v7.7+, place_limit_entry() los EXIGE para
+            # poder colocar la protección en cuanto la entrada se llena.
             lmt_resp = await client.place_limit_entry(
                 symbol, sig.direction, qty, sig.entry,
                 sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
@@ -489,6 +619,7 @@ async def _process_symbol(
                 symbol=symbol, direction=sig.direction, tier=sig.tier,
                 score=sig.score, fr=fr, obi=obi, oi_delta=oi_delta,
                 htf_score=sig.htf_score, adx=sig.adx,
+                filter_tags=filter_tags,
             )
 
         return sig
@@ -662,7 +793,7 @@ def get_current_symbols() -> list[str]:
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
-    log.info("Scanner v7.4 | Modo=%s | Interval=%ds | Batch=20",
+    log.info("Scanner v7.7 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
