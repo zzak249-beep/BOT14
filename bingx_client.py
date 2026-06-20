@@ -1,48 +1,44 @@
 """
-QF×JP Bot v7.8 — BingX Client DEFINITIVO (TP1 límite/maker + fallback)
+QF×JP Bot v7.9 — BingX Client DEFINITIVO (FIX crítico get_open_positions)
 ═══════════════════════════════════════════════════════════════════════════════
-FIX v7.8 — TP1 como orden límite para pagar maker (0.02%) en vez de taker (0.05%):
+FIX v7.9 — get_open_positions() ya NO devuelve [] en silencio ante un error:
 
-  Contexto: con BREAKEVEN_ATR_MULT=1.0 y TP1_ATR_MULT=2.0 (default viejo),
-  el trailing se activa ANTES de que el precio llegue a TP1 — así que TP1
-  casi nunca disparaba. Para que sirva de algo (parte del ahorro de fee
-  Y toma de beneficio parcial real), TP1_ATR_MULT debe configurarse por
-  DEBAJO de BREAKEVEN_ATR_MULT (recomendado: TP1_ATR_MULT=0.6) — esto se
-  cambia en config.py / Railway, no en este archivo.
+  ANTES: si BingX respondía con un código de error (firma rechazada,
+  rate limit 100410, lo que sea), get_open_positions() solo logueaba y
+  devolvía [] — INDISTINGUIBLE de "de verdad no hay posiciones abiertas".
 
-  Con eso resuelto, este fix ataca la otra mitad: TP1 se colocaba como
-  TAKE_PROFIT_MARKET (taker, 0.05%) aunque BingX sí soporta la variante
-  límite TAKE_PROFIT (maker, 0.02%) — confirmado en la documentación de
-  su API (issue #28 del repo BingX-API/BingX-swap-api-doc: "Only supports
-  type: TAKE_PROFIT_MARKET/TAKE_PROFIT").
+  position_manager._check_all_positions() compara el tracker interno del
+  bot contra el resultado de esta función para detectar cierres externos
+  (SL/TP disparado por BingX). Si la lista venía vacía por un error
+  transitorio en vez de por la realidad, TODAS las posiciones trackeadas
+  se interpretaban como "cerradas externamente" de golpe en ese ciclo:
+  se sacaban del tracking, se mandaba notificación de cierre con un PnL
+  que no era el real (calculado contra el último ticker, no el precio de
+  cierre real), y open_count se reseteaba a 0 — liberando cupo de
+  MAX_OPEN_TRADES que en realidad seguía ocupado por posiciones que
+  SEGUÍAN abiertas en BingX con su SL/TP real intactos, simplemente sin
+  que el bot las vigilara más. Visto en producción: error 100410 repetido
+  en renewed-love y joyful-art.
 
-  open_trade() y place_limit_entry() ahora intentan TP1 como TAKE_PROFIT
-  (límite) primero, con un precio de ejecución ligeramente favorable para
-  garantizar maker (mismo principio de offset que ya usa place_limit_entry
-  para la entrada, pero en el lado contrario porque el cierre es la
-  dirección opuesta — ver _tp_limit_price()).
+  FIX: ahora LANZA excepción en vez de devolver []. Los 3 callers de esta
+  función (_check_all_positions, get_unrealized_pnl, _get_real_position_side
+  en position_manager.py) YA tenían try/except esperando justo esto —
+  con este cambio, un fallo de API hace que cada uno tome su fallback
+  seguro (saltar el ciclo, devolver 0.0 de PnL no realizado, o asumir la
+  dirección conocida) en vez de interpretar el error como "cero posiciones".
 
-  ⚠️ NO CONFIRMADO AL 100%: el nombre exacto del parámetro que BingX espera
-  para el precio de ejecución de un TAKE_PROFIT límite. Se asume "price"
-  (convención estilo Binance que el resto de este cliente ya sigue:
-  positionSide, workingType, priceProtect son todos nomenclatura Binance).
-  Por eso TP1 tiene FALLBACK AUTOMÁTICO: si la variante límite falla
-  (código != 0, lo que pasaría si el parámetro fuera incorrecto), se
-  reintenta inmediatamente como TAKE_PROFIT_MARKET (el comportamiento
-  de siempre, garantizado que funciona). En el peor caso se pierde el
-  ahorro de fee en esa pierna — nunca se queda el trade sin TP1.
-  Recomendado: vigilar los primeros TP1 tras desplegar esto y confirmar
-  en logs si entran como "límite/maker" o caen al fallback.
+  De regalo: caché de 3s. Cada símbolo que llega a la fase LIVE del
+  scanner llama a get_unrealized_pnl() → get_open_positions() — con
+  varias señales calificadas por iteración, eso eran varias llamadas casi
+  simultáneas al mismo endpoint en cada ráfaga de asyncio.gather. Ahora
+  comparten una sola consulta real cada 3 segundos, reduciendo la presión
+  sobre el rate limit que causaba el 100410 en primer lugar. El error
+  también se cachea (y se re-lanza) durante la ventana, para no martillar
+  la API mientras el rate limit sigue activo.
 
-  SL y TP2 NO se tocan — siguen en *_MARKET (taker). SL por seguridad
-  (un límite puede no ejecutarse si el precio salta, dejando la posición
-  sin protección real — justo lo que esta sesión entera evitó). TP2 sigue
-  efectivamente inalcanzable mientras BREAKEVEN_ATR_MULT < TP2_ATR_MULT
-  (el trailing lo cancela primero), así que cambiarle el tipo no aporta.
-
-DE v7.7 (features que se conservan):
-  ✅ place_limit_entry() coloca SL+TP1+TP2 al confirmar el fill (fix de la
-     posición desnuda en entrada límite)
+DE v7.8 (features que se conservan):
+  ✅ TP1 como TAKE_PROFIT límite (maker) con fallback automático a market
+  ✅ place_limit_entry() coloca SL+TP1+TP2 al confirmar el fill
   ✅ Firma byte-a-byte (URL completa pre-construida, sin params= en aiohttp)
   ✅ .strip() en API key y secret
   ✅ _get_real_position_side() — Hedge/One-Way auto-detección
@@ -50,7 +46,6 @@ DE v7.7 (features que se conservan):
   ✅ _safe_qty_for_sl()
   ✅ Retry HTTP 3 intentos con backoff exponencial
   ✅ cancel_order / cancel_all_orders con DELETE (no POST)
-  ✅ get_balance()/get_open_positions() revisan data["code"] antes de extraer
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -73,7 +68,10 @@ class BingXClient:
         self._precision_map:  dict[str, int]   = {}
         self._min_qty_map:    dict[str, float] = {}
         self._step_map:       dict[str, float] = {}
-        log.info("BingXClient v7.8 — firma byte-a-byte + SL/TP en límite + TP1 maker")
+        # FIX v7.9: caché corta de get_open_positions() — ver docstring del módulo.
+        self._positions_cache: tuple = (0.0, [])
+        self._POSITIONS_CACHE_TTL = 3.0
+        log.info("BingXClient v7.9 — firma byte-a-byte + SL/TP en límite + TP1 maker + fix get_open_positions")
         # Diagnóstico seguro: longitud de claves, NUNCA el valor real.
         log.info("[auth] API_KEY len=%d | SECRET_KEY len=%d",
                   len(C.BINGX_API_KEY), len(C.BINGX_SECRET_KEY))
@@ -410,19 +408,50 @@ class BingXClient:
         return 0.0
 
     async def get_open_positions(self) -> list:
-        """FIX v7.6: mismo chequeo de código que get_balance() — ver ahí."""
+        """
+        FIX v7.9 — CRÍTICO: ya NO devuelve [] en silencio si BingX responde
+        con error (firma rechazada, rate limit, lo que sea). Antes eso era
+        indistinguible de "de verdad no hay posiciones", y
+        _check_all_positions() en position_manager.py interpretaba un
+        fallo transitorio de la API como "todas las posiciones se cerraron
+        externamente" — las sacaba del tracking, notificaba cierres falsos,
+        y liberaba cupo de MAX_OPEN_TRADES que en realidad seguía ocupado.
+
+        Ahora LANZA excepción en error — los 3 callers (_check_all_positions,
+        get_unrealized_pnl, _get_real_position_side) ya tienen try/except
+        preparados para esto, así que con este cambio caen en su fallback
+        seguro (saltar el ciclo) en vez de asumir "cero posiciones".
+
+        Caché de 3s (éxito Y error se cachean, ver docstring del módulo) —
+        colapsa ráfagas de llamadas casi simultáneas del mismo ciclo de
+        scan en una sola consulta real, reduciendo la presión que causaba
+        el rate limit en primer lugar.
+        """
+        now = time.time()
+        cache_ts, cache_val = self._positions_cache
+        if now - cache_ts < self._POSITIONS_CACHE_TTL:
+            if isinstance(cache_val, Exception):
+                raise cache_val
+            return cache_val
+
         data = await self._get("/openApi/swap/v2/user/positions")
 
         code = data.get("code", 0)
         if code not in (0, None):
+            msg = data.get("msg", "")
             log.error("[auth] get_open_positions código=%s msg=%s — firma/permiso rechazado por BingX",
-                      code, data.get("msg", ""))
-            return []
+                      code, msg)
+            err = RuntimeError(f"get_open_positions falló: code={code} msg={msg}")
+            self._positions_cache = (now, err)
+            raise err
 
         pos = data.get("data", [])
-        if not isinstance(pos, list):
-            return []
-        return [p for p in pos if float(p.get("positionAmt", 0) or 0) != 0]
+        result = (
+            [p for p in pos if float(p.get("positionAmt", 0) or 0) != 0]
+            if isinstance(pos, list) else []
+        )
+        self._positions_cache = (now, result)
+        return result
 
     async def get_open_orders(self, symbol: str) -> list:
         data = await self._get("/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
@@ -466,8 +495,9 @@ class BingXClient:
         del precio de disparo (stopPrice). Se asume que el campo se llama
         "price" (convención Binance-style que el resto de esta API sigue:
         positionSide, workingType, priceProtect). NO confirmado al 100%
-        contra la doc oficial — ver _tp_limit_price() y el fallback
-        automático en open_trade()/place_limit_entry().
+        contra la doc oficial — ver _tp_limit_price() en stc... (en
+        scanner-side) y el fallback automático en open_trade()/
+        place_limit_entry().
         """
         qty     = self._round_qty(symbol, quantity)
         real_ps = await self._get_real_position_side(symbol, direction)
@@ -680,9 +710,7 @@ class BingXClient:
         este camino dejaba el trade sin ninguna protección.
 
         FIX v7.8: TP1 se intenta como TAKE_PROFIT límite (maker) con
-        fallback automático a TAKE_PROFIT_MARKET — mismo mecanismo que
-        open_trade(), ver _tp_limit_price() y el aviso en la cabecera del
-        módulo sobre el parámetro "price" no confirmado al 100%.
+        fallback automático a TAKE_PROFIT_MARKET.
         """
         qty_r     = self._round_qty(symbol, qty)
         side_open = "BUY" if direction == "LONG" else "SELL"
@@ -816,11 +844,10 @@ def _tp_limit_price(trigger_price: float, direction: str, prec: int) -> float:
       - SHORT cierra con BUY  → limit ligeramente POR DEBAJO del trigger
               (igual que una entrada LONG: -0.05%).
 
-    NO CONFIRMADO AL 100% contra la doc oficial de BingX — ver aviso en
-    la cabecera del módulo. Con el fallback automático en open_trade() y
-    place_limit_entry(), un precio mal calculado en el peor caso causa
-    que la orden límite no se acepte (BingX la rechaza) y se cae a
-    TAKE_PROFIT_MARKET — no deja el trade sin TP1.
+    NO CONFIRMADO AL 100% contra la doc oficial de BingX. Con el fallback
+    automático en open_trade() y place_limit_entry(), un precio mal
+    calculado en el peor caso causa que la orden límite no se acepte y se
+    cae a TAKE_PROFIT_MARKET — no deja el trade sin TP1.
     """
     if direction == "LONG":
         return round(trigger_price * 1.0005, prec + 2)
