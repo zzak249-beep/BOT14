@@ -1,6 +1,12 @@
 """
-QF×JP Bot v7.3 — Scanner COMPLETO
+QF×JP Bot v7.4 — Scanner COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
+FIX v7.4:
+  ✅ place_limit_entry() ahora recibe sl_price/tp1_price/tp2_price — son
+     obligatorios desde bingx_client.py v7.7, que coloca SL+TP1+TP2 en
+     cuanto la entrada límite se llena (antes ese camino dejaba el trade
+     sin ninguna protección — ver bingx_client.py para el detalle completo).
+
 NUEVO en v7.3 (todas las mejoras del roadmap de anticipación):
 
   1. SESSION FILTER — evita operar en horas de bajo volumen (00:00-08:00 UTC)
@@ -431,8 +437,13 @@ async def _process_symbol(
         entry_resp = {}
         used_limit = False
         if getattr(C, 'LIMIT_ORDERS_ENABLED', False):
+            # FIX v7.4: ahora se pasan sl_price/tp1_price/tp2_price — desde
+            # bingx_client.py v7.7, place_limit_entry() los EXIGE para poder
+            # colocar la protección en cuanto la entrada se llena. Antes
+            # esta llamada no los pasaba y el trade abría sin SL ni TP.
             lmt_resp = await client.place_limit_entry(
                 symbol, sig.direction, qty, sig.entry,
+                sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
                 timeout_s=getattr(C, 'LIMIT_TIMEOUT_SECS', 15),
             )
             if lmt_resp.get("code", -1) == 0:
@@ -651,7 +662,7 @@ def get_current_symbols() -> list[str]:
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
-    log.info("Scanner v7.3 | Modo=%s | Interval=%ds | Batch=20",
+    log.info("Scanner v7.4 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0

@@ -1,26 +1,31 @@
 """
-QF×JP Bot v7.6 — BingX Client DEFINITIVO (fix firma byte-a-byte)
+QF×JP Bot v7.7 — BingX Client DEFINITIVO (fix SL/TP en entrada límite)
 ═══════════════════════════════════════════════════════════════════════════════
-FIX v7.6 — causa real del 100001 "Signature mismatch" que persistía en v7.5:
+FIX v7.7 — place_limit_entry() dejaba el trade SIN SL NI TP:
 
-  v7.5 firmaba con:
-      qs  = urlencode(sorted(params.items()))
-      sig = hmac.new(secret, qs.encode(), sha256).hexdigest()
-  ... pero luego enviaba la petición con `session.get(url, params=p)`,
-  dejando que aiohttp/yarl reconstruyera el query string POR SU CUENTA a
-  partir del dict `p`. aiohttp serializa por orden de inserción del dict
-  (no alfabético) y con sus propias reglas de encoding — NO garantizado
-  idéntico byte a byte a `urlencode(sorted(...))`. BingX exige que la
-  cadena firmada y la cadena realmente transmitida sean EXACTAMENTE la
-  misma; cualquier diferencia de orden o encoding rompe la firma aunque
-  el secret sea 100% correcto. Por eso .strip() y regenerar la clave no
-  arreglaba nada: el secret nunca fue el problema.
+  ANTES: place_limit_entry() colocaba la orden LIMIT de entrada, esperaba
+  el fill por polling, y si se llenaba devolvía el resp de la entrada tal
+  cual — SIN colocar ninguna orden de protección. El caller en scanner.py
+  solo llama a open_trade() (que sí coloca SL/TP1/TP2) cuando la entrada
+  límite NO se usó o falló — es decir, en el camino NORMAL (LIMIT_ORDERS_
+  ENABLED=True, que es el default, y la entrada se llena, que es el caso
+  más común), el trade abría 100% desprotegido desde el segundo cero.
+  Quedaba a merced del trailing stop (que solo se activa si el precio se
+  mueve a favor primero) o del time stop (hasta MAX_HOLD_MINUTES sin
+  ninguna protección real). Casos confirmados: HYPE-USDT -20.47% sin SL,
+  BSB-USDT, WLD-USDT, entre otros con cero o media protección.
 
-  FIX: se construye la URL completa (incluyendo "&signature=...") UNA
-  sola vez, y esa URL exacta es la que se pasa a aiohttp — sin ningún
-  parámetro params= adicional que pueda volver a serializar nada.
+  FIX: tras confirmar el fill (ya no aparece en open_orders), coloca
+  SL + TP1 + TP2 en paralelo — exactamente la misma lógica que open_trade()
+  usa después de su entrada MARKET (mismo split de qty para TP1/TP2, mismo
+  fallback de qty segura si el SL es rechazado). place_limit_entry() ahora
+  EXIGE sl_price/tp1_price/tp2_price como parámetros — ya no es posible
+  llamarla sin pasarlos, así una futura llamada que se olvide de esto
+  falla ruidosamente (TypeError) en vez de abrir una posición desnuda en
+  silencio.
 
-DE v7.5 (features que se conservan):
+DE v7.6 (features que se conservan):
+  ✅ Firma byte-a-byte (URL completa pre-construida, sin params= en aiohttp)
   ✅ .strip() en API key y secret (config.py ya lo aplica también)
   ✅ _get_real_position_side() — Hedge/One-Way auto-detección
   ✅ _extract_executed_qty() — qty real de BingX (fix error 110424)
@@ -29,12 +34,7 @@ DE v7.5 (features que se conservan):
   ✅ Retry HTTP 3 intentos con backoff exponencial
   ✅ cancel_order / cancel_all_orders con DELETE (no POST)
   ✅ Sin closePosition=true (fix error 10940)
-
-FIX v6.4 reincorporado (visibilidad de errores):
-  ✅ get_balance() y get_open_positions() ahora revisan data["code"]
-     ANTES de extraer — un error de firma/permiso llega como HTTP 200
-     + {'code': 100001}, y antes se traducía en silencio a "balance=0"
-     o "0 posiciones" sin ningún log de error visible.
+  ✅ get_balance()/get_open_positions() revisan data["code"] antes de extraer
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -57,7 +57,7 @@ class BingXClient:
         self._precision_map:  dict[str, int]   = {}
         self._min_qty_map:    dict[str, float] = {}
         self._step_map:       dict[str, float] = {}
-        log.info("BingXClient v7.6 — firma byte-a-byte (fix double-serialización)")
+        log.info("BingXClient v7.7 — firma byte-a-byte + SL/TP en entrada límite")
         # Diagnóstico seguro: longitud de claves, NUNCA el valor real.
         log.info("[auth] API_KEY len=%d | SECRET_KEY len=%d",
                   len(C.BINGX_API_KEY), len(C.BINGX_SECRET_KEY))
@@ -607,6 +607,9 @@ class BingXClient:
         direction:  str,
         qty:        float,
         price:      float,
+        sl_price:   float,
+        tp1_price:  float,
+        tp2_price:  float,
         timeout_s:  int = 25,
     ) -> dict:
         """
@@ -616,11 +619,23 @@ class BingXClient:
           LONG:  price * 0.9995 (0.05% bajo el mark) → añade liquidez = MAKER
           SHORT: price * 1.0005 (0.05% sobre el mark) → añade liquidez = MAKER
 
-        Si no se llena en timeout_s cancela y devuelve {} para fallback a market.
-        Con mercados en tendencia se llena en 2-5 segundos.
+        Si no se llena en timeout_s cancela y devuelve {} para fallback a
+        market (open_trade(), que sí coloca SL/TP).
+
+        FIX v7.7: ANTES, si la entrada límite se llenaba, esta función
+        devolvía el resp de la entrada sin más — sin colocar SL ni TP.
+        Como esta es la rama que se usa siempre que el mercado coopera
+        (la mayoría de las veces), los trades abrían 100% desprotegidos.
+        Ahora, tras confirmar el fill, coloca SL + TP1 + TP2 en paralelo
+        — misma lógica que open_trade() usa tras su entrada MARKET (mismo
+        split de qty, mismo fallback de qty segura si el SL es rechazado).
+        sl_price/tp1_price/tp2_price son ahora obligatorios — si alguna
+        llamada futura se olvida de pasarlos, falla con TypeError en vez
+        de abrir una posición desnuda en silencio.
         """
         qty_r     = self._round_qty(symbol, qty)
         side_open = "BUY" if direction == "LONG" else "SELL"
+        side_cls  = "SELL" if direction == "LONG" else "BUY"
         prec      = max(self._precision_map.get(symbol, 4), 2)
 
         # Precio ligeramente mejor que el mark → garantiza maker
@@ -655,6 +670,7 @@ class BingXClient:
                  symbol, lmt_price, timeout_s)
 
         # Polling hasta timeout
+        filled   = False
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             await asyncio.sleep(3)
@@ -662,15 +678,57 @@ class BingXClient:
                 orders = await self.get_open_orders(symbol)
                 still_open = any(str(o.get("orderId")) == order_id for o in orders)
                 if not still_open:
-                    log.info("[%s] ✅ Limit LLENA — fee maker 0.02%%", symbol)
-                    return resp
+                    filled = True
+                    break
             except Exception:
                 pass
 
-        # Timeout — cancelar y fallback a market
-        try:
-            await self.cancel_order(symbol, order_id)
-            log.info("[%s] Limit timeout (%ds) — cancelada → market order", symbol, timeout_s)
-        except Exception as e:
-            log.debug("[%s] cancel limit: %s", symbol, e)
-        return {}   # vacío = caller usa market
+        if not filled:
+            # Timeout — cancelar y fallback a market (open_trade() sí coloca SL/TP)
+            try:
+                await self.cancel_order(symbol, order_id)
+                log.info("[%s] Limit timeout (%ds) — cancelada → market order", symbol, timeout_s)
+            except Exception as e:
+                log.debug("[%s] cancel limit: %s", symbol, e)
+            return {}   # vacío = caller usa market
+
+        log.info("[%s] ✅ Limit LLENA — fee maker 0.02%% — colocando SL/TP1/TP2", symbol)
+
+        # ── FIX v7.7: colocar protección — antes este camino terminaba aquí
+        # sin SL ni TP. Pequeño margen para que BingX refleje la posición
+        # antes de mandar las órdenes condicionales (mismo patrón que
+        # open_trade() usa con su sleep de 1.2s post-entrada).
+        await asyncio.sleep(0.5)
+
+        step = self._step_map.get(symbol, 0)
+        prc  = max(0, round(-math.log10(step))) if step > 0 else self._precision_map.get(symbol, 4)
+        f    = 10 ** prc
+        qty_half   = math.floor(qty_r / 2 * f) / f
+        qty_remain = math.floor((qty_r - qty_half) * f) / f
+
+        sl_r, tp1_r, tp2_r = await asyncio.gather(
+            self.place_stop_market_order(symbol, side_cls, qty_r,      sl_price,  direction, "STOP_MARKET"),
+            self.place_stop_market_order(symbol, side_cls, qty_half,   tp1_price, direction, "TAKE_PROFIT_MARKET"),
+            self.place_stop_market_order(symbol, side_cls, qty_remain, tp2_price, direction, "TAKE_PROFIT_MARKET"),
+            return_exceptions=True,
+        )
+
+        protection = {}
+        for label, r, p in [("sl", sl_r, sl_price), ("tp1", tp1_r, tp1_price), ("tp2", tp2_r, tp2_price)]:
+            pr = r if isinstance(r, dict) else {"code": -1, "msg": str(r)}
+            protection[label] = pr
+            if pr.get("code", -1) == 0:
+                log.info("[%s] %s OK @ %.6f (limit path)", symbol, label.upper(), p)
+            else:
+                log.error("[%s] %s FALLIDO (limit path): %s", symbol, label.upper(), pr)
+                if label == "sl":
+                    qty_safe = self._safe_qty_for_sl(symbol, qty_r)
+                    if qty_safe != qty_r:
+                        pr2 = await self.place_stop_market_order(
+                            symbol, side_cls, qty_safe, sl_price, direction, "STOP_MARKET")
+                        protection["sl"] = pr2
+                        if pr2.get("code", -1) == 0:
+                            log.info("[%s] SL OK (retry, limit path) @ %.6f", symbol, sl_price)
+
+        resp.update(protection)
+        return resp

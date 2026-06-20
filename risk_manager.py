@@ -1,6 +1,20 @@
 """
-QF×JP Bot v7.9 — Risk Manager COMPLETO
+QF×JP Bot v7.10 — Risk Manager COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
+NUEVO en v7.10:
+  ✅ MIN_NOTIONAL_USDT ya NO descarta la señal cuando el sizing por riesgo
+     calcula un notional por debajo del mínimo — en vez de eso, SUBE el
+     tamaño hasta el mínimo. Con RISK_PCT=0.5% y KELLY_FRACTION=0.15, el
+     risk_usdt por trade suele ser de pocos céntimos (ej. balance=200 →
+     risk_usdt≈0.045-0.06 USDT en tier FUEL), lo que para la mayoría de
+     símbolos calculaba un notional de 2-4 USDT — por debajo incluso del
+     antiguo mínimo de 3 USDT, así que muchas señales que pasaban TODOS
+     los filtros del scanner se descartaban igualmente aquí, en silencio,
+     sin ningún log visible salvo "skip (fees dominarían)". Pedido
+     explícito: con ~200 USDT por cuenta, trades de mínimo 10 USDT.
+     MIN_NOTIONAL_USDT pasa a usarse como SUELO que se fuerza, no como
+     umbral de descarte. Sigue respetando el cap duro MAX_NOTIONAL_USDT.
+
 NUEVO en v7.9:
   ✅ RACE CONDITION "max_open_trades(6/5)" — _open_count tenía DOS escritores
      sin coordinar: can_trade() lo incrementaba de forma "atómica" al
@@ -31,7 +45,6 @@ NUEVO en v7.7:
 
 SIN CAMBIOS vs v7.1:
   ✅ daily_loss_limit incluye PnL no realizado (unrealized_pnl)
-  ✅ Notional cap duro MAX_NOTIONAL_USDT
   ✅ Cooldown 2h por símbolo tras pérdida
   ✅ open_count sincronizado solo desde BingX real (solo posiciones propias)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -104,7 +117,7 @@ class RiskManager:
         de BingX, y si corría justo tras la reserva pero antes de que el
         trade terminara de registrarse, borraba la reserva — permitiendo
         de nuevo superar MAX_OPEN_TRADES (caso real: "max_open_trades(6/5)").
-        Fix: el check y la reserva ahora usan _open_count + 
+        Fix: el check y la reserva ahora usan _open_count +
         _pending_reservations. update_open_count() solo toca _open_count
         (la parte "confirmada" desde BingX real), nunca _pending_reservations
         (la parte "reservada, esperando confirmación") — así ya no puede
@@ -334,17 +347,27 @@ class RiskManager:
             qty = cap / entry
             notional = cap
 
-        # ── PISO MÍNIMO DE NOTIONAL ────────────────────────────────────────────
-        # Con la fórmula corregida, símbolos caros + riesgo conservador pueden
-        # seguir dando posiciones diminutas donde las comisiones (0.02-0.05%
-        # por lado) se comen una fracción enorme del edge real. Si el notional
-        # calculado no llega al mínimo configurado, NO merece la pena abrir
-        # — mejor saltarse la señal que pagar fees por una posición simbólica.
-        min_notional = getattr(C, 'MIN_NOTIONAL_USDT', 5.0)
+        # ── SUELO MÍNIMO DE NOTIONAL — FIX v7.10 ──────────────────────────────
+        # ANTES: si el notional calculado por riesgo caía por debajo del
+        # mínimo, la señal se DESCARTABA (return 0.0) — con RISK_PCT=0.5%
+        # y KELLY_FRACTION conservador, esto pasaba con la mayoría de
+        # señales FUEL/STD en cuentas de ~200 USDT, descartando en silencio
+        # trades que ya habían pasado TODOS los filtros del scanner.
+        # AHORA: en vez de descartar, SUBE el tamaño hasta el mínimo
+        # configurado. Pedido explícito: trades de mínimo 10 USDT con
+        # cuentas de ~200 USDT. Sigue respetando el cap duro de arriba
+        # (no tiene sentido en la práctica que min > max, pero por si acaso
+        # se re-aplica el cap tras subir al suelo).
+        min_notional = getattr(C, 'MIN_NOTIONAL_USDT', 10.0)
         if notional < min_notional:
-            log.info("[sizing] %s notional %.2f < mínimo %.2f USDT — skip (fees dominarían)",
-                     tier, notional, min_notional)
-            return 0.0
+            old_notional = notional
+            qty      = min_notional / entry
+            notional = min_notional
+            if notional > cap:
+                qty      = cap / entry
+                notional = cap
+            log.info("[sizing] %s notional %.2f < mínimo %.2f USDT — subiendo a %.2f USDT",
+                     tier, old_notional, min_notional, notional)
 
         log.info("[sizing] %s score=%.1f risk=%.4f USDT qty=%.6f notional=%.2f USDT",
                  tier, score, risk_usdt, qty, qty * entry)
