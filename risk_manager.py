@@ -1,6 +1,28 @@
 """
-QF×JP Bot v7.7 — Risk Manager COMPLETO
+QF×JP Bot v7.9 — Risk Manager COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
+NUEVO en v7.9:
+  ✅ RACE CONDITION "max_open_trades(6/5)" — _open_count tenía DOS escritores
+     sin coordinar: can_trade() lo incrementaba de forma "atómica" al
+     reservar un slot (fix v7.8), pero update_open_count() — llamado por
+     PositionManager.monitor_loop() EN PARALELO, cada POSITION_CHECK_INTERVAL
+     segundos — lo SOBRESCRIBÍA con el conteo real de BingX. Si el monitor
+     corría justo en la ventana entre "can_trade() reservó el slot" y
+     "register_trade() añadió el trade a position_manager._trades" (que es
+     lo que update_open_count() usa para contar lo "real"), la reserva en
+     curso quedaba invisible para el resync y se borraba — permitiendo que
+     entraran más trades de los que MAX_OPEN_TRADES permitía. Caso real:
+     "Bloqueado por risk: max_open_trades(6/5)" en renewed-love, con un
+     límite de 5 y 6 posiciones realmente abiertas.
+
+     Fix: separar "confirmado" (_open_count, sincronizado desde BingX vía
+     update_open_count() y on_trade_closed()) de "reservado pero aún sin
+     confirmar" (_pending_reservations, nuevo — solo lo tocan can_trade(),
+     release_reservation() y on_trade_opened()). El check de can_trade()
+     usa la suma de ambos. update_open_count() ya NO puede pisar una
+     reserva en vuelo porque ahora solo escribe en _open_count, nunca en
+     _pending_reservations.
+
 NUEVO en v7.7:
   ✅ direction_allowed() — Correlation Guard (evita FHEU+XNY: 2 LONG correlados)
   ✅ on_trade_opened() acepta direction= para registrar en correlation guard
@@ -30,6 +52,11 @@ class RiskManager:
     def __init__(self):
         self._lock             = asyncio.Lock()
         self._open_count       = 0
+        # FIX v7.9: slots reservados por can_trade() pero aún sin confirmar
+        # (esperando el round-trip de red de open_trade()). Separado de
+        # _open_count para que update_open_count() (sync desde BingX real)
+        # no pueda borrar una reserva en vuelo — ver docstring del módulo.
+        self._pending_reservations = 0
         self._daily_trades     = 0
         self._daily_pnl        = 0.0
         self._last_reset       = date.today()
@@ -62,19 +89,26 @@ class RiskManager:
         """
         Verifica si el bot puede abrir un nuevo trade.
 
-        FIX v7.8 — RACE CONDITION CRÍTICA: el scanner procesa hasta 20
-        símbolos en paralelo (asyncio.gather). Antes, este método solo
-        CHEQUEABA open_count < MAX_OPEN_TRADES, y el incremento real
-        ocurría mucho después (en on_trade_opened(), tras el round-trip
-        de red a BingX). Eso dejaba una ventana en la que 5+ símbolos
-        concurrentes podían ver TODOS "open_count=3<5", pasar el check
-        a la vez, y abrir 5+ trades de golpe — superando el límite
-        configurado (caso real: "Trades abiertos: 6/5" en producción).
+        FIX v7.8 — RACE CONDITION: el scanner procesa hasta 20 símbolos en
+        paralelo (asyncio.gather). Antes, este método solo CHEQUEABA
+        open_count < MAX_OPEN_TRADES, y el incremento real ocurría mucho
+        después (en on_trade_opened(), tras el round-trip de red a BingX).
+        Eso dejaba una ventana en la que 5+ símbolos concurrentes podían ver
+        TODOS "open_count=3<5", pasar el check a la vez, y abrir 5+ trades
+        de golpe — superando el límite configurado.
 
-        FIX: si todos los chequeos pasan, el slot se RESERVA de inmediato
-        (incrementando open_count/daily_trades) DENTRO del mismo lock,
-        antes de devolver True. Así, la siguiente llamada concurrente ve
-        el contador ya actualizado y se bloquea correctamente.
+        FIX v7.9 — el fix de v7.8 resolvía la carrera ENTRE símbolos del
+        mismo scan, pero introdujo una nueva carrera CONTRA
+        update_open_count() (llamado por el monitor_loop de PositionManager,
+        en paralelo): ese método sobrescribe _open_count con el conteo real
+        de BingX, y si corría justo tras la reserva pero antes de que el
+        trade terminara de registrarse, borraba la reserva — permitiendo
+        de nuevo superar MAX_OPEN_TRADES (caso real: "max_open_trades(6/5)").
+        Fix: el check y la reserva ahora usan _open_count + 
+        _pending_reservations. update_open_count() solo toca _open_count
+        (la parte "confirmada" desde BingX real), nunca _pending_reservations
+        (la parte "reservada, esperando confirmación") — así ya no puede
+        pisar una reserva en vuelo.
 
         Si el trade finalmente NO se concreta (entrada rechazada, qty=0,
         excepción, etc.), el caller DEBE llamar a release_reservation()
@@ -91,8 +125,10 @@ class RiskManager:
             self._check_reset()
             self._last_unrealized = unrealized_pnl
 
-            if self._open_count >= C.MAX_OPEN_TRADES:
-                return False, f"max_open_trades({self._open_count}/{C.MAX_OPEN_TRADES})"
+            # FIX v7.9: gate sobre confirmado + reservado-en-vuelo
+            effective_open = self._open_count + self._pending_reservations
+            if effective_open >= C.MAX_OPEN_TRADES:
+                return False, f"max_open_trades({effective_open}/{C.MAX_OPEN_TRADES})"
             if self._daily_trades >= C.MAX_DAILY_TRADES:
                 return False, f"max_daily_trades({self._daily_trades}/{C.MAX_DAILY_TRADES})"
 
@@ -106,9 +142,11 @@ class RiskManager:
                     f"< -{daily_limit:.2f}, limit={C.DAILY_LOSS_PCT}%)"
                 )
 
-            # FIX: reserva atómica — incrementar AQUÍ, dentro del lock,
-            # antes de soltar el control a otra corrutina concurrente.
-            self._open_count   += 1
+            # FIX v7.9: reserva atómica en _pending_reservations, NO en
+            # _open_count — _open_count queda reservado exclusivamente
+            # para lo que update_open_count()/on_trade_closed() consideran
+            # "confirmado" en BingX real, evitando el doble-escritor.
+            self._pending_reservations += 1
             self._daily_trades += 1
             return True, ""
 
@@ -117,12 +155,15 @@ class RiskManager:
         Libera un slot reservado por can_trade() cuando el trade
         finalmente NO se concreta. Llamar SIEMPRE que can_trade()
         devolvió True pero el flujo termina sin abrir la posición real.
+
+        FIX v7.9: libera _pending_reservations, no _open_count — la
+        reserva nunca tocó _open_count (ver can_trade()).
         """
         async with self._lock:
-            self._open_count   = max(0, self._open_count - 1)
-            self._daily_trades = max(0, self._daily_trades - 1)
-            log.debug("Reserva liberada (trade no concretado) — open=%d daily=%d",
-                     self._open_count, self._daily_trades)
+            self._pending_reservations = max(0, self._pending_reservations - 1)
+            self._daily_trades         = max(0, self._daily_trades - 1)
+            log.debug("Reserva liberada (trade no concretado) — pending=%d open=%d daily=%d",
+                     self._pending_reservations, self._open_count, self._daily_trades)
 
     def symbol_allowed(self, symbol: str) -> tuple[bool, str]:
         """Verifica cooldown y límite de trades por símbolo."""
@@ -186,18 +227,27 @@ class RiskManager:
         """
         Llamar cuando el trade se CONFIRMA realmente abierto en BingX.
 
-        FIX v7.8: open_count, daily_trades y direction_ts YA se reservaron
-        atómicamente en can_trade()/direction_allowed() cuando pasaron el
-        check — incrementarlos otra vez aquí los duplicaría. Esta función
-        ahora solo registra el cooldown por símbolo (symbol_trade_cnt),
-        que no tiene el mismo riesgo de carrera porque cada símbolo se
-        procesa una sola vez por ciclo de scan.
+        FIX v7.8: daily_trades y direction_ts YA se reservaron atómicamente
+        en can_trade()/direction_allowed() cuando pasaron el check —
+        incrementarlos otra vez aquí los duplicaría.
+
+        FIX v7.9: la reserva de open_count pasa de "pendiente" a
+        "confirmada" — se libera _pending_reservations (ya no hace falta,
+        el trade es real) y se incrementa _open_count directamente (en vez
+        de esperar al próximo update_open_count(), que podría tardar hasta
+        POSITION_CHECK_INTERVAL segundos en correr y dejar una ventana
+        corta donde el trade no cuenta en ningún lado). update_open_count()
+        seguirá resincronizando _open_count con BingX real en cada ciclo
+        de todas formas, así que esto es solo para cerrar la ventana antes.
         """
         async with self._lock:
+            self._pending_reservations = max(0, self._pending_reservations - 1)
+            self._open_count          += 1
             if symbol:
                 self._symbol_trade_cnt[symbol] = self._symbol_trade_cnt.get(symbol, 0) + 1
-            log.info("Trade confirmado — open=%d daily=%d symbol=%s dir=%s",
-                     self._open_count, self._daily_trades, symbol, direction)
+            log.info("Trade confirmado — open=%d pending=%d daily=%d symbol=%s dir=%s",
+                     self._open_count, self._pending_reservations,
+                     self._daily_trades, symbol, direction)
 
     async def on_trade_closed(self, pnl: float = 0.0, symbol: str = ""):
         async with self._lock:
@@ -210,10 +260,19 @@ class RiskManager:
                      pnl, self._daily_pnl, self._open_count)
 
     async def update_open_count(self, real_count: int):
-        """Sincroniza con BingX real — fuente de verdad."""
+        """
+        Sincroniza con BingX real — fuente de verdad PARA LO CONFIRMADO.
+
+        FIX v7.9: solo toca _open_count, NUNCA _pending_reservations —
+        antes este método podía sobrescribir reservas en vuelo hechas por
+        can_trade() (ver docstring del módulo). Las reservas pendientes
+        viven en su propio contador y solo las tocan can_trade(),
+        release_reservation() y on_trade_opened().
+        """
         async with self._lock:
             if self._open_count != real_count:
-                log.debug("open_count %d → %d (BingX real)", self._open_count, real_count)
+                log.debug("open_count %d → %d (BingX real) | pending=%d",
+                         self._open_count, real_count, self._pending_reservations)
                 self._open_count = real_count
 
     # ── Kelly sizing con cap duro ─────────────────────────────────────────────
@@ -304,6 +363,11 @@ class RiskManager:
 
         return {
             "open_trades":       self._open_count,
+            # FIX v7.9: visibilidad de reservas en vuelo — si esto se queda
+            # >0 de forma persistente en el STATUS de Telegram, es señal de
+            # que algo no está liberando/confirmando reservas correctamente.
+            "pending_reservations": self._pending_reservations,
+            "effective_open":    self._open_count + self._pending_reservations,
             "daily_trades":      self._daily_trades,
             "daily_pnl":         round(self._daily_pnl, 4),       # solo cerrado (compat legacy)
             "daily_pnl_no_real": round(unreal, 4),                # FIX v7.1
