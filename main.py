@@ -1,5 +1,12 @@
 """
-QF×JP Bot v7.1 — Main
+QF×JP Bot v7.2 — Main
+FIX v7.2: nuevo endpoint /journal (expone journal.stats()) y tarea del
+Query Assistant — ver query_assistant.py. Solo hace algo si
+QUERY_ASSISTANT_ENABLED=true (pensado para renewed-love únicamente); en
+joyful-art y zesty-reverence este archivo es idéntico pero la tarea no
+arranca nada — solo aporta el endpoint /journal para que renewed-love
+pueda consultarlas.
+
 FastAPI con lifespan moderno + reconciliación al arrancar + trailing stop info
 + daily loss real (PnL no realizado incluido) en /status
 """
@@ -21,6 +28,7 @@ import telegram_client as tg
 from copier_client import MasterClient
 from complement_engine import ComplementEngine
 from trade_journal import TradeJournal
+from query_assistant import TelegramListener
 from ws_market_data import run_ws_client, ws_cache
 
 logging.basicConfig(
@@ -71,12 +79,28 @@ async def _run_complement():
             await tg.notify_error("complement_crash", str(e))
 
 
+async def _run_query_assistant():
+    """
+    FIX v7.2 — solo hace algo si QUERY_ASSISTANT_ENABLED=true (pensado
+    únicamente para renewed-love). En los otros bots, TelegramListener.
+    poll_loop() comprueba el flag y retorna de inmediato sin escuchar nada
+    — no hace falta nada especial en joyful-art/zesty-reverence más que
+    tener este archivo presente.
+    """
+    listener = TelegramListener(C.PORT)
+    try:
+        await listener.poll_loop()
+    except Exception as e:
+        log.critical("Query assistant crash: %s", e, exc_info=True)
+        await tg.notify_error("query_assistant_crash", str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, risk, pos_mgr, master, complement, journal
 
     log.info("═" * 54)
-    log.info("  QF×JP Bot v7.7 — ROADMAP COMPLETO")
+    log.info("  QF×JP Bot v7.2 — ROADMAP COMPLETO")
     log.info("  Modo: %s | Capital: %.2f USDT", C.MODE, C.CAPITAL)
     log.info("  Leverage: %dx | Min tier: %s", C.LEVERAGE, C.MIN_TIER)
     log.info("  Max notional: %.0f USDT | Daily loss: %.1f%%",
@@ -87,6 +111,7 @@ async def lifespan(app: FastAPI):
     log.info("  Session: %02d:00-%02d:00 UTC | Limit orders: %s",
              getattr(C, 'TRADE_START_UTC', 0), getattr(C, 'TRADE_END_UTC', 24),
              getattr(C, 'LIMIT_ORDERS_ENABLED', False))
+    log.info("  Query assistant: %s", getattr(C, 'QUERY_ASSISTANT_ENABLED', False))
     log.info("═" * 54)
 
     journal    = TradeJournal()
@@ -119,7 +144,8 @@ async def lifespan(app: FastAPI):
     scanner_task    = asyncio.create_task(_run_scanner())
     monitor_task    = asyncio.create_task(_run_monitor())
     complement_task = asyncio.create_task(_run_complement())
-    log.info("Loops iniciados (scanner + monitor + complement)")
+    query_task      = asyncio.create_task(_run_query_assistant())
+    log.info("Loops iniciados (scanner + monitor + complement + query assistant)")
 
     ws_task = None
     if getattr(C, 'WS_ENABLED', False):
@@ -132,6 +158,7 @@ async def lifespan(app: FastAPI):
     scanner_task.cancel()
     monitor_task.cancel()
     complement_task.cancel()
+    query_task.cancel()
     if master:
         await master.close()
     if client:
@@ -140,7 +167,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="QF×JP Bot v7.1",
+    title="QF×JP Bot v7.2",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -149,7 +176,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "7.1", "mode": C.MODE}
+    return {"status": "ok", "version": "7.2", "mode": C.MODE}
 
 
 @app.get("/status")
@@ -169,7 +196,7 @@ async def status():
 
     tracked = pos_mgr.get_tracked() if pos_mgr else {}
     return {
-        "version": "7.1",
+        "version": "7.2",
         "mode":    C.MODE,
         "balance": round(balance, 2),
         "risk":    risk.status(unrealized_pnl=unrealized),
@@ -182,7 +209,6 @@ async def status():
                 "tp2":             t.tp2,
                 "qty":             t.qty,
                 "be_moved":        t.be_moved,
-                # ── Trailing info ─────────────────────────────────────────────
                 "trailing_active": t.trailing_active,
                 "trail_sl":        round(t.trail_sl, 8) if t.trail_sl else None,
                 "peak_price":      round(t.peak_price, 8) if t.peak_price else None,
@@ -197,6 +223,20 @@ async def status():
             for sym, t in tracked.items()
         },
     }
+
+
+@app.get("/journal")
+async def journal_stats():
+    """
+    FIX v7.2 — expone journal.stats() (win rate, PnL, por tier/hora/símbolo/
+    filtro) por HTTP, mismo patrón que /status. Lo consume query_assistant.py
+    de renewed-love para responder preguntas sobre los 3 bots — pero está
+    disponible en cualquiera de los 3 igual, no hace falta nada especial
+    para que funcione salvo tener este archivo.
+    """
+    if journal is None:
+        return JSONResponse({"error": "not_ready"}, status_code=503)
+    return journal.stats()
 
 
 @app.post("/close/{symbol}")
