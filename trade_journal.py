@@ -1,10 +1,34 @@
 """
-QF×JP Bot v7.7 — Trade Journal
+QF×JP Bot v7.8 — Trade Journal (FIX etiquetado de filtros)
 ═══════════════════════════════════════════════════════════════════════════════
+FIX v7.8 — medir si los filtros nuevos aportan de verdad, no solo ruido:
+  Hasta ahora el journal medía win rate global y por tier/hora/símbolo,
+  pero no había forma de saber si un filtro CONCRETO (STC+Asimetría,
+  STC+Volumen+Slope, Price Action Framework) estaba mejorando los
+  resultados o solo añadiendo complejidad sin aportar nada — exactamente
+  la pregunta de "Filters in algorithmic trading: how to know if they
+  improve performance".
+
+  Nuevo campo `filter_tags` en TradeRecord: cuando un filtro de
+  confirmación boostea una señal (boost>0), se etiqueta el trade con el
+  nombre del filtro. stats() ahora calcula, por cada filtro visto:
+    win rate de trades CONFIRMADOS por ese filtro
+    vs
+    win rate de trades NO confirmados por ese filtro (incluye trades de
+    antes de activarlo, o donde el filtro corrió pero no encontró nada)
+
+  Si "confirmado" no gana claramente a "no confirmado" tras suficientes
+  trades de cada lado, el filtro no está aportando — es la señal objetiva
+  para desactivarlo en vez de mantenerlo por intuición.
+
+  scanner.py debe pasar filter_tags={"stc_asym": "...", ...} a on_open()
+  cuando cada filtro confirme — ver scanner.py v7.7.
+
 Registra cada trade con todos sus componentes de señal y resultado final.
 Tras N trades, calcula estadísticas reales:
   - Win rate por tier (STD/FUEL/SUP)
   - Win rate por hora UTC
+  - Win rate por filtro de confirmación (NUEVO v7.8)
   - Score mínimo óptimo empírico
   - Symbols con mejor/peor performance
 
@@ -43,6 +67,12 @@ class TradeRecord:
     # Timing
     hour_utc:  int     # hora UTC de apertura
     opened_at: float   # timestamp
+    # ── FIX v7.8: qué filtros de confirmación confirmaron esta señal ────────
+    # dict {nombre_filtro: detalle} — solo se añade la clave cuando el
+    # filtro boosteó (boost>0). Ausencia de clave = no confirmó o estaba
+    # desactivado; para el análisis de "¿aporta o no?" da igual cuál de
+    # las dos, ambas son "no confirmado por este filtro".
+    filter_tags: dict = field(default_factory=dict)
     # Resultado (se completa al cerrar)
     closed_at: Optional[float] = None
     pnl:       Optional[float] = None
@@ -95,6 +125,7 @@ class TradeJournal:
         oi_delta:  float   = 0.0,
         htf_score: float   = 0.0,
         adx:       float   = 0.0,
+        filter_tags: Optional[dict] = None,   # FIX v7.8
     ):
         rec = TradeRecord(
             symbol=symbol, direction=direction, tier=tier,
@@ -102,9 +133,11 @@ class TradeJournal:
             htf_score=htf_score, adx=adx,
             hour_utc=time.gmtime().tm_hour,
             opened_at=time.time(),
+            filter_tags=dict(filter_tags) if filter_tags else {},
         )
         self._open[symbol] = rec
-        log.debug("[journal] abierto: %s %s score=%.1f", symbol, direction, score)
+        log.debug("[journal] abierto: %s %s score=%.1f filtros=%s",
+                  symbol, direction, score, list(rec.filter_tags.keys()))
 
     # ── Cierre ────────────────────────────────────────────────────────────────
 
@@ -114,6 +147,9 @@ class TradeJournal:
     AUTO_BLACKLIST_DURATION_S   = 86400  # 24h de bloqueo automático
     STREAK_BREAKER_THRESHOLD    = 5      # 5 pérdidas consecutivas GLOBALES
     STREAK_BREAKER_PAUSE_S      = 3600   # pausa 1h tras racha mala
+
+    # ── FIX v7.8: mínimo de trades por bucket antes de fiarse del win rate ──
+    MIN_TRADES_PER_FILTER_BUCKET = 8
 
     async def on_close(self, symbol: str, pnl: float, reason: str = ""):
         rec = self._open.pop(symbol, None)
@@ -178,8 +214,8 @@ class TradeJournal:
 
         # Recalcular umbral adaptativo
         self._recalculate_adaptive()
-        log.info("[journal] cerrado: %s pnl=%.4f won=%s (total=%d)",
-                 symbol, pnl, rec.won, len(self._closed))
+        log.info("[journal] cerrado: %s pnl=%.4f won=%s filtros=%s (total=%d)",
+                 symbol, pnl, rec.won, list(rec.filter_tags.keys()), len(self._closed))
 
     def is_symbol_auto_blacklisted(self, symbol: str) -> tuple[bool, str]:
         """
@@ -232,6 +268,60 @@ class TradeJournal:
     def get_adaptive_offset(self) -> float:
         """Retorna el offset a aplicar sobre MIN_SCORE. 0 = sin cambio."""
         return self._adaptive_min_score
+
+    # ── Win rate por filtro (FIX v7.8) ──────────────────────────────────────
+
+    def _filter_breakdown(self, closed: list[TradeRecord]) -> dict:
+        """
+        Para cada filtro visto en algún filter_tags, compara win rate de
+        trades CONFIRMADOS por ese filtro vs NO confirmados (ausencia de
+        la clave — incluye "corrió y no encontró nada" y "desactivado").
+
+        Esta es la respuesta a "¿este filtro aporta o solo añade ruido?":
+        si confirmado no gana claramente a no_confirmado con suficientes
+        trades de cada lado (MIN_TRADES_PER_FILTER_BUCKET), no hay
+        evidencia de que el filtro mejore nada — desactívalo.
+        """
+        all_filter_names: set[str] = set()
+        for t in closed:
+            all_filter_names.update(t.filter_tags.keys())
+
+        out: dict[str, dict] = {}
+        for fname in all_filter_names:
+            confirmados     = [t for t in closed if fname in t.filter_tags]
+            no_confirmados  = [t for t in closed if fname not in t.filter_tags]
+
+            def _bucket(group: list[TradeRecord]) -> dict:
+                n = len(group)
+                if n == 0:
+                    return {"n": 0, "wr": None, "pnl": 0.0, "suficiente": False}
+                w = sum(1 for t in group if t.won)
+                pnl = sum(t.pnl or 0 for t in group)
+                return {
+                    "n":   n,
+                    "wr":  round(w / n * 100, 1),
+                    "pnl": round(pnl, 4),
+                    "suficiente": n >= self.MIN_TRADES_PER_FILTER_BUCKET,
+                }
+
+            b_conf = _bucket(confirmados)
+            b_noconf = _bucket(no_confirmados)
+            veredicto = "datos_insuficientes"
+            if b_conf["suficiente"] and b_noconf["suficiente"]:
+                diff = (b_conf["wr"] or 0) - (b_noconf["wr"] or 0)
+                if diff >= 10:
+                    veredicto = "aporta"
+                elif diff <= -10:
+                    veredicto = "perjudica"
+                else:
+                    veredicto = "sin_diferencia_clara"
+
+            out[fname] = {
+                "confirmado":    b_conf,
+                "no_confirmado": b_noconf,
+                "veredicto":     veredicto,
+            }
+        return out
 
     # ── Estadísticas ──────────────────────────────────────────────────────────
 
@@ -308,6 +398,7 @@ class TradeJournal:
             "best_hours_utc": best_hours,
             "top5_symbols":   sym_sorted[:5],
             "bot5_symbols":   sym_sorted[-5:][::-1],
+            "by_filter":      self._filter_breakdown(closed),   # FIX v7.8
         }
 
     def recent_win_rate(self) -> float:
