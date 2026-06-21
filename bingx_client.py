@@ -1,49 +1,40 @@
 """
-QF×JP Bot v7.9 — BingX Client DEFINITIVO (FIX crítico get_open_positions)
+QF×JP Bot v7.10 — BingX Client DEFINITIVO (FIX CRÍTICO dirección real)
 ═══════════════════════════════════════════════════════════════════════════════
-FIX v7.9 — get_open_positions() ya NO devuelve [] en silencio ante un error:
+FIX v7.10 — CRÍTICO: place_stop_market_order() y close_position_market()
+  ya NO confían en el `direction`/`side` que pasa el caller para construir
+  órdenes de cierre. Ahora verifican la dirección REAL contra el signo de
+  positionAmt en BingX (ground truth, inequívoco en cualquier modo) ANTES
+  de construir la orden — si no coincide con lo que pasó el caller, usan
+  la verdad de BingX y lo registran con un WARNING explícito.
 
-  ANTES: si BingX respondía con un código de error (firma rechazada,
-  rate limit 100410, lo que sea), get_open_positions() solo logueaba y
-  devolvía [] — INDISTINGUIBLE de "de verdad no hay posiciones abiertas".
+  Caso confirmado en producción: BTWUSDT en renewed-love, 130+ reintentos
+  fallidos de SL/trail durante HORAS, todos con el mismo error 110424
+  "The order size must be less than the available amount of X USDT" —
+  el síntoma exacto de una orden de cierre construida con la dirección
+  invertida (BingX la interpreta como abrir posición nueva, que necesita
+  margen fresco, en vez de cerrar la existente, que no). No se encontró
+  ni se confirmó la causa raíz en position_manager.py (pendiente, no se
+  tiene el archivo) — este fix protege contra el síntoma en el punto
+  exacto donde se construyen las órdenes, sin depender de encontrar el
+  origen exacto primero. Si el warning nuevo aparece en logs, confirma
+  dónde está el bug real para arreglarlo de raíz después.
 
-  position_manager._check_all_positions() compara el tracker interno del
-  bot contra el resultado de esta función para detectar cierres externos
-  (SL/TP disparado por BingX). Si la lista venía vacía por un error
-  transitorio en vez de por la realidad, TODAS las posiciones trackeadas
-  se interpretaban como "cerradas externamente" de golpe en ese ciclo:
-  se sacaban del tracking, se mandaba notificación de cierre con un PnL
-  que no era el real (calculado contra el último ticker, no el precio de
-  cierre real), y open_count se reseteaba a 0 — liberando cupo de
-  MAX_OPEN_TRADES que en realidad seguía ocupado por posiciones que
-  SEGUÍAN abiertas en BingX con su SL/TP real intactos, simplemente sin
-  que el bot las vigilara más. Visto en producción: error 100410 repetido
-  en renewed-love y joyful-art.
+NON_CRYPTO_PREFIXES (FIX v7.9, sin cambios): constante pública del módulo
+  — antes local a get_all_symbols() — para que complement_engine.py
+  también filtre OIL/WTI/BRENT/XAU/XAG/EUR/GBP/JPY en run_copy_mode(),
+  no solo BLACKLIST.
 
-  FIX: ahora LANZA excepción en vez de devolver []. Los 3 callers de esta
-  función (_check_all_positions, get_unrealized_pnl, _get_real_position_side
-  en position_manager.py) YA tenían try/except esperando justo esto —
-  con este cambio, un fallo de API hace que cada uno tome su fallback
-  seguro (saltar el ciclo, devolver 0.0 de PnL no realizado, o asumir la
-  dirección conocida) en vez de interpretar el error como "cero posiciones".
+DE v7.9 (sin cambios):
+  ✅ get_open_positions() lanza excepción en error de API en vez de
+     devolver [] en silencio — evita que un fallo transitorio se
+     interprete como "todas las posiciones cerradas externamente".
+     Caché de 3s (éxito y error).
 
-  De regalo: caché de 3s. Cada símbolo que llega a la fase LIVE del
-  scanner llama a get_unrealized_pnl() → get_open_positions() — con
-  varias señales calificadas por iteración, eso eran varias llamadas casi
-  simultáneas al mismo endpoint en cada ráfaga de asyncio.gather. Ahora
-  comparten una sola consulta real cada 3 segundos, reduciendo la presión
-  sobre el rate limit que causaba el 100410 en primer lugar. El error
-  también se cachea (y se re-lanza) durante la ventana, para no martillar
-  la API mientras el rate limit sigue activo.
-
-DE v7.8 (features que se conservan):
+DE v7.8 (sin cambios):
   ✅ TP1 como TAKE_PROFIT límite (maker) con fallback automático a market
   ✅ place_limit_entry() coloca SL+TP1+TP2 al confirmar el fill
-  ✅ Firma byte-a-byte (URL completa pre-construida, sin params= en aiohttp)
-  ✅ .strip() en API key y secret
-  ✅ _get_real_position_side() — Hedge/One-Way auto-detección
-  ✅ _extract_executed_qty() — qty real de BingX (fix error 110424)
-  ✅ _safe_qty_for_sl()
+  ✅ Firma byte-a-byte, _extract_executed_qty(), _safe_qty_for_sl()
   ✅ Retry HTTP 3 intentos con backoff exponencial
   ✅ cancel_order / cancel_all_orders con DELETE (no POST)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -62,6 +53,12 @@ import config as C
 log = logging.getLogger("bingx")
 
 
+NON_CRYPTO_PREFIXES = (
+    "BEAR", "BULL", "PUMP", "NCS",
+    "OIL", "WTI", "BRENT", "XAU", "XAG", "EUR", "GBP", "JPY",
+)
+
+
 class BingXClient:
     def __init__(self):
         self._session:        aiohttp.ClientSession | None = None
@@ -71,7 +68,8 @@ class BingXClient:
         # FIX v7.9: caché corta de get_open_positions() — ver docstring del módulo.
         self._positions_cache: tuple = (0.0, [])
         self._POSITIONS_CACHE_TTL = 3.0
-        log.info("BingXClient v7.9 — firma byte-a-byte + SL/TP en límite + TP1 maker + fix get_open_positions")
+        log.info("BingXClient v7.10 — firma byte-a-byte + SL/TP en límite + TP1 maker + "
+                 "fix get_open_positions + verificación de dirección real")
         # Diagnóstico seguro: longitud de claves, NUNCA el valor real.
         log.info("[auth] API_KEY len=%d | SECRET_KEY len=%d",
                   len(C.BINGX_API_KEY), len(C.BINGX_SECRET_KEY))
@@ -232,6 +230,42 @@ class BingXClient:
             log.debug("[%s] _get_real_position_side error: %s", symbol, e)
         return direction
 
+    async def _get_real_direction_and_side(self, symbol: str, fallback_direction: str) -> tuple[str, str]:
+        """
+        FIX v7.10 CRÍTICO — determina la dirección REAL de la posición
+        desde el signo de positionAmt en BingX, no se fía del `direction`
+        que pasa el caller. Caso confirmado en producción: BTWUSDT, 130+
+        reintentos fallidos de SL/trail con 'order size must be less than
+        the available amount' — síntoma exacto de una orden de cierre
+        construida con la dirección invertida, que BingX interpreta como
+        abrir posición nueva (necesita margen fresco) en vez de cerrar la
+        existente (reduce-only, no necesita margen). _get_real_position_side()
+        ya corregía el parámetro positionSide, pero el `side` (BUY/SELL) lo
+        seguía calculando el caller con SU PROPIA idea de la dirección —
+        si esa idea está mal (origen aún sin confirmar, posiblemente en
+        reconcile_on_startup() o en el tracking tras un trade copiado),
+        el side sale invertido igual.
+
+        positionAmt es inequívoco: positivo = LONG, negativo = SHORT, sin
+        importar one-way o hedge mode. Si no se encuentra la posición
+        (cerrada entre el cálculo y la llamada, o symbol nuevo) cae al
+        fallback_direction del caller.
+        """
+        try:
+            positions = await self.get_open_positions()
+            for p in positions:
+                if p.get("symbol") != symbol:
+                    continue
+                amt = float(p.get("positionAmt", 0) or 0)
+                ps  = p.get("positionSide", "")
+                if amt > 0:
+                    return "LONG", (ps if ps in ("LONG", "SHORT", "BOTH") else "LONG")
+                if amt < 0:
+                    return "SHORT", (ps if ps in ("LONG", "SHORT", "BOTH") else "SHORT")
+        except Exception as e:
+            log.debug("[%s] _get_real_direction_and_side error: %s", symbol, e)
+        return fallback_direction, fallback_direction
+
     # ── Símbolos ──────────────────────────────────────────────────────────────
 
     async def get_all_symbols(self) -> list[str]:
@@ -245,12 +279,15 @@ class BingXClient:
         symbols      = []
         vol_map:     dict[str, float] = {}
         vol_detected = 0
-        # FIX: filtro estructural de instrumentos no-cripto (commodities/forex
-        # que BingX lista en el mismo universo USDT-M). Capa extra junto al
-        # BLACKLIST manual — detectados en cuenta real: "Oil WTI", "Oil Brent",
-        # EURUSD, SILVER, todos con leverage 10x como si fueran altcoins.
-        _bad = ("BEAR", "BULL", "PUMP", "NCS",
-                "OIL", "WTI", "BRENT", "XAU", "XAG", "EUR", "GBP", "JPY")
+        # FIX v7.10: _bad ahora es NON_CRYPTO_PREFIXES, constante pública del
+        # módulo (antes local a esta función) — complement_engine.py también
+        # la importa para que run_copy_mode() filtre lo mismo que el scanner.
+        # Antes eran dos listas separadas (BLACKLIST de config.py aquí no
+        # incluye OIL/WTI/XAU) y el camino de copy-trade nunca pasaba por
+        # get_all_symbols(), así que Oil WTI y GOLD(XAU) se colaban en
+        # cuentas que copiaban trades del master en vez de escanear ellas
+        # mismas. Caso real: zesty-reverence con Oil WTI y GOLD(XAU) en su
+        # historial, ninguno de los dos generado por su propio scanner.
 
         for item in raw:
             if not isinstance(item, dict):
@@ -268,7 +305,7 @@ class BingXClient:
             base_sym = sym.replace("-USDT", "")
             if not sym.endswith("-USDT") or base_sym in C.BLACKLIST or sym in C.BLACKLIST:
                 continue
-            if any(sym.replace("-USDT", "").startswith(p) for p in _bad):
+            if any(sym.replace("-USDT", "").startswith(p) for p in NON_CRYPTO_PREFIXES):
                 continue
 
             self._precision_map[sym] = int(item.get("volumePrecision",
@@ -500,7 +537,19 @@ class BingXClient:
         place_limit_entry().
         """
         qty     = self._round_qty(symbol, quantity)
-        real_ps = await self._get_real_position_side(symbol, direction)
+        real_direction, real_ps = await self._get_real_direction_and_side(symbol, direction)
+        real_side = "SELL" if real_direction == "LONG" else "BUY"
+        if real_side != side:
+            log.warning(
+                "[%s] ⚠️ SIDE INVERTIDO detectado y corregido en place_stop_market_order "
+                "— el caller pasó side=%s (asumiendo direction=%s), pero BingX confirma "
+                "que la posición real es %s (positionAmt). Usando side=%s (verdad de "
+                "BingX). Patrón exacto del bug que dejaba BTWUSDT sin protección "
+                "(110424 'order size must be less than available amount') — la orden "
+                "se construía para abrir posición nueva, no para cerrar la existente.",
+                symbol, side, direction, real_direction, real_side,
+            )
+            side = real_side
 
         params = {
             "symbol":       symbol,
@@ -520,8 +569,8 @@ class BingXClient:
         if isinstance(resp, dict) and resp.get("code", -1) != 0:
             msg = self._parse_error(resp)
             if "positionside" in msg or "position side" in msg:
-                log.warning("[%s] positionSide fallback → %s", symbol, direction)
-                params["positionSide"] = direction
+                log.warning("[%s] positionSide fallback → %s", symbol, real_direction)
+                params["positionSide"] = real_direction
                 resp = await self._post("/openApi/swap/v2/trade/order", params)
             elif "position not exist" in msg and real_ps != "BOTH":
                 log.warning("[%s] position not exist → probando BOTH", symbol)
@@ -546,9 +595,16 @@ class BingXClient:
 
     async def close_position_market(self, symbol: str, quantity: float,
                                      direction: str) -> dict:
-        side    = "SELL" if direction == "LONG" else "BUY"
         qty     = self._round_qty(symbol, quantity)
-        real_ps = await self._get_real_position_side(symbol, direction)
+        real_direction, real_ps = await self._get_real_direction_and_side(symbol, direction)
+        side    = "SELL" if real_direction == "LONG" else "BUY"
+        if real_direction != direction:
+            log.warning(
+                "[%s] ⚠️ direction INVERTIDA detectada y corregida en "
+                "close_position_market — caller pasó direction=%s, BingX confirma "
+                "%s (positionAmt). Cerrando con side=%s (verdad de BingX).",
+                symbol, direction, real_direction, side,
+            )
 
         params = {"symbol": symbol, "side": side, "positionSide": real_ps,
                   "type": "MARKET", "quantity": str(qty)}
@@ -558,7 +614,7 @@ class BingXClient:
         if isinstance(resp, dict) and resp.get("code", -1) != 0:
             msg = self._parse_error(resp)
             if "positionside" in msg or "position side" in msg:
-                params["positionSide"] = direction
+                params["positionSide"] = real_direction
                 resp = await self._post("/openApi/swap/v2/trade/order", params)
             elif "position not exist" in msg and real_ps != "BOTH":
                 params["positionSide"] = "BOTH"
