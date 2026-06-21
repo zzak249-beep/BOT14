@@ -1,6 +1,20 @@
 """
-QF×JP Bot v7.5 — Position Manager TRAILING STOP DINÁMICO (FIX reconcile time)
+QF×JP Bot v7.6 — Position Manager TRAILING STOP DINÁMICO (FIX dirección real)
 ═══════════════════════════════════════════════════════════════════════════════
+FIX v7.6 — CRÍTICO: auto-corrección de trade.direction contra BingX real,
+  en cada ciclo del monitor (ver _check_all_positions). reconcile_on_startup()
+  ya priorizaba positionSide sobre el signo de positionAmt al reconciliar,
+  pero nada volvía a verificar esto después — si trade.direction se quedó
+  mal por cualquier vía, se quedaba mal para siempre, invirtiendo
+  side_close en _activate_trail()/_update_trail(), _calc_pnl(), el EMA
+  exit y el time stop. Caso confirmado: BTWUSDT en renewed-love, 130+
+  reintentos de SL fallidos durante horas (110424 "order size must be
+  less than the available amount" — el patrón exacto de una orden de
+  cierre construida como si fuera apertura). Complementa el fix de
+  bingx_client.py v7.10 (que protege el punto de envío de la orden) —
+  este corrige la fuente, para que todo lo que depende de trade.direction
+  esté bien, no solo la orden de protección.
+
 FIX v7.5 — time_stop/EMA exit desactivados de facto por redeploys frecuentes:
   reconcile_on_startup() corre en CADA redeploy y no sabe cuánto lleva
   realmente abierta una posición ya existente (BingX no expone el
@@ -373,7 +387,7 @@ class PositionManager:
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor v7.5 — trailing stop + EMA exit + reconcile time fix | intervalo=%ds",
+        log.info("Position monitor v7.6 — trailing stop + EMA exit + auto-corrección de dirección | intervalo=%ds",
                  C.POSITION_CHECK_INTERVAL)
         while True:
             try:
@@ -431,6 +445,40 @@ class PositionManager:
                 continue
 
             pos = real_map[symbol]
+
+            # ── FIX v7.6 CRÍTICO: auto-corregir trade.direction si no coincide
+            # con la verdad de BingX ───────────────────────────────────────────
+            # reconcile_on_startup() ya prioriza positionSide sobre el signo de
+            # positionAmt en hedge mode al RECONCILIAR — pero nada volvía a
+            # verificar esto después, en cada ciclo del monitor. Si
+            # trade.direction se quedó mal por cualquier vía (registro inicial,
+            # una reconciliación anterior a este fix, lo que sea), se quedaba
+            # mal PARA SIEMPRE — cada side_close calculado en _activate_trail()/
+            # _update_trail() salía invertido sin que nada lo detectara.
+            # Caso confirmado: BTWUSDT en renewed-love, 130+ reintentos de SL
+            # fallidos durante horas, error 110424 "order size must be less
+            # than the available amount" — el patrón exacto de una orden de
+            # cierre construida con la dirección al revés (BingX la trata como
+            # abrir posición nueva, necesita margen fresco, en vez de cerrar la
+            # existente). bingx_client.py v7.10 ya protege el punto de envío de
+            # la orden con la misma verificación — esto corrige la FUENTE: si
+            # trade.direction está mal, _calc_pnl(), el EMA exit y el time stop
+            # también calculaban mal, no solo la orden de protección.
+            real_amt = float(pos.get("positionAmt", 0) or 0)
+            real_ps  = pos.get("positionSide", "")
+            real_direction = (
+                real_ps if real_ps in ("LONG", "SHORT")
+                else ("LONG" if real_amt > 0 else "SHORT")
+            )
+            if real_direction != trade.direction:
+                log.warning(
+                    "[%s] ⚠️ DIRECCIÓN CORREGIDA: tracker tenía %s, BingX confirma "
+                    "%s (positionSide=%s, positionAmt=%.6f). Actualizando — esta "
+                    "es la causa raíz del bug que dejó BTWUSDT sin protección "
+                    "durante horas.", symbol, trade.direction, real_direction,
+                    real_ps, real_amt,
+                )
+                trade.direction = real_direction
 
             # ── Mark price ────────────────────────────────────────────────────
             try:
