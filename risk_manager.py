@@ -1,6 +1,18 @@
 """
-QF×JP Bot v7.10 — Risk Manager COMPLETO
+QF×JP Bot v7.11 — Risk Manager COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
+NUEVO en v7.11:
+  ✅ MIN_MARGIN_USDT — suelo de MARGEN real, no solo de notional. El suelo
+     de MIN_NOTIONAL_USDT (v7.10) garantiza un notional mínimo, pero con
+     leverage alto (11-14x, visto variar por símbolo en BingX) ese mismo
+     notional sigue dando un margen real menor a 1 USDT — exactamente lo
+     que se ve en la cuenta como "trades de menos de 1 USDT" pese a que el
+     notional ya esté correctamente floored. Fix: convierte MIN_MARGIN_USDT
+     a un notional equivalente (margen × leverage) y usa el MAYOR entre
+     ese y MIN_NOTIONAL_USDT como suelo efectivo — así el margen real
+     nunca cae por debajo del mínimo configurado, sin importar el leverage
+     del símbolo.
+
 NUEVO en v7.10:
   ✅ MIN_NOTIONAL_USDT ya NO descarta la señal cuando el sizing por riesgo
      calcula un notional por debajo del mínimo — en vez de eso, SUBE el
@@ -347,27 +359,32 @@ class RiskManager:
             qty = cap / entry
             notional = cap
 
-        # ── SUELO MÍNIMO DE NOTIONAL — FIX v7.10 ──────────────────────────────
-        # ANTES: si el notional calculado por riesgo caía por debajo del
-        # mínimo, la señal se DESCARTABA (return 0.0) — con RISK_PCT=0.5%
-        # y KELLY_FRACTION conservador, esto pasaba con la mayoría de
-        # señales FUEL/STD en cuentas de ~200 USDT, descartando en silencio
-        # trades que ya habían pasado TODOS los filtros del scanner.
-        # AHORA: en vez de descartar, SUBE el tamaño hasta el mínimo
-        # configurado. Pedido explícito: trades de mínimo 10 USDT con
-        # cuentas de ~200 USDT. Sigue respetando el cap duro de arriba
-        # (no tiene sentido en la práctica que min > max, pero por si acaso
-        # se re-aplica el cap tras subir al suelo).
+        # ── SUELO MÍNIMO DE NOTIONAL + MARGEN — FIX v7.11 ─────────────────────
+        # ANTES (v7.10): solo garantizaba un notional mínimo. Con leverage
+        # alto, ese notional mínimo seguía dando un margen real menor a 1
+        # USDT — "trades de menos de 1 USDT" en la cuenta BingX pese a que
+        # el notional estuviera correctamente floored.
+        # AHORA: además del suelo de notional, exige un margen mínimo real.
+        # Convierte MIN_MARGIN_USDT a un notional equivalente (margen ×
+        # leverage) y usa el MAYOR de los dos suelos como umbral efectivo.
         min_notional = getattr(C, 'MIN_NOTIONAL_USDT', 10.0)
-        if notional < min_notional:
+        min_margin   = getattr(C, 'MIN_MARGIN_USDT', 1.0)
+        min_notional_for_margin = min_margin * C.LEVERAGE
+        effective_min = max(min_notional, min_notional_for_margin)
+
+        if notional < effective_min:
             old_notional = notional
-            qty      = min_notional / entry
-            notional = min_notional
+            qty      = effective_min / entry
+            notional = effective_min
             if notional > cap:
                 qty      = cap / entry
                 notional = cap
-            log.info("[sizing] %s notional %.2f < mínimo %.2f USDT — subiendo a %.2f USDT",
-                     tier, old_notional, min_notional, notional)
+            log.info(
+                "[sizing] %s notional %.2f < mínimo efectivo %.2f "
+                "(suelo_notional=%.2f, suelo_margen=%.2f×%.0fx=%.2f) — subiendo a %.2f USDT",
+                tier, old_notional, effective_min, min_notional,
+                min_margin, C.LEVERAGE, min_notional_for_margin, notional,
+            )
 
         log.info("[sizing] %s score=%.1f risk=%.4f USDT qty=%.6f notional=%.2f USDT",
                  tier, score, risk_usdt, qty, qty * entry)
