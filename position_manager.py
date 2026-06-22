@@ -1,6 +1,16 @@
 """
-QF×JP Bot v7.6 — Position Manager TRAILING STOP DINÁMICO (FIX dirección real)
+QF×JP Bot v7.7 — Position Manager TRAILING STOP DINÁMICO (FIX PnL real)
 ═══════════════════════════════════════════════════════════════════════════════
+FIX v7.7 — CRÍTICO: _calc_pnl() ya NO multiplica por C.LEVERAGE. qty viene
+  del sizing ya corregido (risk_usdt / sl_dist, sin leverage incluido) —
+  multiplicar el PnL por LEVERAGE otra vez lo inflaba por ese factor
+  completo. Caso confirmado: get_unrealized_pnl() reportando -522.06 USDT
+  de pérdida no realizada cuando la real en BingX era ~10x menor (con
+  LEVERAGE=10) — alimentaba el chequeo de daily_drawdown con una cifra
+  falsa, bloqueando trades por una "pérdida" que no existía. Probablemente
+  también infló las notificaciones de Telegram de "TRADE CERRADO" todo
+  este tiempo.
+
 FIX v7.6 — CRÍTICO: auto-corrección de trade.direction contra BingX real,
   en cada ciclo del monitor (ver _check_all_positions). reconcile_on_startup()
   ya priorizaba positionSide sobre el signo de positionAmt al reconciliar,
@@ -387,7 +397,7 @@ class PositionManager:
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor v7.6 — trailing stop + EMA exit + auto-corrección de dirección | intervalo=%ds",
+        log.info("Position monitor v7.7 — trailing stop + EMA exit + PnL real | intervalo=%ds",
                  C.POSITION_CHECK_INTERVAL)
         while True:
             try:
@@ -1037,11 +1047,30 @@ class PositionManager:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _calc_pnl(self, trade: OpenTrade, close_price: float) -> float:
+        """
+        FIX v7.7 CRÍTICO: ya NO multiplica por C.LEVERAGE.
+
+        qty viene de risk_manager.kelly_position_size(), que desde el fix
+        del bug dimensional de sizing calcula qty = risk_usdt / sl_dist —
+        SIN multiplicar por leverage (el leverage solo determina cuánto
+        margen hace falta para una qty dada, no cambia el PnL en USDT de
+        un mismo movimiento de precio). (close_price - entry) * qty YA ES
+        el PnL real en USDT — multiplicar otra vez por LEVERAGE lo
+        infla por ese factor completo.
+
+        Caso confirmado: get_unrealized_pnl() reportando -522.06 USDT
+        cuando el PnL no realizado real en BingX era ~10x menor — con
+        LEVERAGE=10, exactamente el factor de esta doble-cuenta. Esto
+        alimentaba el chequeo de daily_drawdown en risk_manager.py,
+        bloqueando trades por una pérdida que no era real, y
+        probablemente infló también las notificaciones de Telegram de
+        "TRADE CERRADO" todo este tiempo.
+        """
         if trade.direction == "LONG":
             raw = (close_price - trade.entry) * trade.qty
         else:
             raw = (trade.entry - close_price) * trade.qty
-        return round(raw * C.LEVERAGE, 4)
+        return round(raw, 4)
 
     def get_tracked(self) -> dict[str, OpenTrade]:
         return dict(self._trades)
