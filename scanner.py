@@ -1,27 +1,12 @@
 """
-QF×JP Bot v8.1 — Scanner COMPLETO
+QF×JP Bot v7.7 — Scanner COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
-FIX v8.1:
-  ✅ Nuevo filtro Fibonacci Retracement MTF — ver fibonacci_mtf.py. Usa el
-     día completo anterior como referencia, zona dorada 61.8-78.6%.
-     Necesita klines diarias (1 llamada extra a la API, no reutiliza k3m).
-     Desactivado por defecto (FIB_MTF_ENABLED=False).
-
-FIX v8.0:
-  ✅ Nuevo filtro Sniper Predator x VSA Matrix — ver sniper_vsa_matrix.py.
-
-FIX v7.9:
-  ✅ Nuevo filtro Order Blocks + Kaplan-Meier Survival — ver order_block_km.py.
-
-FIX v7.8:
-  ✅ Nuevo filtro opcional Trend Magic + RMI Sniper — ver trend_magic_rmi.py.
-
 FIX v7.7:
   ✅ Cada señal acumula filter_tags{} con los filtros de confirmación que
-     dispararon (stc_asym, stc_vol_slope, price_action, trend_magic_rmi)
-     y se pasa a journal.on_open(). Permite a trade_journal.py v7.9 medir,
-     con datos reales (win rate + Deflated Sharpe), si cada filtro nuevo
-     aporta o solo añade ruido.
+     dispararon (stc_asym, stc_vol_slope, price_action) y se pasa a
+     journal.on_open(). Permite a trade_journal.py v7.8 medir, con datos
+     reales, si cada filtro nuevo aporta win rate o solo añade ruido —
+     ver _filter_breakdown() en trade_journal.py.
 
 FIX v7.6:
   ✅ Nuevo filtro opcional Price Action Framework (Large Bodies / Wicks
@@ -90,10 +75,10 @@ from btc_correlation import compute_correlation, btc_guard
 from stc_asymmetry import stc_asymmetry_filter, stc_volume_slope_filter
 from price_action_framework import price_action_filter
 from trend_magic_rmi import trend_magic_rmi_filter
+from ws_market_data import ws_cache
 from order_block_km import ob_engine, order_block_km_filter
 from sniper_vsa_matrix import sniper_vsa_filter
 from fibonacci_mtf import fib_mtf_filter
-from ws_market_data import ws_cache
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
@@ -464,84 +449,57 @@ async def _process_symbol(
             filter_tags["price_action"] = pa_reason
             log.info("[%s] 📐 %s", symbol, pa_reason)
 
-    # ── 5e. Trend Magic + RMI Sniper ─────────────────────────────────────────
-    # NUEVO — portado de un indicador Pine compartido. Reutiliza k3m, sin
-    # llamada extra a la API. Ver trend_magic_rmi.py para el detalle y lo
-    # que se dejó fuera a propósito (Band/RWMA, puramente visual en el
-    # original). Desactivado por defecto.
+    # ── 5e. Trend Magic + RMI Sniper — filtro de confirmación ───────────────
+    # NUEVO — ver trend_magic_rmi.py. Reutiliza k3m (ya fetcheado), sin
+    # llamada extra a la API. Desactivado por defecto (igual que el resto
+    # de filtros opcionales nuevos): activar en config tras validar en
+    # MODE=SIGNAL y revisar by_filter en el journal antes de confiar en él
+    # con dinero real.
     if getattr(C, 'TREND_MAGIC_RMI_ENABLED', False):
-        tm_boost, tm_reason, tm_block = trend_magic_rmi_filter(
+        tmr_boost, tmr_reason, tmr_block = trend_magic_rmi_filter(
             k3m, sig.direction,
-            cci_len=getattr(C, 'TM_CCI_LEN', 20),
-            atr_len=getattr(C, 'TM_ATR_LEN', 5),
-            atr_mult=getattr(C, 'TM_ATR_MULT', 1.0),
-            rmi_len=getattr(C, 'TM_RMI_LEN', 14),
-            pmom=getattr(C, 'TM_PMOM', 66.0),
-            nmom=getattr(C, 'TM_NMOM', 30.0),
-            boost_amount=getattr(C, 'TM_BOOST_AMOUNT', 7.0),
+            cci_len=getattr(C, 'TMR_CCI_LEN', 20),
+            atr_len=getattr(C, 'TMR_ATR_LEN', 5),
+            atr_mult=getattr(C, 'TMR_ATR_MULT', 1.0),
+            rmi_len=getattr(C, 'TMR_RMI_LEN', 14),
+            pmom=getattr(C, 'TMR_PMOM', 66.0),
+            nmom=getattr(C, 'TMR_NMOM', 30.0),
+            boost_amount=getattr(C, 'TMR_BOOST_AMOUNT', 7.0),
         )
-        if tm_block:
-            log.info("[%s] 🚫 Trend Magic/RMI veto: %s", symbol, tm_reason)
+        if tmr_block:
+            log.info("[%s] 🚫 Trend Magic/RMI veto: %s", symbol, tmr_reason)
             diag["counts"]["trend_magic_rmi_veto"] += 1
             return None
-        if tm_boost > 0:
-            sig.score = min(sig.score + tm_boost, 100.0)
+        if tmr_boost > 0:
+            sig.score = min(sig.score + tmr_boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
             diag["counts"]["trend_magic_rmi_boost"] += 1
-            filter_tags["trend_magic_rmi"] = tm_reason
-            log.info("[%s] 🧲 %s", symbol, tm_reason)
+            filter_tags["trend_magic_rmi"] = tmr_reason
+            log.info("[%s] 🧲 %s", symbol, tmr_reason)
 
-    # ── 5f. Order Blocks + Kaplan-Meier Survival ─────────────────────────────
-    # NUEVO — motor STATEFUL (ver order_block_km.py), a diferencia de los
-    # demás filtros de hoy. update() siempre corre (acumula historial
-    # incluso si el filtro está desactivado, para que cuando lo actives
-    # ya tenga muestra) — el filtro en sí, que sí puede afectar el score,
-    # solo actúa si OB_KM_ENABLED=true. Nunca veta, solo confirma o queda
-    # neutral (ver docstring del módulo).
+    # ── 5f. Order Block KM — siempre se actualiza, filtro opcional ───────────
+    # ob_engine.update() corre SIEMPRE para acumular historial, aunque el
+    # filtro esté desactivado — así cuando lo actives ya tiene muestra.
     try:
-        ob_engine.update(symbol, k3m,
-                          z_len=getattr(C, 'OB_Z_LEN', 50),
-                          max_age_bars=getattr(C, 'OB_MAX_AGE_BARS', 2000))
+        ob_engine.update(symbol, k3m)
     except Exception as e:
-        log.debug("[%s] order_block update error: %s", symbol, e)
-
+        log.debug("[%s] ob_engine update error: %s", symbol, e)
     if getattr(C, 'OB_KM_ENABLED', False):
-        ob_boost, ob_reason, ob_block = order_block_km_filter(
-            symbol, sig.direction,
-            survival_threshold=getattr(C, 'OB_SURVIVAL_THR', 0.6),
-            boost_amount=getattr(C, 'OB_BOOST_AMOUNT', 8.0),
-            min_samples=getattr(C, 'OB_MIN_SAMPLES', 5),
-        )
+        ob_boost, ob_reason, ob_block = order_block_km_filter(symbol, sig.direction)
         if ob_block:
-            diag["counts"]["order_block_km_veto"] += 1
+            log.info("[%s] 🚫 OB/KM veto: %s", symbol, ob_reason)
+            diag["counts"]["ob_km_veto"] += 1
             return None
         if ob_boost > 0:
             sig.score = min(sig.score + ob_boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
-            diag["counts"]["order_block_km_boost"] += 1
+            diag["counts"]["ob_km_boost"] += 1
             filter_tags["order_block_km"] = ob_reason
             log.info("[%s] 📦 %s", symbol, ob_reason)
 
-    # ── 5g. Sniper Predator x VSA Matrix ─────────────────────────────────────
-    # NUEVO — port completo de Sniper Engine + VSA Engine + Anticipación.
-    # Ver sniper_vsa_matrix.py. Reutiliza k3m, necesita ~200 velas para que
-    # vsa_lookback tenga margen. Desactivado por defecto.
+    # ── 5g. Sniper Predator x VSA Matrix ────────────────────────────────────
     if getattr(C, 'SNIPER_VSA_ENABLED', False):
-        sv_boost, sv_reason, sv_block = sniper_vsa_filter(
-            k3m, sig.direction,
-            pivot_len=getattr(C, 'SV_PIVOT_LEN', 3),
-            slope_min=getattr(C, 'SV_SLOPE_MIN', 25.0),
-            poc_lookback=getattr(C, 'SV_POC_LOOKBACK', 40),
-            rvol_threshold=getattr(C, 'SV_RVOL_THR', 1.3),
-            ema_fast_len=getattr(C, 'SV_EMA_FAST', 5),
-            ema_slow_len=getattr(C, 'SV_EMA_SLOW', 13),
-            vsa_lookback=getattr(C, 'SV_VSA_LOOKBACK', 120),
-            r_threshold=getattr(C, 'SV_R_THR', 0.45),
-            vsa_threshold=getattr(C, 'SV_VSA_THR', 0.85),
-            vsa_expiry=getattr(C, 'SV_VSA_EXPIRY', 8),
-            boost_full=getattr(C, 'SV_BOOST_FULL', 10.0),
-            boost_pre_alert=getattr(C, 'SV_BOOST_PRE', 4.0),
-        )
+        sv_boost, sv_reason, sv_block = sniper_vsa_filter(k3m, sig.direction)
         if sv_block:
             log.info("[%s] 🚫 Sniper/VSA veto: %s", symbol, sv_reason)
             diag["counts"]["sniper_vsa_veto"] += 1
@@ -553,12 +511,11 @@ async def _process_symbol(
             filter_tags["sniper_vsa"] = sv_reason
             log.info("[%s] 🎯 %s", symbol, sv_reason)
 
-    # ── 5h. Fibonacci Retracement MTF ────────────────────────────────────────
-    # NUEVO — necesita klines diarias, no reutiliza k3m (timeframe distinto).
-    # Desactivado por defecto.
+    # ── 5h. Fibonacci MTF — zona dorada del día anterior ────────────────────
     if getattr(C, 'FIB_MTF_ENABLED', False):
         try:
-            k_daily = await client.get_klines(symbol, "1d", getattr(C, 'FIB_LOOKBACK_DAYS', 1) + 2)
+            k_daily = await client.get_klines(symbol, "1d",
+                                              getattr(C, 'FIB_LOOKBACK_DAYS', 1) + 2)
         except Exception as e:
             k_daily = []
             log.debug("[%s] fib k_daily fetch error: %s", symbol, e)
@@ -566,7 +523,8 @@ async def _process_symbol(
             fib_boost, fib_reason, fib_block = fib_mtf_filter(
                 k_daily, sig.entry, sig.direction,
                 lookback_days=getattr(C, 'FIB_LOOKBACK_DAYS', 1),
-                golden_zone=(getattr(C, 'FIB_ZONE_LO', 0.618), getattr(C, 'FIB_ZONE_HI', 0.786)),
+                golden_zone=(getattr(C, 'FIB_ZONE_LO', 0.618),
+                             getattr(C, 'FIB_ZONE_HI', 0.786)),
                 tolerance_pct=getattr(C, 'FIB_TOLERANCE_PCT', 0.3),
                 boost_amount=getattr(C, 'FIB_BOOST_AMOUNT', 6.0),
             )
@@ -635,6 +593,7 @@ async def _process_symbol(
     # release en cada uno de los ~7 puntos de salida posibles.
     trade_confirmed  = False
     dir_reserved     = False
+    dir_token        = None
     btc_corr         = 0.0
     btc_reserved     = False
 
@@ -645,8 +604,9 @@ async def _process_symbol(
             diag["counts"]["symbol_blocked"] += 1
             return None
 
-        # Correlation guard — reserva atómica si pasa (fix v7.8)
-        dir_ok, dir_reason = risk.direction_allowed(sig.direction)
+        # Correlation guard — reserva atómica si pasa (fix v7.8); el token
+        # identifica esta reserva específica para liberarla sin ambigüedad.
+        dir_ok, dir_reason, dir_token = risk.direction_allowed(sig.direction)
         if not dir_ok:
             log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
             diag["counts"]["correlation_blocked"] += 1
@@ -767,7 +727,7 @@ async def _process_symbol(
         if not trade_confirmed:
             await risk.release_reservation()
             if dir_reserved:
-                risk.release_direction_reservation(sig.direction)
+                risk.release_direction_reservation(sig.direction, dir_token)
             if btc_reserved:
                 btc_guard.release(sig.direction, btc_corr)
 
@@ -865,8 +825,12 @@ async def _harvest_scan(
         return
 
     # Sizing harvest: MAX_NOTIONAL * 0.25 (más pequeño que señales normales)
+    # FIX: NO dividir por LEVERAGE — qty es en unidades del activo base,
+    # igual que el fix dimensional del scanner principal. El leverage solo
+    # determina cuánto margen bloquea BingX (notional/leverage), no la qty.
+    # Con LEVERAGE=19, dividir aquí producía posiciones 19x más pequeñas.
     harvest_notional = getattr(C, 'MAX_NOTIONAL_USDT', 200) * 0.25
-    qty = harvest_notional / price / C.LEVERAGE
+    qty = harvest_notional / price
     qty = client._round_qty(symbol, qty)
     if qty <= 0:
         return
@@ -929,7 +893,7 @@ def get_current_symbols() -> list[str]:
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
-    log.info("Scanner v8.1 | Modo=%s | Interval=%ds | Batch=20",
+    log.info("Scanner v8.2 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
