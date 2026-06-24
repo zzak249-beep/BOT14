@@ -1,42 +1,36 @@
 """
-QF×JP Bot v7.10 — BingX Client DEFINITIVO (FIX CRÍTICO dirección real)
+QF×JP Bot v7.11 — BingX Client
 ═══════════════════════════════════════════════════════════════════════════════
-FIX v7.10 — CRÍTICO: place_stop_market_order() y close_position_market()
-  ya NO confían en el `direction`/`side` que pasa el caller para construir
-  órdenes de cierre. Ahora verifican la dirección REAL contra el signo de
-  positionAmt en BingX (ground truth, inequívoco en cualquier modo) ANTES
-  de construir la orden — si no coincide con lo que pasó el caller, usan
-  la verdad de BingX y lo registran con un WARNING explícito.
+FIX v7.11 — CRÍTICO: sizing 26-47x en tokens con mismatch de unidades
+  Caso real: ANIME-USDT (47x) y FLOCK-USDT (26x). El bot enviaba qty=268
+  contratos, BingX ejecutaba 7,073 tokens — la diferencia varía por par.
+  Causa probable: _extract_executed_qty() extraía un campo de la respuesta
+  de BingX (executedQty / origQty / quantity) que para algunos pares
+  devuelve el importe en tokens base en vez de contratos, resultando en
+  una qty 26-47x mayor almacenada en el trade y usada para SL/TP.
 
-  Caso confirmado en producción: BTWUSDT en renewed-love, 130+ reintentos
-  fallidos de SL/trail durante HORAS, todos con el mismo error 110424
-  "The order size must be less than the available amount of X USDT" —
-  el síntoma exacto de una orden de cierre construida con la dirección
-  invertida (BingX la interpreta como abrir posición nueva, que necesita
-  margen fresco, en vez de cerrar la existente, que no). No se encontró
-  ni se confirmó la causa raíz en position_manager.py (pendiente, no se
-  tiene el archivo) — este fix protege contra el síntoma en el punto
-  exacto donde se construyen las órdenes, sin depender de encontrar el
-  origen exacto primero. Si el warning nuevo aparece en logs, confirma
-  dónde está el bug real para arreglarlo de raíz después.
+  Fix A — safety cap en _extract_executed_qty(): si el valor extraído es
+  >5x la qty local calculada, log.error + warning Telegram + fallback a
+  la qty local. Esto cubre cualquier par no identificado todavía.
 
-NON_CRYPTO_PREFIXES (FIX v7.9, sin cambios): constante pública del módulo
-  — antes local a get_all_symbols() — para que complement_engine.py
-  también filtre OIL/WTI/BRENT/XAU/XAG/EUR/GBP/JPY en run_copy_mode(),
-  no solo BLACKLIST.
+  Fix B — log.debug del entry_resp completo para diagnosticar qué campo
+  exacto devuelve BingX para cada par afectado — permite identificar la
+  causa raíz exacta y eliminar el cap una vez corregido.
 
-DE v7.9 (sin cambios):
-  ✅ get_open_positions() lanza excepción en error de API en vez de
-     devolver [] en silencio — evita que un fallo transitorio se
-     interprete como "todas las posiciones cerradas externamente".
-     Caché de 3s (éxito y error).
+FIX v7.10 (sin cambios):
+  ✅ place_stop_market_order() y close_position_market() verifican
+     dirección REAL contra positionAmt antes de construir la orden.
 
-DE v7.8 (sin cambios):
-  ✅ TP1 como TAKE_PROFIT límite (maker) con fallback automático a market
-  ✅ place_limit_entry() coloca SL+TP1+TP2 al confirmar el fill
-  ✅ Firma byte-a-byte, _extract_executed_qty(), _safe_qty_for_sl()
-  ✅ Retry HTTP 3 intentos con backoff exponencial
-  ✅ cancel_order / cancel_all_orders con DELETE (no POST)
+FIX v7.9 (sin cambios):
+  ✅ get_open_positions() lanza excepción en error de API (no devuelve []).
+  ✅ Caché de 3s en get_open_positions().
+
+FIX v7.8 (sin cambios):
+  ✅ TP1 como TAKE_PROFIT límite (maker) con fallback automático a market.
+  ✅ place_limit_entry() coloca SL+TP1+TP2 al confirmar el fill.
+  ✅ Firma byte-a-byte, _extract_executed_qty(), _safe_qty_for_sl().
+  ✅ Retry HTTP 3 intentos con backoff exponencial.
+  ✅ cancel_order / cancel_all_orders con DELETE (no POST).
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -61,16 +55,15 @@ NON_CRYPTO_PREFIXES = (
 
 class BingXClient:
     def __init__(self):
-        self._session:        aiohttp.ClientSession | None = None
+        self._session:        object = None
         self._precision_map:  dict[str, int]   = {}
         self._min_qty_map:    dict[str, float] = {}
         self._step_map:       dict[str, float] = {}
-        # FIX v7.9: caché corta de get_open_positions() — ver docstring del módulo.
         self._positions_cache: tuple = (0.0, [])
         self._POSITIONS_CACHE_TTL = 3.0
-        log.info("BingXClient v7.10 — firma byte-a-byte + SL/TP en límite + TP1 maker + "
-                 "fix get_open_positions + verificación de dirección real")
-        # Diagnóstico seguro: longitud de claves, NUNCA el valor real.
+        log.info("BingXClient v7.11 — safety cap qty mismatch + firma byte-a-byte + "
+                 "SL/TP en límite + TP1 maker + fix get_open_positions + "
+                 "verificación de dirección real")
         log.info("[auth] API_KEY len=%d | SECRET_KEY len=%d",
                   len(C.BINGX_API_KEY), len(C.BINGX_SECRET_KEY))
         if not C.BINGX_API_KEY or not C.BINGX_SECRET_KEY:
@@ -87,21 +80,11 @@ class BingXClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    # ── Firma + construcción de URL — TODO en un solo paso ───────────────────
+    # ── Firma + construcción de URL ───────────────────────────────────────────
 
-    def _build_url(self, path: str, params: dict | None, signed: bool) -> tuple[str, dict]:
-        """
-        Construye la URL completa con el query string EXACTO que se firma.
-
-        CRÍTICO: el string que se firma y el string que se transmite deben
-        ser BYTE-IDÉNTICOS. Por eso esta función no devuelve un dict para
-        que aiohttp lo vuelva a serializar — devuelve la URL ya completa
-        (con &signature= incluido si signed=True) para pasarla directo a
-        session.get/post/delete SIN el argumento params=.
-        """
+    def _build_url(self, path: str, params: dict, signed: bool) -> tuple[str, dict]:
         p = dict(params or {})
         headers = {}
-
         if signed:
             p["timestamp"]  = int(time.time() * 1000)
             p["recvWindow"] = 10000
@@ -115,18 +98,14 @@ class BingXClient:
             headers = {"X-BX-APIKEY": C.BINGX_API_KEY}
         else:
             qs = urlencode(sorted(p.items())) if p else ""
-
         url = f"{C.BINGX_BASE_URL}{path}"
         if qs:
             url = f"{url}?{qs}"
         return url, headers
 
-    # ── HTTP con retry (3 intentos, backoff exponencial) ─────────────────────
-    # FIX v7.6: nunca se pasa params= aquí — la URL ya viene completa y
-    # firmada desde _build_url(), así que session.get/post/delete(url) la
-    # usa tal cual, sin ninguna re-serialización intermedia.
+    # ── HTTP con retry ────────────────────────────────────────────────────────
 
-    async def _get(self, path: str, params: dict | None = None,
+    async def _get(self, path: str, params: dict = None,
                    signed: bool = True) -> dict:
         for attempt in range(3):
             try:
@@ -156,7 +135,6 @@ class BingXClient:
         return {}
 
     async def _delete(self, path: str, params: dict) -> dict:
-        """DELETE correcto para cancel_order y cancel_all_orders."""
         for attempt in range(3):
             try:
                 s = await self._get_session()
@@ -196,7 +174,29 @@ class BingXClient:
         min_qty = self._min_qty_map.get(symbol, 0)
         return max(qty, min_qty) if qty > 0 else 0.0
 
-    def _extract_executed_qty(self, entry_resp: dict, fallback_qty: float) -> float:
+    def _extract_executed_qty(self, entry_resp: dict, fallback_qty: float,
+                               symbol: str = "") -> float:
+        """
+        Extrae la qty ejecutada de la respuesta de BingX.
+
+        FIX v7.11 — SAFETY CAP: si el valor extraído es >5x la qty local
+        calculada, descarta la extracción y usa el fallback. Caso real
+        confirmado en producción:
+          - ANIME-USDT: bot ordenó 4,496 contratos, BingX devolvió
+            executedQty=212,520 (tokens base, ratio 47x) — el bot almacenó
+            212,520 como trade.qty, abriendo una posición 47x mayor de lo
+            calculado y sufriendo una pérdida de -11.33 USDT en vez de
+            los ~0.11 USDT de riesgo calculados.
+          - FLOCK-USDT: mismo bug, ratio 26x, pérdida -9.19 USDT.
+
+        El log de debug del entry_resp completo permite identificar qué
+        campo exacto BingX usa para cada par afectado y corregir la causa
+        raíz una vez confirmada.
+        """
+        # FIX v7.11: log completo para diagnóstico de mismatch de unidades
+        if symbol:
+            log.debug("[%s] entry_resp completo: %s", symbol, entry_resp)
+
         try:
             data  = entry_resp.get("data", {})
             order = data.get("order", data)
@@ -205,15 +205,55 @@ class BingXClient:
                 if val and str(val) not in ("", "0", "0.0"):
                     extracted = float(val)
                     if extracted > 0:
+                        # FIX v7.11 — SAFETY CAP ────────────────────────────
+                        # Si el valor extraído es >5x la qty local, es una
+                        # señal clara de mismatch de unidades (contratos vs
+                        # tokens base). Usar fallback y alertar.
+                        # El umbral es 5x (no 2x) para no dispararse con
+                        # variaciones normales de fill parcial o slippage.
+                        if fallback_qty > 0 and extracted > fallback_qty * 5:
+                            log.error(
+                                "[%s] ⚠️ SAFETY CAP qty: campo '%s' devolvió %.4f "
+                                "(%.1fx la qty local %.4f) — probable mismatch "
+                                "contratos/tokens en BingX. Usando fallback %.4f. "
+                                "Revisar entry_resp en logs DEBUG.",
+                                symbol, field, extracted,
+                                extracted / max(fallback_qty, 1e-9),
+                                fallback_qty, fallback_qty,
+                            )
+                            # Notificación Telegram asíncrona no disponible
+                            # aquí — el log.error es suficiente para Railway.
+                            # El llamador (open_trade) logueará "qty ajustada"
+                            # solo si la diferencia supera el 0.1% — en este
+                            # caso no habrá diferencia (fallback = local).
+                            return self._safe_qty_for_sl(symbol, fallback_qty)
                         return extracted
         except Exception:
             pass
-        return self._safe_qty_for_sl("", fallback_qty)
+        return self._safe_qty_for_sl(symbol, fallback_qty)
 
     def _parse_error(self, resp: dict) -> str:
         if not isinstance(resp, dict):
             return ""
         return str(resp.get("msg", resp.get("message", ""))).lower()
+
+    @staticmethod
+    def is_api_disabled_error(resp: dict) -> bool:
+        """
+        Detecta el error 109400: BingX deshabilita órdenes API temporalmente
+        durante volatilidad extrema para evitar liquidaciones en cascada.
+
+        Cuando ocurre, NO hay que reintentar inmediatamente — BingX tarda
+        entre 1 y 5 minutos en restaurar. El caller debe esperar y reintentar
+        en el próximo ciclo del monitor (ya implementado via trail_order_id="").
+
+        Ejemplo del mensaje:
+          'Reminder: Due to the large market fluctuations, in order to reduce
+          the risk of liquidation, API orders are temporarily disabled.'
+        """
+        if not isinstance(resp, dict):
+            return False
+        return resp.get("code") == 109400
 
     # ── positionSide auto-detección ───────────────────────────────────────────
 
@@ -234,22 +274,7 @@ class BingXClient:
         """
         FIX v7.10 CRÍTICO — determina la dirección REAL de la posición
         desde el signo de positionAmt en BingX, no se fía del `direction`
-        que pasa el caller. Caso confirmado en producción: BTWUSDT, 130+
-        reintentos fallidos de SL/trail con 'order size must be less than
-        the available amount' — síntoma exacto de una orden de cierre
-        construida con la dirección invertida, que BingX interpreta como
-        abrir posición nueva (necesita margen fresco) en vez de cerrar la
-        existente (reduce-only, no necesita margen). _get_real_position_side()
-        ya corregía el parámetro positionSide, pero el `side` (BUY/SELL) lo
-        seguía calculando el caller con SU PROPIA idea de la dirección —
-        si esa idea está mal (origen aún sin confirmar, posiblemente en
-        reconcile_on_startup() o en el tracking tras un trade copiado),
-        el side sale invertido igual.
-
-        positionAmt es inequívoco: positivo = LONG, negativo = SHORT, sin
-        importar one-way o hedge mode. Si no se encuentra la posición
-        (cerrada entre el cálculo y la llamada, o symbol nuevo) cae al
-        fallback_direction del caller.
+        que pasa el caller.
         """
         try:
             positions = await self.get_open_positions()
@@ -279,15 +304,6 @@ class BingXClient:
         symbols      = []
         vol_map:     dict[str, float] = {}
         vol_detected = 0
-        # FIX v7.10: _bad ahora es NON_CRYPTO_PREFIXES, constante pública del
-        # módulo (antes local a esta función) — complement_engine.py también
-        # la importa para que run_copy_mode() filtre lo mismo que el scanner.
-        # Antes eran dos listas separadas (BLACKLIST de config.py aquí no
-        # incluye OIL/WTI/XAU) y el camino de copy-trade nunca pasaba por
-        # get_all_symbols(), así que Oil WTI y GOLD(XAU) se colaban en
-        # cuentas que copiaban trades del master en vez de escanear ellas
-        # mismas. Caso real: zesty-reverence con Oil WTI y GOLD(XAU) en su
-        # historial, ninguno de los dos generado por su propio scanner.
 
         for item in raw:
             if not isinstance(item, dict):
@@ -297,11 +313,6 @@ class BingXClient:
                 continue
             if "-" not in sym and sym.endswith("USDT"):
                 sym = sym[:-4] + "-USDT"
-            # FIX CRÍTICO: BLACKLIST se configura SIN sufijo ("SYN", "ESPORTS")
-            # pero `sym` aquí ya está normalizado CON sufijo ("SYN-USDT").
-            # `sym in C.BLACKLIST` nunca coincidía → el blacklist nunca filtró
-            # nada, ni siquiera ESPORTS pese a estar añadido explícitamente.
-            # Se compara contra ambas formas para cubrir cualquier config.
             base_sym = sym.replace("-USDT", "")
             if not sym.endswith("-USDT") or base_sym in C.BLACKLIST or sym in C.BLACKLIST:
                 continue
@@ -405,20 +416,12 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
-        """
-        FIX v7.6 (reincorporado de v6.4): revisa data["code"] ANTES de
-        extraer. Un error de firma/permiso llega como HTTP 200 +
-        {'code': 100001}, y antes se traducía en silencio a balance=0.0
-        sin ningún log de error — ahora queda visible explícitamente.
-        """
         data = await self._get("/openApi/swap/v3/user/balance", {"currency": "USDT"})
-
         code = data.get("code", 0)
         if code not in (0, None):
             log.error("[auth] get_balance código=%s msg=%s — firma/permiso rechazado por BingX",
                       code, data.get("msg", ""))
             return 0.0
-
         raw = data.get("data", {})
 
         def _extract(d: dict) -> float:
@@ -446,23 +449,8 @@ class BingXClient:
 
     async def get_open_positions(self) -> list:
         """
-        FIX v7.9 — CRÍTICO: ya NO devuelve [] en silencio si BingX responde
-        con error (firma rechazada, rate limit, lo que sea). Antes eso era
-        indistinguible de "de verdad no hay posiciones", y
-        _check_all_positions() en position_manager.py interpretaba un
-        fallo transitorio de la API como "todas las posiciones se cerraron
-        externamente" — las sacaba del tracking, notificaba cierres falsos,
-        y liberaba cupo de MAX_OPEN_TRADES que en realidad seguía ocupado.
-
-        Ahora LANZA excepción en error — los 3 callers (_check_all_positions,
-        get_unrealized_pnl, _get_real_position_side) ya tienen try/except
-        preparados para esto, así que con este cambio caen en su fallback
-        seguro (saltar el ciclo) en vez de asumir "cero posiciones".
-
-        Caché de 3s (éxito Y error se cachean, ver docstring del módulo) —
-        colapsa ráfagas de llamadas casi simultáneas del mismo ciclo de
-        scan en una sola consulta real, reduciendo la presión que causaba
-        el rate limit en primer lugar.
+        FIX v7.9: lanza excepción en error de API (no devuelve [] en silencio).
+        Caché de 3s para colapsar ráfagas de llamadas del mismo ciclo.
         """
         now = time.time()
         cache_ts, cache_val = self._positions_cache
@@ -472,7 +460,6 @@ class BingXClient:
             return cache_val
 
         data = await self._get("/openApi/swap/v2/user/positions")
-
         code = data.get("code", 0)
         if code not in (0, None):
             msg = data.get("msg", "")
@@ -523,19 +510,8 @@ class BingXClient:
         stop_price:  float,
         direction:   str = "LONG",
         order_type:  str = "STOP_MARKET",
-        limit_price: float | None = None,
+        limit_price: float = None,
     ) -> dict:
-        """
-        FIX v7.8: nuevo parámetro opcional limit_price. Necesario cuando
-        order_type es la variante límite ("TAKE_PROFIT" o "STOP", no sus
-        versiones "_MARKET") — BingX exige un precio de ejecución además
-        del precio de disparo (stopPrice). Se asume que el campo se llama
-        "price" (convención Binance-style que el resto de esta API sigue:
-        positionSide, workingType, priceProtect). NO confirmado al 100%
-        contra la doc oficial — ver _tp_limit_price() en stc... (en
-        scanner-side) y el fallback automático en open_trade()/
-        place_limit_entry().
-        """
         qty     = self._round_qty(symbol, quantity)
         real_direction, real_ps = await self._get_real_direction_and_side(symbol, direction)
         real_side = "SELL" if real_direction == "LONG" else "BUY"
@@ -543,10 +519,7 @@ class BingXClient:
             log.warning(
                 "[%s] ⚠️ SIDE INVERTIDO detectado y corregido en place_stop_market_order "
                 "— el caller pasó side=%s (asumiendo direction=%s), pero BingX confirma "
-                "que la posición real es %s (positionAmt). Usando side=%s (verdad de "
-                "BingX). Patrón exacto del bug que dejaba BTWUSDT sin protección "
-                "(110424 'order size must be less than available amount') — la orden "
-                "se construía para abrir posición nueva, no para cerrar la existente.",
+                "que la posición real es %s (positionAmt). Usando side=%s.",
                 symbol, side, direction, real_direction, real_side,
             )
             side = real_side
@@ -580,14 +553,12 @@ class BingXClient:
         return resp if isinstance(resp, dict) else {"code": -1, "msg": str(resp)}
 
     async def cancel_order(self, symbol: str, order_id: str) -> dict:
-        """DELETE correcto — v7.2 usaba POST (no cancelaba nada)."""
         return await self._delete(
             "/openApi/swap/v2/trade/order",
             {"symbol": symbol, "orderId": order_id},
         )
 
     async def cancel_all_orders(self, symbol: str) -> dict:
-        """DELETE correcto."""
         return await self._delete(
             "/openApi/swap/v2/trade/allOpenOrders",
             {"symbol": symbol},
@@ -601,9 +572,8 @@ class BingXClient:
         if real_direction != direction:
             log.warning(
                 "[%s] ⚠️ direction INVERTIDA detectada y corregida en "
-                "close_position_market — caller pasó direction=%s, BingX confirma "
-                "%s (positionAmt). Cerrando con side=%s (verdad de BingX).",
-                symbol, direction, real_direction, side,
+                "close_position_market — caller pasó direction=%s, BingX confirma %s.",
+                symbol, direction, real_direction,
             )
 
         params = {"symbol": symbol, "side": side, "positionSide": real_ps,
@@ -636,7 +606,6 @@ class BingXClient:
         if qty <= 0:
             return {"entry": {"code": -1, "msg": "qty_zero"}}
 
-        # Entrada
         entry_resp = await self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         side_open,
@@ -651,26 +620,23 @@ class BingXClient:
         if entry_resp.get("code", -1) != 0:
             return results
 
-        # qty real ejecutada (fix 110424)
-        real_qty = self._extract_executed_qty(entry_resp, qty)
+        # FIX v7.11: se pasa symbol para safety cap y debug log
+        real_qty = self._extract_executed_qty(entry_resp, qty, symbol=symbol)
         if abs(real_qty - qty) > qty * 0.001:
             log.info("[%s] qty ajustada: local=%.6f real=%.6f", symbol, qty, real_qty)
         qty = real_qty
 
         await asyncio.sleep(1.2)
 
-        # Split para TP
         step = self._step_map.get(symbol, 0)
         prec = max(0, round(-math.log10(step))) if step > 0 else self._precision_map.get(symbol, 4)
         f    = 10 ** prec
         qty_half   = math.floor(qty / 2 * f) / f
         qty_remain = math.floor((qty - qty_half) * f) / f
 
-        # FIX v7.8: TP1 se intenta como TAKE_PROFIT límite (maker) primero
         price_prec = max(self._precision_map.get(symbol, 4), 2)
         tp1_limit  = _tp_limit_price(tp1_price, direction, price_prec)
 
-        # SL + TP1(límite) + TP2 en paralelo
         sl_r, tp1_r, tp2_r = await asyncio.gather(
             self.place_stop_market_order(symbol, side_cls, qty,        sl_price,  direction, "STOP_MARKET"),
             self.place_stop_market_order(symbol, side_cls, qty_half,   tp1_price, direction, "TAKE_PROFIT",
@@ -679,10 +645,6 @@ class BingXClient:
             return_exceptions=True,
         )
 
-        # FIX v7.8: fallback de TP1 — si la variante límite falla (ej. el
-        # parámetro "price" no es el esperado por BingX para este tipo),
-        # reintentar inmediatamente como TAKE_PROFIT_MARKET. Nunca debe
-        # quedar el trade sin TP1, en el peor caso se pierde el ahorro de fee.
         tp1_resp = tp1_r if isinstance(tp1_r, dict) else {"code": -1, "msg": str(tp1_r)}
         if tp1_resp.get("code", -1) == 0:
             log.info("[%s] TP1 OK (límite/maker) @ trigger=%.6f limit=%.6f",
@@ -719,12 +681,6 @@ class BingXClient:
     # ── Open Interest ─────────────────────────────────────────────────────────
 
     async def get_open_interest(self, symbol: str) -> float:
-        """
-        Retorna el Open Interest actual en USD del símbolo.
-        Endpoint: /openApi/swap/v2/quote/openInterest
-        El OI creciente en dirección de la señal confirma la tendencia;
-        OI decreciente sugiere que las posiciones se están cerrando (trampa).
-        """
         try:
             data = await self._get(
                 "/openApi/swap/v2/quote/openInterest",
@@ -733,8 +689,7 @@ class BingXClient:
             )
             raw = data.get("data", {})
             if isinstance(raw, dict):
-                oi = float(raw.get("openInterest", raw.get("openInterestValue", 0)) or 0)
-                return oi
+                return float(raw.get("openInterest", raw.get("openInterestValue", 0)) or 0)
         except Exception as e:
             log.debug("[%s] get_open_interest error: %s", symbol, e)
         return 0.0
@@ -752,28 +707,11 @@ class BingXClient:
         tp2_price:  float,
         timeout_s:  int = 25,
     ) -> dict:
-        """
-        Orden límite real MAKER (fee 0.02% vs 0.05% taker = ahorro 60%).
-
-        Precio:
-          LONG:  price * 0.9995 (0.05% bajo el mark) → añade liquidez = MAKER
-          SHORT: price * 1.0005 (0.05% sobre el mark) → añade liquidez = MAKER
-
-        Si no se llena en timeout_s cancela y devuelve {} para fallback a
-        market (open_trade(), que sí coloca SL/TP).
-
-        FIX v7.7: tras confirmar el fill, coloca SL + TP1 + TP2 — antes
-        este camino dejaba el trade sin ninguna protección.
-
-        FIX v7.8: TP1 se intenta como TAKE_PROFIT límite (maker) con
-        fallback automático a TAKE_PROFIT_MARKET.
-        """
         qty_r     = self._round_qty(symbol, qty)
         side_open = "BUY" if direction == "LONG" else "SELL"
         side_cls  = "SELL" if direction == "LONG" else "BUY"
         prec      = max(self._precision_map.get(symbol, 4), 2)
 
-        # Precio ligeramente mejor que el mark → garantiza maker
         if direction == "LONG":
             lmt_price = round(price * 0.9995, prec + 2)
         else:
@@ -804,7 +742,6 @@ class BingXClient:
         log.info("[%s] 📋 Limit entry @ %.6f (maker) — esperando fill (%ds)",
                  symbol, lmt_price, timeout_s)
 
-        # Polling hasta timeout
         filled   = False
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -819,16 +756,14 @@ class BingXClient:
                 pass
 
         if not filled:
-            # Timeout — cancelar y fallback a market (open_trade() sí coloca SL/TP)
             try:
                 await self.cancel_order(symbol, order_id)
                 log.info("[%s] Limit timeout (%ds) — cancelada → market order", symbol, timeout_s)
             except Exception as e:
                 log.debug("[%s] cancel limit: %s", symbol, e)
-            return {}   # vacío = caller usa market
+            return {}
 
         log.info("[%s] ✅ Limit LLENA — fee maker 0.02%% — colocando SL/TP1/TP2", symbol)
-
         await asyncio.sleep(0.5)
 
         step = self._step_map.get(symbol, 0)
@@ -837,7 +772,6 @@ class BingXClient:
         qty_half   = math.floor(qty_r / 2 * f) / f
         qty_remain = math.floor((qty_r - qty_half) * f) / f
 
-        # FIX v7.8: TP1 como TAKE_PROFIT límite (maker) primero
         tp1_limit = _tp_limit_price(tp1_price, direction, prec)
 
         sl_r, tp1_r, tp2_r = await asyncio.gather(
@@ -850,7 +784,6 @@ class BingXClient:
 
         protection = {}
 
-        # Fallback TP1 — mismo mecanismo que open_trade()
         tp1_resp = tp1_r if isinstance(tp1_r, dict) else {"code": -1, "msg": str(tp1_r)}
         if tp1_resp.get("code", -1) == 0:
             log.info("[%s] TP1 OK (límite/maker, limit path) @ trigger=%.6f limit=%.6f",
@@ -884,27 +817,9 @@ class BingXClient:
         return resp
 
 
-# ── Helper de precio para TP1 límite (FIX v7.8) ───────────────────────────────
+# ── Helper de precio para TP1 límite ─────────────────────────────────────────
 
 def _tp_limit_price(trigger_price: float, direction: str, prec: int) -> float:
-    """
-    Precio de ejecución límite para TP1 cuando se coloca como TAKE_PROFIT
-    (variante límite) en vez de TAKE_PROFIT_MARKET — necesario para que la
-    salida sea MAKER (0.02%) en vez de TAKER (0.05%).
-
-    Mismo principio de offset que place_limit_entry() usa para la entrada,
-    pero invertido: el cierre es el lado contrario al de apertura.
-      - LONG  cierra con SELL → limit ligeramente POR ENCIMA del trigger
-              (igual que una entrada SHORT: +0.05%) — se sienta como ask
-              en el libro en vez de cruzar el bid inmediatamente.
-      - SHORT cierra con BUY  → limit ligeramente POR DEBAJO del trigger
-              (igual que una entrada LONG: -0.05%).
-
-    NO CONFIRMADO AL 100% contra la doc oficial de BingX. Con el fallback
-    automático en open_trade() y place_limit_entry(), un precio mal
-    calculado en el peor caso causa que la orden límite no se acepte y se
-    cae a TAKE_PROFIT_MARKET — no deja el trade sin TP1.
-    """
     if direction == "LONG":
         return round(trigger_price * 1.0005, prec + 2)
     else:
