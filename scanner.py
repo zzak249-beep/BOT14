@@ -76,9 +76,6 @@ from stc_asymmetry import stc_asymmetry_filter, stc_volume_slope_filter
 from price_action_framework import price_action_filter
 from trend_magic_rmi import trend_magic_rmi_filter
 from ws_market_data import ws_cache
-from order_block_km import ob_engine, order_block_km_filter
-from sniper_vsa_matrix import sniper_vsa_filter
-from fibonacci_mtf import fib_mtf_filter
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
@@ -477,68 +474,6 @@ async def _process_symbol(
             filter_tags["trend_magic_rmi"] = tmr_reason
             log.info("[%s] 🧲 %s", symbol, tmr_reason)
 
-    # ── 5f. Order Block KM — siempre se actualiza, filtro opcional ───────────
-    # ob_engine.update() corre SIEMPRE para acumular historial, aunque el
-    # filtro esté desactivado — así cuando lo actives ya tiene muestra.
-    try:
-        ob_engine.update(symbol, k3m)
-    except Exception as e:
-        log.debug("[%s] ob_engine update error: %s", symbol, e)
-    if getattr(C, 'OB_KM_ENABLED', False):
-        ob_boost, ob_reason, ob_block = order_block_km_filter(symbol, sig.direction)
-        if ob_block:
-            log.info("[%s] 🚫 OB/KM veto: %s", symbol, ob_reason)
-            diag["counts"]["ob_km_veto"] += 1
-            return None
-        if ob_boost > 0:
-            sig.score = min(sig.score + ob_boost, 100.0)
-            sig.tier  = score_to_tier(sig.score)
-            diag["counts"]["ob_km_boost"] += 1
-            filter_tags["order_block_km"] = ob_reason
-            log.info("[%s] 📦 %s", symbol, ob_reason)
-
-    # ── 5g. Sniper Predator x VSA Matrix ────────────────────────────────────
-    if getattr(C, 'SNIPER_VSA_ENABLED', False):
-        sv_boost, sv_reason, sv_block = sniper_vsa_filter(k3m, sig.direction)
-        if sv_block:
-            log.info("[%s] 🚫 Sniper/VSA veto: %s", symbol, sv_reason)
-            diag["counts"]["sniper_vsa_veto"] += 1
-            return None
-        if sv_boost > 0:
-            sig.score = min(sig.score + sv_boost, 100.0)
-            sig.tier  = score_to_tier(sig.score)
-            diag["counts"]["sniper_vsa_boost"] += 1
-            filter_tags["sniper_vsa"] = sv_reason
-            log.info("[%s] 🎯 %s", symbol, sv_reason)
-
-    # ── 5h. Fibonacci MTF — zona dorada del día anterior ────────────────────
-    if getattr(C, 'FIB_MTF_ENABLED', False):
-        try:
-            k_daily = await client.get_klines(symbol, "1d",
-                                              getattr(C, 'FIB_LOOKBACK_DAYS', 1) + 2)
-        except Exception as e:
-            k_daily = []
-            log.debug("[%s] fib k_daily fetch error: %s", symbol, e)
-        if len(k_daily) >= getattr(C, 'FIB_LOOKBACK_DAYS', 1) + 1:
-            fib_boost, fib_reason, fib_block = fib_mtf_filter(
-                k_daily, sig.entry, sig.direction,
-                lookback_days=getattr(C, 'FIB_LOOKBACK_DAYS', 1),
-                golden_zone=(getattr(C, 'FIB_ZONE_LO', 0.618),
-                             getattr(C, 'FIB_ZONE_HI', 0.786)),
-                tolerance_pct=getattr(C, 'FIB_TOLERANCE_PCT', 0.3),
-                boost_amount=getattr(C, 'FIB_BOOST_AMOUNT', 6.0),
-            )
-            if fib_block:
-                log.info("[%s] 🚫 Fib MTF veto: %s", symbol, fib_reason)
-                diag["counts"]["fib_mtf_veto"] += 1
-                return None
-            if fib_boost > 0:
-                sig.score = min(sig.score + fib_boost, 100.0)
-                sig.tier  = score_to_tier(sig.score)
-                diag["counts"]["fib_mtf_boost"] += 1
-                filter_tags["fib_mtf"] = fib_reason
-                log.info("[%s] 📏 %s", symbol, fib_reason)
-
     # ── 6. BTC Correlation Guard se evalúa DENTRO del bloque LIVE (más abajo)
     # — moverlo aquí causaba fuga de reserva si MODE=SIGNAL o si score/tier
     # rechazaban la señal después, ya que esos `return` ocurren ANTES del
@@ -561,8 +496,45 @@ async def _process_symbol(
     # ── 7. Adaptive threshold (feed del TradeJournal) ──────────────────────
     adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
     effective_min   = C.MIN_SCORE + adaptive_offset
+
+    # ── NUEVO: Penalización counter-trend ─────────────────────────────────
+    # Cuando el HTF no está completamente alineado con la señal (solo 2/3
+    # timeframes vs 3/3), la señal va contra el flujo dominante y necesita
+    # más evidencia para justificarse. Cada timeframe que falta suma una
+    # penalización configurable al umbral mínimo.
+    # Caso real evitado: LONG en mercado 4h bajista con solo 15m/1h alcistas
+    # → demasiado ruido contratendencia → loss. Con esta regla, ese LONG
+    # habría necesitado score >= MIN_SCORE + COUNTER_TREND_PENALTY para pasar.
+    htf_score_val = getattr(sig, 'htf_score', 0.5)
+    # Reconstruir htf_aligned a partir del sig.htf_score (0-1 escalado):
+    # Usamos una proxy simple: si htf_score < 0.4 es mayoritariamente
+    # contra-tendencia, si > 0.6 es mayoritariamente a favor.
+    _counter_penalty = getattr(C, 'COUNTER_TREND_PENALTY', 8.0)
+    _htf_s = float(sig.htf_score) if hasattr(sig, 'htf_score') else 0.5
+    if sig.direction == "LONG" and _htf_s < 0.45:
+        effective_min += _counter_penalty
+        diag["counts"]["counter_trend_penalty"] = diag["counts"].get("counter_trend_penalty", 0) + 1
+        log.debug("[%s] Penalización counter-trend LONG: htf=%.2f → min_score=%.1f",
+                  symbol, _htf_s, effective_min)
+    elif sig.direction == "SHORT" and _htf_s > 0.55:
+        effective_min += _counter_penalty
+        diag["counts"]["counter_trend_penalty"] = diag["counts"].get("counter_trend_penalty", 0) + 1
+        log.debug("[%s] Penalización counter-trend SHORT: htf=%.2f → min_score=%.1f",
+                  symbol, _htf_s, effective_min)
+
     if sig.score < effective_min:
         diag["counts"]["score_bajo"] += 1
+        return None
+
+    # ── NUEVO: Convicción mínima ──────────────────────────────────────────
+    # El campo conviction (0-20) de indicators.py cuenta evidencias
+    # independientes a favor de la señal. Con MIN_CONVICTION=5 filtramos
+    # señales donde solo 1-4 indicadores confirman, reduciendo entradas
+    # en señales "técnicamente válidas" pero sin confluencia real.
+    _min_conviction = getattr(C, 'MIN_CONVICTION', 5)
+    if hasattr(sig, 'conviction') and sig.conviction < _min_conviction:
+        log.debug("[%s] Convicción insuficiente: %d/%d", symbol, sig.conviction, _min_conviction)
+        diag["counts"]["conviction_bajo"] += 1
         return None
 
     if not risk.tier_ok(sig.tier):
@@ -596,6 +568,7 @@ async def _process_symbol(
     dir_token        = None
     btc_corr         = 0.0
     btc_reserved     = False
+    btc_token        = None
 
     try:
         sym_ok, sym_reason = risk.symbol_allowed(symbol)
@@ -625,7 +598,7 @@ async def _process_symbol(
             btc_guard.max_same   = getattr(C, 'BTC_CORR_MAX_SAME', 3)
             btc_reserved = abs(btc_corr) >= btc_guard.threshold
             if btc_reserved:
-                btc_ok, btc_reason = btc_guard.allowed(sig.direction, btc_corr)
+                btc_ok, btc_reason, btc_token = btc_guard.allowed(sig.direction, btc_corr)
                 if not btc_ok:
                     log.info("[%s] 🔗 %s", symbol, btc_reason)
                     diag["counts"]["btc_correlation_blocked"] += 1
@@ -729,7 +702,7 @@ async def _process_symbol(
             if dir_reserved:
                 risk.release_direction_reservation(sig.direction, dir_token)
             if btc_reserved:
-                btc_guard.release(sig.direction, btc_corr)
+                btc_guard.release(sig.direction, btc_corr, btc_token)
 
 
 def _new_diag() -> dict:
@@ -811,26 +784,22 @@ async def _harvest_scan(
         k3m = await client.get_klines(symbol, C.TIMEFRAME, 50)
         if len(k3m) < 20:
             return
-        import numpy as np
-        highs  = np.array([c[2] for c in k3m[-20:]])
-        lows   = np.array([c[3] for c in k3m[-20:]])
-        closes = np.array([c[4] for c in k3m[-20:]])
-        tr = np.maximum(highs - lows,
-             np.maximum(abs(highs - np.roll(closes, 1)),
-                        abs(lows  - np.roll(closes, 1))))
-        atr   = float(np.mean(tr[1:]))
+        # FIX v8.3: numpy reemplazado por Python puro — misma lógica,
+        # sin dependencia de numpy que puede fallar silenciosamente.
+        recent = k3m[-20:]
+        tr_vals = []
+        for i in range(1, len(recent)):
+            h, l, pc = recent[i][2], recent[i][3], recent[i-1][4]
+            tr_vals.append(max(h - l, abs(h - pc), abs(l - pc)))
+        atr   = sum(tr_vals) / len(tr_vals) if tr_vals else 0.01
         price = float(k3m[-1][4])
     except Exception as e:
         log.debug("Harvest klines error: %s", e)
         return
 
     # Sizing harvest: MAX_NOTIONAL * 0.25 (más pequeño que señales normales)
-    # FIX: NO dividir por LEVERAGE — qty es en unidades del activo base,
-    # igual que el fix dimensional del scanner principal. El leverage solo
-    # determina cuánto margen bloquea BingX (notional/leverage), no la qty.
-    # Con LEVERAGE=19, dividir aquí producía posiciones 19x más pequeñas.
     harvest_notional = getattr(C, 'MAX_NOTIONAL_USDT', 200) * 0.25
-    qty = harvest_notional / price
+    qty = harvest_notional / price  # FIX v8.3: no / LEVERAGE
     qty = client._round_qty(symbol, qty)
     if qty <= 0:
         return
@@ -893,7 +862,7 @@ def get_current_symbols() -> list[str]:
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
-    log.info("Scanner v8.2 | Modo=%s | Interval=%ds | Batch=20",
+    log.info("Scanner v7.7 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
@@ -942,6 +911,25 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
                 btc_klines = await client.get_klines("BTC-USDT", C.TIMEFRAME, 80)
             except Exception as e:
                 log.debug("BTC klines fetch error: %s", e)
+
+        # ── FIX v8.3: BTC REGIME FILTER ─────────────────────────────────────
+        # Usa las btc_klines ya fetcheadas para calcular MA10/MA20 del
+        # timeframe principal. Si BTC está bajo su MA20, loguear la situación.
+        # Con BTC_REGIME_BLOCK=true → el counter_trend_penalty se aplica de
+        # forma más agresiva a señales LONG en el siguiente ciclo.
+        btc_macro_bull = True
+        if btc_klines and len(btc_klines) >= 20:
+            btc_cls = [c[4] for c in btc_klines]
+            btc_ma10 = sum(btc_cls[-10:]) / 10
+            btc_ma20 = sum(btc_cls[-20:]) / 20
+            btc_macro_bull = btc_ma10 > btc_ma20
+            if not btc_macro_bull and iteration % 5 == 0:
+                log.info(
+                    "📉 BTC REGIME: MA10=%.0f < MA20=%.0f — bear macro "
+                    "(Qullamaggie filter activo, LONGs penalizados)",
+                    btc_ma10, btc_ma20,
+                )
+                diag["counts"]["btc_regime_bear"] += 1
 
         BATCH = 20
         signals_found = 0
