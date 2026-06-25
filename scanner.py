@@ -78,6 +78,13 @@ from trend_magic_rmi import trend_magic_rmi_filter
 from ws_market_data import ws_cache
 import telegram_client as tg
 
+# v8.3: OI + Funding Cascade Signal — import opcional
+try:
+    from oi_cascade_signal import oi_cascade_engine as _oi_engine
+    _OI_CASCADE_AVAILABLE = True
+except ImportError:
+    _OI_CASCADE_AVAILABLE = False
+
 log = logging.getLogger("scanner")
 
 _cb_blacklist: dict[str, float] = {}
@@ -112,13 +119,14 @@ async def _fetch_all(client: BingXClient, symbol: str):
         client.get_klines(symbol, C.HTF5_TIMEFRAME, 100),
         client.get_order_book(symbol, 10),
         client.get_funding_rate(symbol),
+        client.get_open_interest(symbol),   # v8.3: OI para cascade signal
         return_exceptions=True,
     )
     def _l(r): return r if isinstance(r, list) else []
     def _d(r): return r if isinstance(r, dict) else {}
     def _f(r): return r if isinstance(r, float) else 0.0
     return (_l(results[0]), _l(results[1]), _l(results[2]), _l(results[3]),
-            _d(results[4]), _f(results[5]))
+            _d(results[4]), _f(results[5]), _f(results[6]))
 
 
 def _obi(ob: dict) -> float:
@@ -210,7 +218,7 @@ async def _process_symbol(
         return None
 
     try:
-        k3m, k15m, k1h, k4h, ob, fr = await _fetch_all(client, symbol)
+        k3m, k15m, k1h, k4h, ob, fr, oi_raw = await _fetch_all(client, symbol)
     except Exception as e:
         log.debug("[%s] fetch error: %s", symbol, e)
         diag["counts"]["fetch_error"] += 1
@@ -492,6 +500,31 @@ async def _process_symbol(
         if streak_paused:
             diag["counts"]["streak_breaker"] += 1
             return None
+
+    # ── 5i. OI + Funding Rate Cascade Signal (v8.3) ─────────────────────────
+    # FR extremo positivo + OI spike = longs sobreextendidos → boost SHORT
+    # FR extremo negativo + OI spike = shorts sobreextendidos → boost LONG
+    # El engine va construyendo historia de OI con el tiempo (snapshot 30min).
+    # Activar con OI_CASCADE_ENABLED=true (default false).
+    if getattr(C, 'OI_CASCADE_ENABLED', False) and _OI_CASCADE_AVAILABLE:
+        try:
+            _oi_engine.update(symbol, oi_raw, fr,
+                              k3m[-1][4] if k3m else 0.0)
+            oi_boost, oi_reason, oi_block = _oi_engine.signal_for_direction(
+                symbol, sig.direction)
+            if oi_block:
+                log.info("[%s] 🚫 OI/FR cascade block: %s", symbol, oi_reason)
+                diag["counts"]["oi_cascade_block"] += 1
+                return None
+            if oi_boost != 0:
+                sig.score = max(0.0, min(sig.score + oi_boost, 100.0))
+                sig.tier  = score_to_tier(sig.score)
+                filter_tags["oi_cascade"] = oi_reason
+                diag["counts"][f"oi_cascade_{oi_boost:+.0f}"] += 1
+                log.info("[%s] ⚡ OI/FR: %s -> score=%.1f",
+                         symbol, oi_reason, sig.score)
+        except Exception as e:
+            log.debug("[%s] oi_cascade error: %s", symbol, e)
 
     # ── 7. Adaptive threshold (feed del TradeJournal) ──────────────────────
     adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
