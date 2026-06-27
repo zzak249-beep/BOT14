@@ -4,15 +4,15 @@ EMA9×VWAP Bot — ema9_vwap_scanner.py
 Estrategia base: Pine v5 "EMA 9 + VWAP Strategy with ATR Trailing Stop"
   Señal LONG:  EMA9 cruza hacia arriba VWAP
   Señal SHORT: EMA9 cruza hacia abajo VWAP
-  Exit:        ATR trailing stop dinámico (× ATR_TRAIL_MULT)
+  Exit:        ATR trailing stop dinámico
 
-Confirmaciones añadidas (no en el Pine original):
-  1. MACD: histograma en dirección de la señal + posición vs zero line
-  2. RSI:  > 50 para LONG, < 50 para SHORT (filtro de tendencia)
-  3. Volumen: > media × VOL_MIN_MULT en la vela del cruce
-  4. EMA21: EMA9 relativa a EMA21 (opcional, EMA21_REQUIRED)
+Confirmaciones:
+  1. MACD: histograma en dirección de la señal
+  2. RSI:  > 50 LONG / < 50 SHORT
+  3. Volumen: > media × VOL_MIN_MULT (opcional)
+  4. EMA21: alineada (opcional)
 
-Fuente: TradingView "EMA 9/21/50 + VWAP + MACD + RSI Pro [v6]" (JOSES2705)
+FIX: logs de debug en todos los puntos de bloqueo LIVE
 ════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -49,7 +49,7 @@ CB_COOLDOWN = 600
 
 
 # ═══════════════════════════════════════════════════════════════
-# CÁLCULOS DE INDICADORES
+# INDICADORES
 # ═══════════════════════════════════════════════════════════════
 
 def _ema(arr: np.ndarray, period: int) -> np.ndarray:
@@ -71,7 +71,6 @@ def _rma(arr: np.ndarray, period: int) -> np.ndarray:
 
 
 def _vwap(klines_arr: np.ndarray) -> np.ndarray:
-    """VWAP acumulada (equivalente al Pine ta.vwap en sesión única crypto)."""
     h    = klines_arr[:, 2]
     l    = klines_arr[:, 3]
     c    = klines_arr[:, 4]
@@ -106,7 +105,6 @@ def _rsi(c: np.ndarray, period: int) -> np.ndarray:
 
 
 def _macd(c: np.ndarray, fast: int, slow: int, signal: int):
-    """Retorna (macd_line, signal_line, histogram)."""
     ema_f    = _ema(c, fast)
     ema_s    = _ema(c, slow)
     macd_l   = ema_f - ema_s
@@ -116,7 +114,6 @@ def _macd(c: np.ndarray, fast: int, slow: int, signal: int):
 
 
 def _crossover(a: np.ndarray, b: np.ndarray, lookback: int = 1) -> bool:
-    """a cruza hacia arriba b en las últimas `lookback` barras."""
     for i in range(1, lookback + 2):
         if len(a) <= i:
             break
@@ -126,7 +123,6 @@ def _crossover(a: np.ndarray, b: np.ndarray, lookback: int = 1) -> bool:
 
 
 def _crossunder(a: np.ndarray, b: np.ndarray, lookback: int = 1) -> bool:
-    """a cruza hacia abajo b en las últimas `lookback` barras."""
     for i in range(1, lookback + 2):
         if len(a) <= i:
             break
@@ -136,13 +132,13 @@ def _crossunder(a: np.ndarray, b: np.ndarray, lookback: int = 1) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-# DATACLASS DE SEÑAL
+# SEÑAL
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class EV_Signal:
     symbol:    str
-    direction: str       # LONG / SHORT / NONE
+    direction: str
     score:     float
     entry:     float
     sl:        float
@@ -154,10 +150,6 @@ class EV_Signal:
     vol_ratio: float
     reason:    str = ""
 
-
-# ═══════════════════════════════════════════════════════════════
-# ANÁLISIS POR SÍMBOLO
-# ═══════════════════════════════════════════════════════════════
 
 def _analyze(symbol: str, klines: list) -> EV_Signal:
     def _none(reason: str) -> EV_Signal:
@@ -172,26 +164,20 @@ def _analyze(symbol: str, klines: list) -> EV_Signal:
     c   = arr[:, 4]
     v   = arr[:, 5]
 
-    # ── Indicadores base ──────────────────────────────────────────────────
     ema9_arr  = _ema(c, getattr(C, 'EMA9_PERIOD',  9))
     ema21_arr = _ema(c, getattr(C, 'EMA21_PERIOD', 21))
     vwap_arr  = _vwap(arr)
     atr_arr   = _atr(arr, getattr(C, 'ATR_LEN', 14))
 
-    ema9  = ema9_arr[-1]
-    ema21 = ema21_arr[-1]
-    vwap  = vwap_arr[-1]
     atr   = float(atr_arr[-1])
     price = float(c[-1])
 
     if atr <= 0:
         return _none("invalid_atr")
 
-    # ── Confirmación: RSI ─────────────────────────────────────────────────
     rsi_arr = _rsi(c, getattr(C, 'RSI_PERIOD', 14))
     rsi     = float(rsi_arr[-1])
 
-    # ── Confirmación: MACD ────────────────────────────────────────────────
     macd_l, sig_l, hist = _macd(
         c,
         getattr(C, 'MACD_FAST',   12),
@@ -199,10 +185,8 @@ def _analyze(symbol: str, klines: list) -> EV_Signal:
         getattr(C, 'MACD_SIGNAL',  9),
     )
     macd_hist   = float(hist[-1])
-    macd_line   = float(macd_l[-1])
     macd_rising = hist[-1] > hist[-2] if len(hist) > 1 else True
 
-    # ── Confirmación: Volumen ─────────────────────────────────────────────
     vol_period = getattr(C, 'VOL_MA_PERIOD', 20)
     if len(v) >= vol_period:
         vol_ma    = float(np.mean(v[-vol_period:]))
@@ -211,86 +195,65 @@ def _analyze(symbol: str, klines: list) -> EV_Signal:
     else:
         vol_ratio = 1.0
 
-    # ── Crossover / Crossunder detección ─────────────────────────────────
-    lookback      = getattr(C, 'CROSS_LOOKBACK', 3)
-    long_cross    = _crossover(ema9_arr,  vwap_arr, lookback)
-    short_cross   = _crossunder(ema9_arr, vwap_arr, lookback)
+    lookback    = getattr(C, 'CROSS_LOOKBACK', 3)
+    long_cross  = _crossover(ema9_arr,  vwap_arr, lookback)
+    short_cross = _crossunder(ema9_arr, vwap_arr, lookback)
 
     if not long_cross and not short_cross:
         return _none("no_cross")
 
     direction = "LONG" if long_cross else "SHORT"
+    score     = 50.0
 
-    # ── Score de confluencia (0-100) ──────────────────────────────────────
-    score = 50.0  # base: cruce detectado
-
-    # RSI filter
-    rsi_ok    = False
-    rsi_mid   = getattr(C, 'RSI_MID', 50.0)
-    rsi_ob    = getattr(C, 'RSI_OB',  70.0)
-    rsi_os    = getattr(C, 'RSI_OS',  30.0)
+    rsi_mid = getattr(C, 'RSI_MID', 50.0)
+    rsi_ob  = getattr(C, 'RSI_OB',  70.0)
+    rsi_os  = getattr(C, 'RSI_OS',  30.0)
 
     if direction == "LONG":
         rsi_ok = rsi > rsi_mid and rsi < rsi_ob
         if rsi_ok:
-            score += 15
-            if rsi > 55:
-                score += 5
+            score += 15 + (5 if rsi > 55 else 0)
     else:
         rsi_ok = rsi < rsi_mid and rsi > rsi_os
         if rsi_ok:
-            score += 15
-            if rsi < 45:
-                score += 5
+            score += 15 + (5 if rsi < 45 else 0)
 
     if getattr(C, 'RSI_REQUIRED', True) and not rsi_ok:
         return _none(f"rsi_fail(rsi={rsi:.1f} dir={direction})")
 
-    # MACD filter
-    macd_ok = False
     if direction == "LONG":
         macd_ok = macd_hist > 0 or (macd_hist < 0 and macd_rising)
         if macd_hist > 0:
-            score += 20
-            if macd_line > 0:    # MACD sobre zero line = tendencia confirmada
-                score += 5
+            score += 20 + (5 if float(macd_l[-1]) > 0 else 0)
         elif macd_rising:
-            score += 8  # MACD virando hacia arriba = señal anticipatoria
+            score += 8
     else:
         macd_ok = macd_hist < 0 or (macd_hist > 0 and not macd_rising)
         if macd_hist < 0:
-            score += 20
-            if macd_line < 0:
-                score += 5
+            score += 20 + (5 if float(macd_l[-1]) < 0 else 0)
         elif not macd_rising:
             score += 8
 
     if getattr(C, 'MACD_REQUIRED', True) and not macd_ok:
         return _none(f"macd_fail(hist={macd_hist:.4f} dir={direction})")
 
-    # Volumen boost
     vol_mult = getattr(C, 'VOL_MIN_MULT', 1.3)
     vol_ok   = vol_ratio >= vol_mult
     if vol_ok:
-        score += min((vol_ratio - 1) * 10, 10)  # hasta +10pts por volumen
+        score += min((vol_ratio - 1) * 10, 10)
     elif getattr(C, 'VOL_REQUIRED', False):
         return _none(f"vol_fail(ratio={vol_ratio:.2f}<{vol_mult})")
 
-    # EMA21 alignment boost
-    ema21_ok = False
-    if direction == "LONG":
-        ema21_ok = ema9 > ema21
-    else:
-        ema21_ok = ema9 < ema21
+    ema9  = float(ema9_arr[-1])
+    ema21 = float(ema21_arr[-1])
+    ema21_ok = (ema9 > ema21) if direction == "LONG" else (ema9 < ema21)
     if ema21_ok:
         score += 10
     elif getattr(C, 'EMA21_REQUIRED', False):
-        return _none(f"ema21_fail(ema9={ema9:.6f} ema21={ema21:.6f})")
+        return _none(f"ema21_fail")
 
-    # Cap score
     score = min(round(score, 1), 100.0)
 
-    # ── SL / TP basados en ATR ────────────────────────────────────────────
     trail_mult = getattr(C, 'ATR_TRAIL_MULT', 2.0)
     tp1_mult   = getattr(C, 'TP1_ATR_MULT',   2.0)
     tp2_mult   = getattr(C, 'TP2_ATR_MULT',   4.0)
@@ -313,7 +276,7 @@ def _analyze(symbol: str, klines: list) -> EV_Signal:
 
 
 # ═══════════════════════════════════════════════════════════════
-# PROCESO POR SÍMBOLO
+# PROCESO POR SÍMBOLO — CON DEBUG LOGS EN TODOS LOS BLOQUEOS
 # ═══════════════════════════════════════════════════════════════
 
 async def _process_symbol(
@@ -348,8 +311,7 @@ async def _process_symbol(
         diag["counts"][sig.reason or "no_signal"] += 1
         return None
 
-    # ── Score mínimo ─────────────────────────────────────────────────────
-    if sig.score < getattr(C, 'MIN_SCORE', 55.0):
+    if sig.score < getattr(C, 'MIN_SCORE', 50.0):
         diag["counts"]["score_bajo"] += 1
         return None
 
@@ -369,9 +331,9 @@ async def _process_symbol(
         await tg.send(
             f"📊 *EMA9×VWAP* — `{symbol}` {sig.direction}\n"
             f"Entry: `{sig.entry:.6f}` | Score: `{sig.score:.1f}`\n"
-            f"RSI: `{sig.rsi:.1f}` | MACD hist: `{sig.macd_hist:.4f}` | "
+            f"RSI: `{sig.rsi:.1f}` | MACD: `{sig.macd_hist:.4f}` | "
             f"Vol: `{sig.vol_ratio:.2f}×`\n"
-            f"SL: `{sig.sl:.6f}` | TP1: `{sig.tp1:.6f}` | TP2: `{sig.tp2:.6f}`"
+            f"SL: `{sig.sl:.6f}` | TP1: `{sig.tp1:.6f}`"
         )
         diag["counts"]["signal_sent"] += 1
         return sig
@@ -380,7 +342,8 @@ async def _process_symbol(
     unrealized = await pos_mgr.get_unrealized_pnl()
     can, reason = await risk.can_trade(unrealized_pnl=unrealized)
     if not can:
-        diag["counts"]["risk_blocked"] += 1
+        log.info("[%s] 🚫 BLOCKED can_trade: %s", symbol, reason)
+        diag["counts"][f"risk_blocked({reason[:30]})"] += 1
         return None
 
     trade_confirmed = False
@@ -391,18 +354,19 @@ async def _process_symbol(
     btc_corr        = 0.0
 
     try:
-        sym_ok, _ = risk.symbol_allowed(symbol)
+        sym_ok, sym_reason = risk.symbol_allowed(symbol)
         if not sym_ok:
+            log.info("[%s] 🚫 BLOCKED symbol_allowed: %s", symbol, sym_reason)
             diag["counts"]["symbol_blocked"] += 1
             return None
 
-        dir_ok, _, dir_token = risk.direction_allowed(sig.direction)
+        dir_ok, dir_reason, dir_token = risk.direction_allowed(sig.direction)
         if not dir_ok:
+            log.info("[%s] 🚫 BLOCKED direction: %s", symbol, dir_reason)
             diag["counts"]["correlation_blocked"] += 1
             return None
         dir_reserved = True
 
-        # BTC Correlation Guard
         if (btc_klines and _BTC_CORR_AVAILABLE and
                 getattr(C, 'BTC_CORR_ENABLED', True) and symbol != "BTC-USDT"):
             btc_corr = compute_correlation(klines, btc_klines)
@@ -411,14 +375,16 @@ async def _process_symbol(
             btc_guard.max_same   = getattr(C, 'BTC_CORR_MAX_SAME', 3)
             btc_reserved = abs(btc_corr) >= btc_guard.threshold
             if btc_reserved:
-                btc_ok, _, btc_token = btc_guard.allowed(sig.direction, btc_corr)
+                btc_ok, btc_reason, btc_token = btc_guard.allowed(sig.direction, btc_corr)
                 if not btc_ok:
+                    log.info("[%s] 🚫 BLOCKED btc_corr: %s", symbol, btc_reason)
                     diag["counts"]["btc_corr_blocked"] += 1
                     btc_reserved = False
                     return None
 
         try:
             balance = await client.get_balance()
+            log.info("[%s] balance=%.2f USDT", symbol, balance)
         except Exception as e:
             log.error("[%s] get_balance error: %s", symbol, e)
             return None
@@ -428,7 +394,16 @@ async def _process_symbol(
         qty = risk.kelly_position_size(
             balance, sig.entry, sig.sl, sig.score, "STD", symbol=symbol
         )
+        log.info("[%s] qty calculado=%.6f entry=%.6f sl=%.6f notional=%.2f",
+                 symbol, qty, sig.entry, sig.sl, qty * sig.entry)
+
         if qty <= 0:
+            log.warning("[%s] 🚫 BLOCKED qty=0 — notional demasiado pequeño "
+                        "(FIXED_NOTIONAL_USDT=%.1f MIN_NOTIONAL=%.1f)",
+                        symbol,
+                        getattr(C, 'FIXED_NOTIONAL_USDT', 0.0),
+                        getattr(C, 'MIN_NOTIONAL_USDT', 10.0))
+            diag["counts"]["qty_zero"] += 1
             return None
 
         # Entrada límite con fallback a market
@@ -443,6 +418,9 @@ async def _process_symbol(
             if lmt.get("code", -1) == 0:
                 entry_resp = lmt
                 used_limit = True
+                log.info("[%s] Entrada LÍMITE OK ✅", symbol)
+            else:
+                log.info("[%s] Límite no llenado, intentando market...", symbol)
 
         if not used_limit:
             try:
@@ -456,7 +434,8 @@ async def _process_symbol(
             entry_resp = results.get("entry", {})
 
         if entry_resp.get("code", -1) != 0:
-            log.error("[%s] entrada rechazada: %s", symbol, entry_resp)
+            log.error("[%s] 🚫 entrada rechazada code=%s: %s",
+                      symbol, entry_resp.get("code"), entry_resp)
             return None
 
         order_id = str(
@@ -472,10 +451,9 @@ async def _process_symbol(
         await pos_mgr.register_trade(trade)
         await tg.send(
             f"✅ *TRADE ABIERTO* — `{symbol}` {sig.direction}\n"
-            f"Entry: `{sig.entry:.6f}` qty=`{qty}` orderId=`{order_id}`\n"
+            f"Entry: `{sig.entry:.6f}` qty=`{qty:.4f}` id=`{order_id}`\n"
             f"SL: `{sig.sl:.6f}` | TP1: `{sig.tp1:.6f}`\n"
-            f"Score: `{sig.score:.1f}` | RSI: `{sig.rsi:.1f}` | "
-            f"MACD: `{sig.macd_hist:.4f}` | Vol: `{sig.vol_ratio:.2f}×`"
+            f"RSI: `{sig.rsi:.1f}` | MACD: `{sig.macd_hist:.4f}`"
         )
         trade_confirmed = True
         diag["counts"]["trade_opened"] += 1
@@ -504,12 +482,15 @@ def _new_diag() -> dict:
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
     log.info(
         "EMA9×VWAP Scanner | Modo=%s | TF=%s | "
-        "MACD_req=%s RSI_req=%s VOL_req=%s EMA21_req=%s",
+        "MACD_req=%s RSI_req=%s VOL_req=%s EMA21_req=%s | "
+        "FIXED_NOTIONAL=%.1f MIN_NOTIONAL=%.1f",
         C.MODE, C.TIMEFRAME,
-        getattr(C, 'MACD_REQUIRED', True),
-        getattr(C, 'RSI_REQUIRED',  True),
-        getattr(C, 'VOL_REQUIRED',  False),
+        getattr(C, 'MACD_REQUIRED',  True),
+        getattr(C, 'RSI_REQUIRED',   True),
+        getattr(C, 'VOL_REQUIRED',   False),
         getattr(C, 'EMA21_REQUIRED', False),
+        getattr(C, 'FIXED_NOTIONAL_USDT', 0.0),
+        getattr(C, 'MIN_NOTIONAL_USDT',  10.0),
     )
 
     symbols:   list[str] = []
@@ -520,7 +501,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
         iteration += 1
         diag = _new_diag()
 
-        # Refrescar símbolos cada 10 iteraciones
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
                 all_syms = await client.get_all_symbols()
@@ -537,7 +517,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             await asyncio.sleep(10)
             continue
 
-        # Status periódico
         if iteration % 20 == 0:
             try:
                 balance    = await client.get_balance()
@@ -548,7 +527,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             except Exception:
                 pass
 
-        # BTC klines para correlation guard
         btc_klines = None
         if _BTC_CORR_AVAILABLE and getattr(C, 'BTC_CORR_ENABLED', True):
             try:
@@ -556,7 +534,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             except Exception:
                 pass
 
-        # Scan en batches
         BATCH         = 20
         signals_found = 0
         for i in range(0, len(symbols), BATCH):
@@ -572,29 +549,16 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             await asyncio.sleep(0.2)
 
         elapsed = time.time() - start
-        top5    = diag["counts"].most_common(5)
+        top5    = diag["counts"].most_common(8)
         avg_sc  = diag["score_sum"] / diag["score_n"] if diag["score_n"] else 0.0
         top_str = " | ".join(f"{k}={v}" for k, v in top5) if top5 else "—"
 
         log.info(
             "Iter %d | %d símbolos | %d señales | %.1fs | "
-            "con_cruce=%d avg_score=%.1f max=%.1f(%s %s) | %s",
+            "con_cruce=%d avg=%.1f max=%.1f(%s %s) | %s",
             iteration, len(symbols), signals_found, elapsed,
             diag["score_n"], avg_sc, diag["score_max"],
             diag["score_max_symbol"], diag["score_max_dir"], top_str,
         )
-
-        # Diagnóstico Telegram cada 5 iter sin señales
-        if iteration % 5 == 0 and signals_found == 0 and diag["score_n"] > 0:
-            try:
-                await tg.send(
-                    f"🔍 *EMA9×VWAP Diag* iter={iteration} | "
-                    f"{len(symbols)} símbolos | {diag['score_n']} con cruce | "
-                    f"avg={avg_sc:.1f} max={diag['score_max']:.1f}"
-                    f"({diag['score_max_symbol']} {diag['score_max_dir']})\n"
-                    + top_str
-                )
-            except Exception:
-                pass
 
         await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
