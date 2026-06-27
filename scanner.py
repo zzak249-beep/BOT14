@@ -239,7 +239,12 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
             await risk.release_reservation()
             return None
 
-        dir_ok, dir_reason, dir_token = risk.direction_allowed(sig.direction)
+        result_dir = risk.direction_allowed(sig.direction)
+        if len(result_dir) == 3:
+            dir_ok, dir_reason, dir_token = result_dir
+        else:
+            dir_ok, dir_reason = result_dir
+            dir_token = None
         if not dir_ok:
             log.info("[%s] 🚫 direction: %s", symbol, dir_reason)
             diag["counts"]["corr_blocked"] += 1
@@ -261,7 +266,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
                         log.info("[%s] 🚫 btc_corr: %s", symbol, btc_r)
                         diag["counts"]["btc_blocked"] += 1
                         await risk.release_reservation()
-                        risk.release_direction_reservation(sig.direction, dir_token)
+                        try:
+                risk.release_direction_reservation(sig.direction, dir_token)
+            except AttributeError:
+                pass
                         return None
             except Exception as e:
                 log.warning("[%s] btc_corr error (ignorado): %s", symbol, e)
@@ -272,7 +280,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
         except Exception as e:
             log.error("[%s] get_balance error: %s", symbol, e)
             await risk.release_reservation()
-            risk.release_direction_reservation(sig.direction, dir_token)
+            try:
+                risk.release_direction_reservation(sig.direction, dir_token)
+            except AttributeError:
+                pass
             return None
         if balance < 5.0:
             balance = C.CAPITAL
@@ -285,7 +296,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
             log.error("[%s] kelly_position_size error: %s", symbol, e)
             diag["counts"]["kelly_error"] += 1
             await risk.release_reservation()
-            risk.release_direction_reservation(sig.direction, dir_token)
+            try:
+                risk.release_direction_reservation(sig.direction, dir_token)
+            except AttributeError:
+                pass
             return None
 
         log.info("[%s] qty=%.6f notional=%.2f USDT entry=%.6f",
@@ -296,7 +310,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
                         symbol, getattr(C,'FIXED_NOTIONAL_USDT',0), getattr(C,'MIN_NOTIONAL_USDT',10), balance)
             diag["counts"]["qty_zero"] += 1
             await risk.release_reservation()
-            risk.release_direction_reservation(sig.direction, dir_token)
+            try:
+                risk.release_direction_reservation(sig.direction, dir_token)
+            except AttributeError:
+                pass
             return None
 
         # Entrada
@@ -326,7 +343,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
             except Exception as e:
                 log.error("[%s] open_trade error: %s", symbol, e)
                 await risk.release_reservation()
+                try:
                 risk.release_direction_reservation(sig.direction, dir_token)
+            except AttributeError:
+                pass
                 if btc_reserved and _BTC_CORR_AVAILABLE:
                     btc_guard.release(sig.direction, btc_corr, btc_token)
                 return None
@@ -335,7 +355,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
             log.error("[%s] 🚫 entrada rechazada: %s", symbol, entry_resp)
             diag["counts"]["entrada_rechazada"] += 1
             await risk.release_reservation()
-            risk.release_direction_reservation(sig.direction, dir_token)
+            try:
+                risk.release_direction_reservation(sig.direction, dir_token)
+            except AttributeError:
+                pass
             if btc_reserved and _BTC_CORR_AVAILABLE:
                 btc_guard.release(sig.direction, btc_corr, btc_token)
             return None
