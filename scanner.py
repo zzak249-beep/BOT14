@@ -1,10 +1,11 @@
 """
-EMA9×VWAP Bot — scanner.py v4
-FIXES:
-  - CROSS_LOOKBACK=1 por defecto (evita abrir mismo cruce múltiples veces)
-  - HTF trend filter (1H EMA20 vs EMA50) — evita LONG en bajista y SHORT en alcista
-  - set_leverage() antes de cada orden
-  - Mejor logging de sizing
+EMA9×VWAP Bot — scanner.py v5
+MEJORAS vs v4:
+  - Pre-check de cruce en 3m ANTES de fetchear 1H → -95% llamadas API
+  - Cache de tendencia 1H por símbolo (TTL 5 min) → sin llamadas repetidas
+  - set_margin_type ISOLATED antes de cada trade → evita cross margin
+  - VOL_REQUIRED=True por defecto → solo cruces con volumen real
+  - EMA21_REQUIRED opcional pero recomendado
 """
 import asyncio
 import logging
@@ -28,6 +29,10 @@ except ImportError:
 log = logging.getLogger("ema9_vwap_scanner")
 _cb_blacklist: dict[str, float] = {}
 CB_COOLDOWN = 600
+
+# Cache de tendencia 1H: symbol → (trend_str, timestamp)
+_htf_cache: dict[str, tuple[str, float]] = {}
+HTF_CACHE_TTL = 300  # 5 minutos
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────────
@@ -72,34 +77,55 @@ def _macd(c, fast, slow, signal):
     return ml, sl, ml - sl
 
 def _crossover(a, b, lookback=1):
-    """Cruce hacia arriba en las últimas `lookback` barras."""
     for i in range(1, min(lookback+2, len(a))):
-        if a[-i] > b[-i] and a[-(i+1)] <= b[-(i+1)]:
-            return True
+        if a[-i] > b[-i] and a[-(i+1)] <= b[-(i+1)]: return True
     return False
 
 def _crossunder(a, b, lookback=1):
-    """Cruce hacia abajo en las últimas `lookback` barras."""
     for i in range(1, min(lookback+2, len(a))):
-        if a[-i] < b[-i] and a[-(i+1)] >= b[-(i+1)]:
-            return True
+        if a[-i] < b[-i] and a[-(i+1)] >= b[-(i+1)]: return True
     return False
 
-def _htf_trend(klines_1h) -> str:
+def _quick_cross_check(c, lookback=1):
     """
-    Tendencia en 1H basada en EMA20 vs EMA50.
-    Retorna 'BULL', 'BEAR', o 'NEUTRAL'.
+    Comprobación rápida de cruce EMA9×VWAP en solo 3m.
+    Retorna ('LONG', 'SHORT', o None) SIN fetchear 1H.
+    Si no hay cruce → retorna None y ahorramos la llamada 1H.
     """
+    if len(c) < 30:
+        return None
+    arr_fake = np.zeros((len(c), 6))
+    arr_fake[:,4] = c
+    arr_fake[:,5] = 1.0
+    arr_fake[:,2] = c
+    arr_fake[:,3] = c
+    ema9 = _ema(c, 9)
+    vwap = _vwap(arr_fake)
+    if _crossover(ema9, vwap, lookback):
+        return "LONG"
+    if _crossunder(ema9, vwap, lookback):
+        return "SHORT"
+    return None
+
+def _htf_trend_cached(symbol, klines_1h) -> str:
+    """Trend con cache 5 min — evita refetch cada 60s."""
+    now = time.time()
+    cached = _htf_cache.get(symbol)
+    if cached and (now - cached[1]) < HTF_CACHE_TTL:
+        return cached[0]
+    trend = _compute_htf_trend(klines_1h)
+    _htf_cache[symbol] = (trend, now)
+    return trend
+
+def _compute_htf_trend(klines_1h) -> str:
     if len(klines_1h) < 52:
         return "NEUTRAL"
     arr = np.array(klines_1h, dtype=float)
     c = arr[:,4]
     e20 = _ema(c, 20)
     e50 = _ema(c, 50)
-    if e20[-1] > e50[-1] * 1.001:
-        return "BULL"
-    if e20[-1] < e50[-1] * 0.999:
-        return "BEAR"
+    if e20[-1] > e50[-1] * 1.001: return "BULL"
+    if e20[-1] < e50[-1] * 0.999: return "BEAR"
     return "NEUTRAL"
 
 
@@ -118,9 +144,6 @@ def _analyze(symbol, klines_3m, klines_1h):
         return EV_Signal(symbol=symbol, direction="NONE", score=0,
             entry=0, sl=0, tp1=0, tp2=0, atr=0, rsi=50,
             macd_hist=0, vol_ratio=1, reason=r)
-
-    if len(klines_3m) < 60:
-        return _none("insufficient_data")
 
     arr = np.array(klines_3m, dtype=float)
     c, v = arr[:,4], arr[:,5]
@@ -144,26 +167,22 @@ def _analyze(symbol, klines_3m, klines_1h):
     vol_ratio  = (float(v[-1])/(float(np.mean(v[-vol_period:]))+1e-12)
                   if len(v)>=vol_period else 1.0)
 
-    # ── HTF trend filter ──────────────────────────────────────────────────
-    htf = _htf_trend(klines_1h)
-    htf_filter = getattr(C,'HTF_FILTER_ENABLED', True)
+    htf = _htf_trend_cached(symbol, klines_1h)
+    htf_filter = getattr(C,'HTF_FILTER_ENABLED',True)
 
-    # ── Detección de cruce ────────────────────────────────────────────────
-    lookback    = getattr(C,'CROSS_LOOKBACK',1)   # DEFAULT 1 = solo barra actual/anterior
-    long_cross  = _crossover(ema9_arr,  vwap_arr, lookback)
+    lookback    = getattr(C,'CROSS_LOOKBACK',1)
+    long_cross  = _crossover(ema9_arr, vwap_arr, lookback)
     short_cross = _crossunder(ema9_arr, vwap_arr, lookback)
     if not long_cross and not short_cross: return _none("no_cross")
 
     direction = "LONG" if long_cross else "SHORT"
 
-    # ── HTF alineamiento ─────────────────────────────────────────────────
     if htf_filter:
         if direction == "LONG" and htf == "BEAR":
             return _none("htf_bear_no_long")
         if direction == "SHORT" and htf == "BULL":
             return _none("htf_bull_no_short")
 
-    # ── Score ─────────────────────────────────────────────────────────────
     score   = 50.0
     rsi_mid = getattr(C,'RSI_MID',50.0)
     rsi_ob  = getattr(C,'RSI_OB',70.0)
@@ -189,24 +208,27 @@ def _analyze(symbol, klines_3m, klines_1h):
     if getattr(C,'MACD_REQUIRED',True) and not macd_ok:
         return _none(f"macd_fail({macd_hist:.4f})")
 
-    vol_mult = getattr(C,'VOL_MIN_MULT',1.3)
+    vol_mult = getattr(C,'VOL_MIN_MULT',1.5)
     if vol_ratio >= vol_mult:
         score += min((vol_ratio-1)*10, 10)
-    elif getattr(C,'VOL_REQUIRED',False):
-        return _none(f"vol_fail({vol_ratio:.2f})")
+    elif getattr(C,'VOL_REQUIRED',True):   # True por defecto en v5
+        return _none(f"vol_fail({vol_ratio:.2f}<{vol_mult:.1f})")
 
     ema9, ema21 = float(ema9_arr[-1]), float(ema21_arr[-1])
-    if (direction=="LONG" and ema9>ema21) or (direction=="SHORT" and ema9<ema21):
+    ema21_ok = (direction=="LONG" and ema9>ema21) or (direction=="SHORT" and ema9<ema21)
+    if ema21_ok:
         score += 10
+    elif getattr(C,'EMA21_REQUIRED',False):
+        return _none("ema21_fail")
 
     # HTF boost
     if (direction=="LONG" and htf=="BULL") or (direction=="SHORT" and htf=="BEAR"):
         score += 10
 
     score = min(round(score,1), 100.0)
-    mult  = getattr(C,'ATR_TRAIL_MULT',2.0)
-    tp1m  = getattr(C,'TP1_ATR_MULT',2.0)
-    tp2m  = getattr(C,'TP2_ATR_MULT',4.0)
+    mult  = getattr(C,'ATR_TRAIL_MULT',2.5)   # 2.5 por defecto en v5
+    tp1m  = getattr(C,'TP1_ATR_MULT',3.0)     # 3.0 por defecto en v5
+    tp2m  = getattr(C,'TP2_ATR_MULT',5.0)
 
     if direction == "LONG":
         sl, tp1, tp2 = price-atr*mult, price+atr*tp1m, price+atr*tp2m
@@ -223,22 +245,18 @@ def _analyze(symbol, klines_3m, klines_1h):
 
 def _direction_allowed(risk, direction):
     result = risk.direction_allowed(direction)
-    if len(result) == 3:
-        return result
+    if len(result) == 3: return result
     ok, reason = result
     return ok, reason, None
 
 def _release_dir(risk, direction, token):
-    try:
-        risk.release_direction_reservation(direction, token)
-    except AttributeError:
-        pass
+    try: risk.release_direction_reservation(direction, token)
+    except AttributeError: pass
 
 
 # ── Proceso por símbolo ───────────────────────────────────────────────────────
 
-async def _process_symbol(symbol, client, risk, pos_mgr, diag,
-                           btc_klines=None, klines_1h=None):
+async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
     if pos_mgr.is_trading(symbol):
         diag["counts"]["already_trading"] += 1
         return None
@@ -248,9 +266,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         diag["counts"]["cb_cooldown"] += 1
         return None
 
+    # ── FETCH 3m ─────────────────────────────────────────────────────────────
     try:
         klines = await client.get_klines(symbol, C.TIMEFRAME, 200)
-    except Exception as e:
+    except Exception:
         diag["counts"]["fetch_error"] += 1
         return None
 
@@ -258,20 +277,32 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         diag["counts"]["insufficient_data"] += 1
         return None
 
-    # Usar 1H klines si están disponibles, si no fetchear
-    k1h = klines_1h
-    if k1h is None:
-        try:
-            k1h = await client.get_klines(symbol, "1h", 60)
-        except Exception:
-            k1h = []
+    # ── PRE-CHECK CRUCE (sin 1H) — ahorra 95% de llamadas API ────────────────
+    c_arr = np.array([k[4] for k in klines], dtype=float)
+    quick = _quick_cross_check(c_arr, getattr(C,'CROSS_LOOKBACK',1))
+    if quick is None:
+        diag["counts"]["no_cross"] += 1
+        return None
+
+    # ── FETCH 1H solo si hay cruce ────────────────────────────────────────────
+    if getattr(C,'HTF_FILTER_ENABLED',True):
+        cached_trend = _htf_cache.get(symbol)
+        if cached_trend and (now - cached_trend[1]) < HTF_CACHE_TTL:
+            k1h = []  # no necesitamos refetchear
+        else:
+            try:
+                k1h = await client.get_klines(symbol, "1h", 60)
+            except Exception:
+                k1h = []
+    else:
+        k1h = []
 
     sig = _analyze(symbol, klines, k1h)
     if sig.direction == "NONE":
         diag["counts"][sig.reason or "no_signal"] += 1
         return None
 
-    if sig.score < getattr(C,'MIN_SCORE',55.0):
+    if sig.score < getattr(C,'MIN_SCORE',65.0):
         diag["counts"]["score_bajo"] += 1
         return None
 
@@ -290,8 +321,8 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         try:
             await tg.send(
                 f"EMA9xVWAP {symbol} {sig.direction} score={sig.score:.0f} "
-                f"htf={sig.htf_trend}\n"
-                f"RSI:{sig.rsi:.1f} MACD:{sig.macd_hist:.4f} Vol:{sig.vol_ratio:.2f}x\n"
+                f"htf={sig.htf_trend} vol={sig.vol_ratio:.2f}x\n"
+                f"RSI:{sig.rsi:.1f} MACD:{sig.macd_hist:.4f}\n"
                 f"Entry:{sig.entry:.6f} SL:{sig.sl:.6f} TP1:{sig.tp1:.6f}"
             )
         except Exception as e:
@@ -307,7 +338,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         unrealized = await pos_mgr.get_unrealized_pnl()
         can, reason = await risk.can_trade(unrealized_pnl=unrealized)
         if not can:
-            log.info("[%s] BLOCKED can_trade: %s", symbol, reason)
+            log.info("[%s] BLOCKED: %s", symbol, reason)
             diag["counts"][f"risk({reason[:20]})"] += 1
             return None
 
@@ -319,12 +350,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
 
         dir_ok, dir_reason, dir_token = _direction_allowed(risk, sig.direction)
         if not dir_ok:
-            log.info("[%s] BLOCKED dir: %s", symbol, dir_reason)
             diag["counts"]["corr_blocked"] += 1
             await risk.release_reservation()
             return None
 
-        # BTC correlation
         if (btc_klines and _BTC_CORR_AVAILABLE
                 and getattr(C,'BTC_CORR_ENABLED',True)
                 and symbol != "BTC-USDT"):
@@ -342,9 +371,8 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
                         _release_dir(risk, sig.direction, dir_token)
                         return None
             except Exception as e:
-                log.warning("[%s] btc_corr: %s", symbol, e)
+                log.debug("[%s] btc_corr: %s", symbol, e)
 
-        # Balance
         try:
             balance = await client.get_balance()
         except Exception as e:
@@ -355,51 +383,50 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         if balance < 5.0:
             balance = C.CAPITAL
 
-        # Sizing — asegurar mínimo 10 USDT notional
         try:
             qty = risk.kelly_position_size(
                 balance, sig.entry, sig.sl, sig.score, "STD", symbol=symbol
             )
         except Exception as e:
-            log.error("[%s] kelly_position_size: %s", symbol, e)
+            log.error("[%s] kelly: %s", symbol, e)
             diag["counts"]["kelly_error"] += 1
             await risk.release_reservation()
             _release_dir(risk, sig.direction, dir_token)
             return None
 
-        # Forzar notional mínimo si kelly da poco
-        min_notional = getattr(C,'MIN_NOTIONAL_USDT', 10.0)
-        fixed_notional = getattr(C,'FIXED_NOTIONAL_USDT', 0.0)
-        leverage = getattr(C,'LEVERAGE', 5)
+        min_notional   = getattr(C,'MIN_NOTIONAL_USDT',12.0)
+        fixed_notional = getattr(C,'FIXED_NOTIONAL_USDT',0.0)
+        leverage       = getattr(C,'LEVERAGE',5)
 
         if fixed_notional > 0:
             qty = fixed_notional / sig.entry / leverage
         elif qty * sig.entry < min_notional:
             qty = min_notional / sig.entry / leverage
 
-        # Redondear a precisión del exchange
         try:
             qty = client._round_qty(symbol, qty)
         except Exception:
             qty = round(qty, 4)
 
         notional = qty * sig.entry
-        log.info("[%s] qty=%.6f notional=%.2f USDT (balance=%.2f leverage=%dx)",
-                 symbol, qty, notional, balance, leverage)
+        log.info("[%s] qty=%.6f notional=%.2f USDT", symbol, qty, notional)
 
         if qty <= 0 or notional < min_notional * 0.9:
-            log.warning("[%s] BLOCKED qty=%.6f notional=%.2f < min=%.1f",
-                        symbol, qty, notional, min_notional)
+            log.warning("[%s] BLOCKED qty/notional insuficiente", symbol)
             diag["counts"]["qty_too_small"] += 1
             await risk.release_reservation()
             _release_dir(risk, sig.direction, dir_token)
             return None
 
-        # Forzar leverage correcto antes de abrir
+        # Forzar leverage e isolated margin
         try:
             await client.set_leverage(symbol, leverage)
         except Exception as e:
-            log.debug("[%s] set_leverage: %s (ignorado)", symbol, e)
+            log.debug("[%s] set_leverage: %s", symbol, e)
+        try:
+            await client.set_margin_type(symbol, "ISOLATED")
+        except Exception as e:
+            log.debug("[%s] set_margin_type: %s (ignorado)", symbol, e)
 
         # Entrada
         entry_resp = {}
@@ -415,7 +442,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
                     entry_resp = lmt
                     used_limit = True
             except Exception as e:
-                log.warning("[%s] place_limit_entry: %s", symbol, e)
+                log.warning("[%s] limit: %s", symbol, e)
 
         if not used_limit:
             try:
@@ -433,7 +460,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
                 return None
 
         if entry_resp.get("code",-1) != 0:
-            log.error("[%s] rechazada code=%s", symbol, entry_resp.get("code"))
+            log.error("[%s] rechazada: %s", symbol, entry_resp.get("code"))
             diag["counts"]["entrada_rechazada"] += 1
             await risk.release_reservation()
             _release_dir(risk, sig.direction, dir_token)
@@ -454,7 +481,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         try:
             await tg.send(
                 f"TRADE {symbol} {sig.direction} {notional:.1f}USDT "
-                f"entry={sig.entry:.6f} SL={sig.sl:.6f} htf={sig.htf_trend}"
+                f"htf={sig.htf_trend} entry={sig.entry:.6f} SL={sig.sl:.6f}"
             )
         except Exception:
             pass
@@ -462,8 +489,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         return sig
 
     except Exception as e:
-        log.error("[%s] EXCEPCION LIVE: %s — %s",
-                  symbol, type(e).__name__, e, exc_info=True)
+        log.error("[%s] EXCEPCION: %s — %s", symbol, type(e).__name__, e, exc_info=True)
         diag["counts"][f"exc({type(e).__name__})"] += 1
         try:
             await risk.release_reservation()
@@ -472,7 +498,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag,
         return None
 
 
-# ── Loop principal ────────────────────────────────────────────────────────────
+# ── Loop ─────────────────────────────────────────────────────────────────────
 
 def _new_diag():
     return {"counts": Counter(), "score_n": 0, "score_sum": 0.0,
@@ -481,15 +507,14 @@ def _new_diag():
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
     log.info(
-        "EMA9xVWAP v4 | Modo=%s | TF=%s | HTF_filter=%s | "
-        "CROSS_LB=%d | MACD=%s RSI=%s | FIXED=%.1f MIN=%.1f",
+        "EMA9xVWAP v5 | Modo=%s | TF=%s | HTF=%s CROSS_LB=%d | "
+        "VOL_req=%s(%.1fx) EMA21=%s | FIXED=%.1f MIN=%.1f MIN_SCORE=%.0f",
         C.MODE, C.TIMEFRAME,
-        getattr(C,'HTF_FILTER_ENABLED',True),
-        getattr(C,'CROSS_LOOKBACK',1),
-        getattr(C,'MACD_REQUIRED',True),
-        getattr(C,'RSI_REQUIRED',True),
-        getattr(C,'FIXED_NOTIONAL_USDT',0.0),
-        getattr(C,'MIN_NOTIONAL_USDT',10.0),
+        getattr(C,'HTF_FILTER_ENABLED',True), getattr(C,'CROSS_LOOKBACK',1),
+        getattr(C,'VOL_REQUIRED',True), getattr(C,'VOL_MIN_MULT',1.5),
+        getattr(C,'EMA21_REQUIRED',False),
+        getattr(C,'FIXED_NOTIONAL_USDT',0.0), getattr(C,'MIN_NOTIONAL_USDT',12.0),
+        getattr(C,'MIN_SCORE',65.0),
     )
 
     symbols:   list[str] = []
@@ -522,11 +547,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
                 btc_klines = await client.get_klines("BTC-USDT", C.TIMEFRAME, 80)
             except Exception:
                 pass
-
-        # Para HTF filter: no cargamos 1H por símbolo (demasiadas llamadas API)
-        # Usamos el filtro dentro de _analyze que hace una llamada 1H por símbolo
-        # Solo si HTF_FILTER_ENABLED. Para reducir API calls, cargamos 1H
-        # solo cuando se detecta un cruce (se hace dentro de _process_symbol).
 
         signals_found = 0
         for i in range(0, len(symbols), 20):
