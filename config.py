@@ -211,3 +211,5 @@ HEDGE_LOSS_COUNT    = _int("HEDGE_LOSS_COUNT",      3)
 MASTER_URL          = _str("MASTER_URL",            "")
 WS_ENABLED          = _bool("WS_ENABLED",          "false")
 PORT                = _int("PORT",                  8080)
+
+ADX_LATERAL = _float("ADX_LATERAL", 20.0)
