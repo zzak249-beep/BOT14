@@ -1,577 +1,446 @@
 """
-EMA9×VWAP Bot — scanner.py v5
-MEJORAS vs v4:
-  - Pre-check de cruce en 3m ANTES de fetchear 1H → -95% llamadas API
-  - Cache de tendencia 1H por símbolo (TTL 5 min) → sin llamadas repetidas
-  - set_margin_type ISOLATED antes de cada trade → evita cross margin
-  - VOL_REQUIRED=True por defecto → solo cruces con volumen real
-  - EMA21_REQUIRED opcional pero recomendado
+joyful-art — SHORT-only scalper scanner.
+
+Loop:
+  Every POSITION_CHECK_INTERVAL s : manage open positions
+  Every SCAN_INTERVAL s           : scan for new SHORT entries
+
+Log format (matches existing Railway logs):
+  scanner | Iter N | 100 símbolos | N señales | Ns |
+  direccionales=N avg=X max=X | session_filter=N
 """
-import asyncio
+
 import logging
 import time
-from collections import Counter
-from dataclasses import dataclass
-from typing import Optional
-import numpy as np
-import config as C
+import traceback
+
+import config
+import state
+import utils
 from bingx_client import BingXClient
+from ibs_filter import ibs_score
+from bb_short_filter import bb_short_score
+from ema9_vwap_filter import ema9_vwap_score
+from position_manager import PositionManager
 from risk_manager import RiskManager
-from position_manager import PositionManager, OpenTrade
-import telegram_client as tg
+from strategy import get_indicators
+from telegram_client import TelegramClient
 
-try:
-    from btc_correlation import compute_correlation, btc_guard
-    _BTC_CORR_AVAILABLE = True
-except ImportError:
-    _BTC_CORR_AVAILABLE = False
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+)
+log = logging.getLogger("scanner")
 
-log = logging.getLogger("ema9_vwap_scanner")
-_cb_blacklist: dict[str, float] = {}
-CB_COOLDOWN = 600
 
-# Cache de tendencia 1H: symbol → (trend_str, timestamp)
-_htf_cache: dict[str, tuple[str, float]] = {}
-HTF_CACHE_TTL = 300  # 5 minutos
+def main():
+    log.info(f"=== {config.BOT_NAME} starting (SHORT_ONLY={config.SHORT_ONLY}) ===")
 
+    client  = BingXClient(config.API_KEY, config.SECRET_KEY, config.BASE_URL)
+    pos_mgr = PositionManager(client)
+    risk    = RiskManager(config)
+    tg      = TelegramClient(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT)
 
-# ── Indicadores ──────────────────────────────────────────────────────────────
+    tg.startup(config.BOT_NAME, config.TIMEFRAME, config.LEVERAGE)
 
-def _ema(arr, period):
-    k = 2.0 / (period + 1)
-    out = np.empty_like(arr, dtype=float)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        out[i] = arr[i] * k + out[i-1] * (1-k)
-    return out
+    # Reconcile existing positions into state.py on startup
+    _startup_reconcile(client, tg)
+    # Cancel orphan orders and re-place fresh SL/TP for all positions
+    _startup_cleanup_orders(client, pos_mgr, tg)
 
-def _rma(arr, period):
-    k = 1.0 / period
-    out = np.empty_like(arr, dtype=float)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        out[i] = arr[i] * k + out[i-1] * (1-k)
-    return out
-
-def _vwap(arr):
-    h, l, c, v = arr[:,2], arr[:,3], arr[:,4], arr[:,5]
-    hlc3 = (h+l+c)/3.0
-    return np.cumsum(hlc3*v) / (np.cumsum(v) + 1e-12)
-
-def _atr(arr, period):
-    h, l, c = arr[:,2], arr[:,3], arr[:,4]
-    tr = np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))
-    return _rma(np.concatenate([[tr[0]], tr]), period)
-
-def _rsi(c, period):
-    diff = np.diff(c)
-    gain = np.concatenate([[0], np.where(diff>0, diff, 0)])
-    loss = np.concatenate([[0], np.where(diff<0, -diff, 0)])
-    ag, al = _rma(gain, period), _rma(loss, period)
-    rs = np.divide(ag, al+1e-12, out=np.ones_like(ag), where=al>0)
-    return 100.0 - (100.0/(1.0+rs))
-
-def _macd(c, fast, slow, signal):
-    ml = _ema(c, fast) - _ema(c, slow)
-    sl = _ema(ml, signal)
-    return ml, sl, ml - sl
-
-def _crossover(a, b, lookback=1):
-    for i in range(1, min(lookback+2, len(a))):
-        if a[-i] > b[-i] and a[-(i+1)] <= b[-(i+1)]: return True
-    return False
-
-def _crossunder(a, b, lookback=1):
-    for i in range(1, min(lookback+2, len(a))):
-        if a[-i] < b[-i] and a[-(i+1)] >= b[-(i+1)]: return True
-    return False
-
-def _quick_cross_check(c, lookback=1):
-    """
-    Comprobación rápida de cruce EMA9×VWAP en solo 3m.
-    Retorna ('LONG', 'SHORT', o None) SIN fetchear 1H.
-    Si no hay cruce → retorna None y ahorramos la llamada 1H.
-    """
-    if len(c) < 30:
-        return None
-    arr_fake = np.zeros((len(c), 6))
-    arr_fake[:,4] = c
-    arr_fake[:,5] = 1.0
-    arr_fake[:,2] = c
-    arr_fake[:,3] = c
-    ema9 = _ema(c, 9)
-    vwap = _vwap(arr_fake)
-    if _crossover(ema9, vwap, lookback):
-        return "LONG"
-    if _crossunder(ema9, vwap, lookback):
-        return "SHORT"
-    return None
-
-def _htf_trend_cached(symbol, klines_1h) -> str:
-    """Trend con cache 5 min — evita refetch cada 60s."""
-    now = time.time()
-    cached = _htf_cache.get(symbol)
-    if cached and (now - cached[1]) < HTF_CACHE_TTL:
-        return cached[0]
-    trend = _compute_htf_trend(klines_1h)
-    _htf_cache[symbol] = (trend, now)
-    return trend
-
-def _compute_htf_trend(klines_1h) -> str:
-    if len(klines_1h) < 52:
-        return "NEUTRAL"
-    arr = np.array(klines_1h, dtype=float)
-    c = arr[:,4]
-    e20 = _ema(c, 20)
-    e50 = _ema(c, 50)
-    if e20[-1] > e50[-1] * 1.001: return "BULL"
-    if e20[-1] < e50[-1] * 0.999: return "BEAR"
-    return "NEUTRAL"
-
-
-# ── Señal ─────────────────────────────────────────────────────────────────────
-
-@dataclass
-class EV_Signal:
-    symbol: str; direction: str; score: float
-    entry: float; sl: float; tp1: float; tp2: float; atr: float
-    rsi: float; macd_hist: float; vol_ratio: float
-    htf_trend: str = "NEUTRAL"; reason: str = ""
-
-
-def _analyze(symbol, klines_3m, klines_1h):
-    def _none(r):
-        return EV_Signal(symbol=symbol, direction="NONE", score=0,
-            entry=0, sl=0, tp1=0, tp2=0, atr=0, rsi=50,
-            macd_hist=0, vol_ratio=1, reason=r)
-
-    arr = np.array(klines_3m, dtype=float)
-    c, v = arr[:,4], arr[:,5]
-
-    ema9_arr  = _ema(c, getattr(C,'EMA9_PERIOD',9))
-    ema21_arr = _ema(c, getattr(C,'EMA21_PERIOD',21))
-    vwap_arr  = _vwap(arr)
-    atr_arr   = _atr(arr, getattr(C,'ATR_LEN',14))
-    atr       = float(atr_arr[-1])
-    price     = float(c[-1])
-    if atr <= 0: return _none("invalid_atr")
-
-    rsi_arr     = _rsi(c, getattr(C,'RSI_PERIOD',14))
-    rsi         = float(rsi_arr[-1])
-    macd_l, _, hist = _macd(c, getattr(C,'MACD_FAST',12),
-                             getattr(C,'MACD_SLOW',26), getattr(C,'MACD_SIGNAL',9))
-    macd_hist   = float(hist[-1])
-    macd_rising = hist[-1] > hist[-2] if len(hist)>1 else True
-
-    vol_period = getattr(C,'VOL_MA_PERIOD',20)
-    vol_ratio  = (float(v[-1])/(float(np.mean(v[-vol_period:]))+1e-12)
-                  if len(v)>=vol_period else 1.0)
-
-    htf = _htf_trend_cached(symbol, klines_1h)
-    htf_filter = getattr(C,'HTF_FILTER_ENABLED',True)
-
-    lookback    = getattr(C,'CROSS_LOOKBACK',1)
-    long_cross  = _crossover(ema9_arr, vwap_arr, lookback)
-    short_cross = _crossunder(ema9_arr, vwap_arr, lookback)
-    if not long_cross and not short_cross: return _none("no_cross")
-
-    direction = "LONG" if long_cross else "SHORT"
-
-    if htf_filter:
-        if direction == "LONG" and htf == "BEAR":
-            return _none("htf_bear_no_long")
-        if direction == "SHORT" and htf == "BULL":
-            return _none("htf_bull_no_short")
-
-    score   = 50.0
-    rsi_mid = getattr(C,'RSI_MID',50.0)
-    rsi_ob  = getattr(C,'RSI_OB',70.0)
-    rsi_os  = getattr(C,'RSI_OS',30.0)
-
-    if direction == "LONG":
-        rsi_ok = rsi > rsi_mid and rsi < rsi_ob
-        if rsi_ok: score += 20
-    else:
-        rsi_ok = rsi < rsi_mid and rsi > rsi_os
-        if rsi_ok: score += 20
-
-    if getattr(C,'RSI_REQUIRED',True) and not rsi_ok:
-        return _none(f"rsi_fail({rsi:.1f})")
-
-    if direction == "LONG":
-        macd_ok = macd_hist > 0 or macd_rising
-        score  += 20 if macd_hist>0 else (8 if macd_rising else 0)
-    else:
-        macd_ok = macd_hist < 0 or not macd_rising
-        score  += 20 if macd_hist<0 else (8 if not macd_rising else 0)
-
-    if getattr(C,'MACD_REQUIRED',True) and not macd_ok:
-        return _none(f"macd_fail({macd_hist:.4f})")
-
-    vol_mult = getattr(C,'VOL_MIN_MULT',1.5)
-    if vol_ratio >= vol_mult:
-        score += min((vol_ratio-1)*10, 10)
-    elif getattr(C,'VOL_REQUIRED',True):   # True por defecto en v5
-        return _none(f"vol_fail({vol_ratio:.2f}<{vol_mult:.1f})")
-
-    ema9, ema21 = float(ema9_arr[-1]), float(ema21_arr[-1])
-    ema21_ok = (direction=="LONG" and ema9>ema21) or (direction=="SHORT" and ema9<ema21)
-    if ema21_ok:
-        score += 10
-    elif getattr(C,'EMA21_REQUIRED',False):
-        return _none("ema21_fail")
-
-    # HTF boost
-    if (direction=="LONG" and htf=="BULL") or (direction=="SHORT" and htf=="BEAR"):
-        score += 10
-
-    score = min(round(score,1), 100.0)
-    mult  = getattr(C,'ATR_TRAIL_MULT',2.5)   # 2.5 por defecto en v5
-    tp1m  = getattr(C,'TP1_ATR_MULT',3.0)     # 3.0 por defecto en v5
-    tp2m  = getattr(C,'TP2_ATR_MULT',5.0)
-
-    if direction == "LONG":
-        sl, tp1, tp2 = price-atr*mult, price+atr*tp1m, price+atr*tp2m
-    else:
-        sl, tp1, tp2 = price+atr*mult, price-atr*tp1m, price-atr*tp2m
-
-    return EV_Signal(symbol=symbol, direction=direction, score=score,
-        entry=price, sl=sl, tp1=tp1, tp2=tp2, atr=atr,
-        rsi=rsi, macd_hist=macd_hist, vol_ratio=vol_ratio,
-        htf_trend=htf, reason="ok")
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _direction_allowed(risk, direction):
-    result = risk.direction_allowed(direction)
-    if len(result) == 3: return result
-    ok, reason = result
-    return ok, reason, None
-
-def _release_dir(risk, direction, token):
-    try: risk.release_direction_reservation(direction, token)
-    except AttributeError: pass
-
-
-# ── Proceso por símbolo ───────────────────────────────────────────────────────
-
-async def _process_symbol(symbol, client, risk, pos_mgr, diag, btc_klines=None):
-    if pos_mgr.is_trading(symbol):
-        diag["counts"]["already_trading"] += 1
-        return None
-
-    now = time.time()
-    if symbol in _cb_blacklist and now-_cb_blacklist[symbol] < CB_COOLDOWN:
-        diag["counts"]["cb_cooldown"] += 1
-        return None
-
-    # ── FETCH 3m ─────────────────────────────────────────────────────────────
-    try:
-        klines = await client.get_klines(symbol, C.TIMEFRAME, 200)
-    except Exception:
-        diag["counts"]["fetch_error"] += 1
-        return None
-
-    if len(klines) < 60:
-        diag["counts"]["insufficient_data"] += 1
-        return None
-
-    # ── PRE-CHECK CRUCE (sin 1H) — ahorra 95% de llamadas API ────────────────
-    c_arr = np.array([k[4] for k in klines], dtype=float)
-    quick = _quick_cross_check(c_arr, getattr(C,'CROSS_LOOKBACK',1))
-    if quick is None:
-        diag["counts"]["no_cross"] += 1
-        return None
-
-    # ── FETCH 1H solo si hay cruce ────────────────────────────────────────────
-    if getattr(C,'HTF_FILTER_ENABLED',True):
-        cached_trend = _htf_cache.get(symbol)
-        if cached_trend and (now - cached_trend[1]) < HTF_CACHE_TTL:
-            k1h = []  # no necesitamos refetchear
-        else:
-            try:
-                k1h = await client.get_klines(symbol, "1h", 60)
-            except Exception:
-                k1h = []
-    else:
-        k1h = []
-
-    sig = _analyze(symbol, klines, k1h)
-    if sig.direction == "NONE":
-        diag["counts"][sig.reason or "no_signal"] += 1
-        return None
-
-    if sig.score < getattr(C,'MIN_SCORE',65.0):
-        diag["counts"]["score_bajo"] += 1
-        return None
-
-    diag["score_n"]   += 1
-    diag["score_sum"] += sig.score
-    if sig.score > diag["score_max"]:
-        diag["score_max"]        = sig.score
-        diag["score_max_symbol"] = symbol
-        diag["score_max_dir"]    = sig.direction
-
-    log.info("[%s] %s score=%.1f rsi=%.1f macd=%.4f vol=%.2f× htf=%s",
-             symbol, sig.direction, sig.score,
-             sig.rsi, sig.macd_hist, sig.vol_ratio, sig.htf_trend)
-
-    if C.MODE == "SIGNAL":
-        try:
-            await tg.send(
-                f"EMA9xVWAP {symbol} {sig.direction} score={sig.score:.0f} "
-                f"htf={sig.htf_trend} vol={sig.vol_ratio:.2f}x\n"
-                f"RSI:{sig.rsi:.1f} MACD:{sig.macd_hist:.4f}\n"
-                f"Entry:{sig.entry:.6f} SL:{sig.sl:.6f} TP1:{sig.tp1:.6f}"
-            )
-        except Exception as e:
-            log.warning("[%s] tg.send: %s", symbol, e)
-        diag["counts"]["signal_sent"] += 1
-        return sig
-
-    # ── LIVE ─────────────────────────────────────────────────────────────────
-    dir_token = None; btc_token = None
-    btc_reserved = False; btc_corr = 0.0
-
-    try:
-        unrealized = await pos_mgr.get_unrealized_pnl()
-        can, reason = await risk.can_trade(unrealized_pnl=unrealized)
-        if not can:
-            log.info("[%s] BLOCKED: %s", symbol, reason)
-            diag["counts"][f"risk({reason[:20]})"] += 1
-            return None
-
-        sym_ok, sym_reason = risk.symbol_allowed(symbol)
-        if not sym_ok:
-            diag["counts"]["symbol_blocked"] += 1
-            await risk.release_reservation()
-            return None
-
-        dir_ok, dir_reason, dir_token = _direction_allowed(risk, sig.direction)
-        if not dir_ok:
-            diag["counts"]["corr_blocked"] += 1
-            await risk.release_reservation()
-            return None
-
-        if (btc_klines and _BTC_CORR_AVAILABLE
-                and getattr(C,'BTC_CORR_ENABLED',True)
-                and symbol != "BTC-USDT"):
-            try:
-                btc_corr = compute_correlation(klines, btc_klines)
-                btc_guard.threshold  = getattr(C,'BTC_CORR_THRESHOLD',0.5)
-                btc_guard.window_sec = getattr(C,'BTC_CORR_WINDOW_SEC',1800)
-                btc_guard.max_same   = getattr(C,'BTC_CORR_MAX_SAME',3)
-                if abs(btc_corr) >= btc_guard.threshold:
-                    btc_ok, btc_r, btc_token = btc_guard.allowed(sig.direction, btc_corr)
-                    btc_reserved = True
-                    if not btc_ok:
-                        diag["counts"]["btc_blocked"] += 1
-                        await risk.release_reservation()
-                        _release_dir(risk, sig.direction, dir_token)
-                        return None
-            except Exception as e:
-                log.debug("[%s] btc_corr: %s", symbol, e)
-
-        try:
-            balance = await client.get_balance()
-        except Exception as e:
-            log.error("[%s] get_balance: %s", symbol, e)
-            await risk.release_reservation()
-            _release_dir(risk, sig.direction, dir_token)
-            return None
-        if balance < 5.0:
-            balance = C.CAPITAL
-
-        try:
-            qty = risk.kelly_position_size(
-                balance, sig.entry, sig.sl, sig.score, "STD", symbol=symbol
-            )
-        except Exception as e:
-            log.error("[%s] kelly: %s", symbol, e)
-            diag["counts"]["kelly_error"] += 1
-            await risk.release_reservation()
-            _release_dir(risk, sig.direction, dir_token)
-            return None
-
-        min_notional   = getattr(C,'MIN_NOTIONAL_USDT',12.0)
-        fixed_notional = getattr(C,'FIXED_NOTIONAL_USDT',0.0)
-        leverage       = getattr(C,'LEVERAGE',5)
-
-        if fixed_notional > 0:
-            qty = fixed_notional / sig.entry / leverage
-        elif qty * sig.entry < min_notional:
-            qty = min_notional / sig.entry / leverage
-
-        try:
-            qty = client._round_qty(symbol, qty)
-        except Exception:
-            qty = round(qty, 4)
-
-        notional = qty * sig.entry
-        log.info("[%s] qty=%.6f notional=%.2f USDT", symbol, qty, notional)
-
-        if qty <= 0 or notional < min_notional * 0.9:
-            log.warning("[%s] BLOCKED qty/notional insuficiente", symbol)
-            diag["counts"]["qty_too_small"] += 1
-            await risk.release_reservation()
-            _release_dir(risk, sig.direction, dir_token)
-            return None
-
-        # Forzar leverage e isolated margin
-        try:
-            await client.set_leverage(symbol, leverage)
-        except Exception as e:
-            log.debug("[%s] set_leverage: %s", symbol, e)
-        try:
-            await client.set_margin_type(symbol, "ISOLATED")
-        except Exception as e:
-            log.debug("[%s] set_margin_type: %s (ignorado)", symbol, e)
-
-        # Entrada
-        entry_resp = {}
-        used_limit = False
-        if getattr(C,'LIMIT_ORDERS_ENABLED',True):
-            try:
-                lmt = await client.place_limit_entry(
-                    symbol, sig.direction, qty, sig.entry,
-                    sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
-                    timeout_s=getattr(C,'LIMIT_TIMEOUT_SECS',15),
-                )
-                if lmt.get("code",-1) == 0:
-                    entry_resp = lmt
-                    used_limit = True
-            except Exception as e:
-                log.warning("[%s] limit: %s", symbol, e)
-
-        if not used_limit:
-            try:
-                results = await client.open_trade(
-                    symbol=symbol, direction=sig.direction, quantity=qty,
-                    sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
-                )
-                entry_resp = results.get("entry", {})
-            except Exception as e:
-                log.error("[%s] open_trade: %s", symbol, e)
-                await risk.release_reservation()
-                _release_dir(risk, sig.direction, dir_token)
-                if btc_reserved and _BTC_CORR_AVAILABLE:
-                    btc_guard.release(sig.direction, btc_corr, btc_token)
-                return None
-
-        if entry_resp.get("code",-1) != 0:
-            log.error("[%s] rechazada: %s", symbol, entry_resp.get("code"))
-            diag["counts"]["entrada_rechazada"] += 1
-            await risk.release_reservation()
-            _release_dir(risk, sig.direction, dir_token)
-            if btc_reserved and _BTC_CORR_AVAILABLE:
-                btc_guard.release(sig.direction, btc_corr, btc_token)
-            return None
-
-        order_id = str(
-            entry_resp.get("data",{}).get("order",{}).get("orderId","unknown")
-            or entry_resp.get("data",{}).get("orderId","unknown")
-        )
-        trade = OpenTrade(
-            symbol=symbol, direction=sig.direction,
-            entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
-            qty=qty, atr=sig.atr, order_id=order_id,
-        )
-        await pos_mgr.register_trade(trade)
-        try:
-            await tg.send(
-                f"TRADE {symbol} {sig.direction} {notional:.1f}USDT "
-                f"htf={sig.htf_trend} entry={sig.entry:.6f} SL={sig.sl:.6f}"
-            )
-        except Exception:
-            pass
-        diag["counts"]["trade_opened"] += 1
-        return sig
-
-    except Exception as e:
-        log.error("[%s] EXCEPCION: %s — %s", symbol, type(e).__name__, e, exc_info=True)
-        diag["counts"][f"exc({type(e).__name__})"] += 1
-        try:
-            await risk.release_reservation()
-        except Exception:
-            pass
-        return None
-
-
-# ── Loop ─────────────────────────────────────────────────────────────────────
-
-def _new_diag():
-    return {"counts": Counter(), "score_n": 0, "score_sum": 0.0,
-            "score_max": 0.0, "score_max_symbol": "", "score_max_dir": ""}
-
-
-async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
-    log.info(
-        "EMA9xVWAP v5 | Modo=%s | TF=%s | HTF=%s CROSS_LB=%d | "
-        "VOL_req=%s(%.1fx) EMA21=%s | FIXED=%.1f MIN=%.1f MIN_SCORE=%.0f",
-        C.MODE, C.TIMEFRAME,
-        getattr(C,'HTF_FILTER_ENABLED',True), getattr(C,'CROSS_LOOKBACK',1),
-        getattr(C,'VOL_REQUIRED',True), getattr(C,'VOL_MIN_MULT',1.5),
-        getattr(C,'EMA21_REQUIRED',False),
-        getattr(C,'FIXED_NOTIONAL_USDT',0.0), getattr(C,'MIN_NOTIONAL_USDT',12.0),
-        getattr(C,'MIN_SCORE',65.0),
-    )
-
-    symbols:   list[str] = []
-    iteration: int       = 0
+    iteration    = 0
+    last_scan_t  = 0.0
+    last_pos_t   = 0.0
 
     while True:
-        start = time.time()
-        iteration += 1
-        diag = _new_diag()
+        now = time.time()
+        try:
+            # ── Position management (every POSITION_CHECK_INTERVAL) ──
+            if now - last_pos_t >= config.POSITION_CHECK_INTERVAL:
+                _manage_positions(client, pos_mgr, risk, tg)
+                last_pos_t = time.time()
 
-        if iteration == 1 or iteration % 10 == 0 or not symbols:
-            try:
-                syms = await client.get_all_symbols()
-                if syms:
-                    symbols = syms
-                    log.info("Simbolos: %d", len(symbols))
-            except Exception as e:
-                log.error("get_all_symbols: %s", e)
-                if not symbols:
-                    await asyncio.sleep(30)
+            # ── Signal scan (every SCAN_INTERVAL) ───────────────────
+            if now - last_scan_t >= config.SCAN_INTERVAL:
+                t0 = time.time()
+                iteration += 1
+
+                in_session = utils.in_trading_session()
+                equity     = client.get_equity()
+
+                if not in_session:
+                    elapsed = time.time() - t0
+                    log.info(
+                        f"scanner | Iter {iteration} | {config.TOP_N_SYMBOLS} símbolos "
+                        f"| 0 señales | {elapsed:.1f}s | direccionales=0 avg=0.0 max=0.0 "
+                        f"| session_filter={config.TOP_N_SYMBOLS}"
+                    )
+                    last_scan_t = time.time()
+                    time.sleep(5)
                     continue
 
-        if not symbols:
-            await asyncio.sleep(10)
+                allowed, reason = risk.can_trade(equity)
+                if not allowed:
+                    log.warning(f"blocked: {reason}")
+                    tg.blocked(config.BOT_NAME, reason)
+                    last_scan_t = time.time()
+                    time.sleep(5)
+                    continue
+
+                n_open = len(client.get_positions())
+                slots  = config.MAX_OPEN_TRADES - n_open
+                n_sig  = avg_sc = max_sc = 0
+
+                if slots > 0:
+                    n_sig, avg_sc, max_sc = _scan_and_enter(
+                        client, pos_mgr, risk, tg, slots, equity
+                    )
+
+                elapsed = time.time() - t0
+                log.info(
+                    f"scanner | Iter {iteration} | {config.TOP_N_SYMBOLS} símbolos "
+                    f"| {n_sig} señales | {elapsed:.1f}s "
+                    f"| direccionales={n_sig} avg={avg_sc:.1f} max={max_sc:.1f}"
+                )
+                last_scan_t = time.time()
+
+        except KeyboardInterrupt:
+            log.info("Stopped.")
+            break
+        except Exception as e:
+            log.error(f"Loop error: {e}\n{traceback.format_exc()}")
+            tg.error(config.BOT_NAME, str(e)[:400])
+            time.sleep(30)
+
+        time.sleep(2)
+
+
+# ── Startup reconciliation ─────────────────────────────────────
+
+def _startup_reconcile(client: BingXClient, tg: TelegramClient):
+    """
+    FIX: save entry_ts NOW for any position not already in state.py.
+    Ensures MAX_HOLD works after Railway restart even for existing positions.
+    Also alerts on blacklisted symbols still open.
+    """
+    positions = client.get_positions()
+    reconciled = 0
+    for pos in positions:
+        sym  = pos["symbol"]
+        side = pos["positionSide"]
+        if state.get_entry_ts(sym, side) is None:
+            state.save_entry(sym, side)
+            log.info(f"Reconcile: {sym} {side} → entry_ts=now")
+            reconciled += 1
+        if utils.is_blacklisted(sym):
+            log.warning(f"Blacklisted symbol {sym} has open position!")
+            tg.info(config.BOT_NAME,
+                    f"⚠ {sym} está en blacklist pero tiene posición abierta. "
+                    f"Cierra manualmente o espera a max_hold.")
+    if reconciled:
+        log.info(f"Reconciled {reconciled} existing positions into state.py")
+
+
+def _startup_cleanup_orders(client: BingXClient, pos_mgr: PositionManager,
+                             tg: TelegramClient):
+    """
+    FIX: cancel ALL orphan orders for every open position on startup.
+    Solves the 20-orders accumulation bug caused by cancel failures.
+    Then re-places a fresh SL + TP1 based on entry price and current ATR.
+    Also re-initializes trail stop from current price so it works immediately.
+    """
+    positions = client.get_positions()
+    if not positions:
+        return
+
+    log.info(f"Startup order cleanup: {len(positions)} positions")
+    for pos in positions:
+        sym   = pos["symbol"]
+        side  = pos["positionSide"]
+        size  = pos["size"]
+        entry = pos["entryPrice"]
+
+        if side != "SHORT":
             continue
 
-        btc_klines = None
-        if _BTC_CORR_AVAILABLE and getattr(C,'BTC_CORR_ENABLED',True):
-            try:
-                btc_klines = await client.get_klines("BTC-USDT", C.TIMEFRAME, 80)
-            except Exception:
-                pass
+        try:
+            # Step 1: Cancel ALL existing orders (kills accumulation)
+            client.cancel_all_open_orders(sym)
+            log.info(f"Cleanup: cancelled all orders for {sym}")
 
-        signals_found = 0
-        for i in range(0, len(symbols), 20):
-            batch   = symbols[i:i+20]
-            results = await asyncio.gather(
-                *[_process_symbol(s, client, risk, pos_mgr, diag, btc_klines)
-                  for s in batch],
-                return_exceptions=True,
-            )
-            for r in results:
-                if isinstance(r, Exception):
-                    log.debug("gather exc: %s", r)
-                elif isinstance(r, EV_Signal) and r.direction != "NONE":
-                    signals_found += 1
-            await asyncio.sleep(0.2)
+            # Step 2: Get current ATR
+            candles = client.get_klines(sym, config.TIMEFRAME, 80)
+            if len(candles) < 20:
+                continue
+            ind = get_indicators(candles)
+            atr = ind.get("atr")
+            if not atr:
+                continue
 
-        elapsed = time.time() - start
-        top8    = diag["counts"].most_common(8)
-        avg_sc  = diag["score_sum"] / diag["score_n"] if diag["score_n"] else 0.0
-        top_str = " | ".join(f"{k}={v}" for k,v in top8) if top8 else "-"
+            mark = client.get_mark_price(sym)
 
-        log.info("Iter %d | %d sym | %d trades | %.1fs | "
-                 "cruce=%d avg=%.1f max=%.1f(%s %s) | %s",
-                 iteration, len(symbols), signals_found, elapsed,
-                 diag["score_n"], avg_sc, diag["score_max"],
-                 diag["score_max_symbol"], diag["score_max_dir"], top_str)
+            # Step 3: Re-initialize trail stop from current price
+            # (avoids stale trail that never fires after restart)
+            current_trail = state.get_trail(sym, side)
+            if current_trail is None:
+                fresh_stop = mark + atr * config.TRAIL_DISTANCE_ATR
+                state.save_trail(sym, side, fresh_stop)
+                log.info(f"Cleanup: trail reset {sym} → {fresh_stop:.6g}")
 
-        await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
+            # Step 4: Re-place fresh SL + TP1 (max 2 orders)
+            pos_mgr.place_tp_sl(sym, side, entry, size, atr)
+            log.info(f"Cleanup: fresh TP/SL placed for {sym}")
+
+        except Exception as e:
+            log.error(f"Cleanup {sym}: {e}")
+
+    tg.info(config.BOT_NAME, f"✅ Startup cleanup: {len(positions)} posiciones saneadas")
+
+
+# ── Position management ────────────────────────────────────────
+
+def _manage_positions(client: BingXClient, pos_mgr: PositionManager,
+                      risk: RiskManager, tg: TelegramClient):
+    try:
+        positions = client.get_positions()
+    except Exception as e:
+        log.error(f"get_positions: {e}")
+        return
+
+    for pos in positions:
+        sym   = pos["symbol"]
+        side  = pos["positionSide"]
+        size  = pos["size"]
+        entry = pos["entryPrice"]
+        pnl   = pos["unrealizedPnl"]
+
+        if side != "SHORT":
+            continue
+
+        try:
+            mark    = client.get_mark_price(sym)
+            candles = client.get_klines(sym, config.TIMEFRAME, 80)
+            if len(candles) < 20:
+                continue
+            ind = get_indicators(candles)
+            atr = ind.get("atr")
+            if not atr:
+                continue
+
+            # 1. MAX_HOLD (reads from disk — survives restarts)
+            if pos_mgr.is_max_hold_expired(sym, "SHORT"):
+                _exit(pos_mgr, risk, tg, sym, "SHORT", size, mark, pnl, "max_hold")
+                continue
+
+            # 2. TP2 full close
+            if state.is_tp1_hit(sym, "SHORT") and \
+               pos_mgr.should_take_tp2(sym, "SHORT", mark, entry, atr):
+                _exit(pos_mgr, risk, tg, sym, "SHORT", size, mark, pnl, "tp2")
+                continue
+
+            # 3. TP1 partial (50%)
+            if pos_mgr.should_take_tp1(sym, "SHORT", mark, entry, atr):
+                tp_qty = pos_mgr._round_qty(sym, size * 0.5)
+                if tp_qty >= pos_mgr._min_qty(sym):
+                    pos_mgr.close_short(sym, tp_qty, "tp1_partial")
+                    pos_mgr.mark_tp1_hit(sym, "SHORT")
+                    tg.exit_trade(config.BOT_NAME, sym, "SHORT", mark,
+                                  "TP1 partial", pnl * 0.5)
+
+            # 4. ATR trail stop
+            stop, hit = pos_mgr.tick_trail(sym, "SHORT", mark, atr)
+            if hit:
+                _exit(pos_mgr, risk, tg, sym, "SHORT", size, mark, pnl, "trail_stop")
+                continue
+
+            # 5. Breakeven SL
+            if pos_mgr.should_move_breakeven(sym, "SHORT", mark, entry, atr):
+                pos_mgr.move_sl_to_breakeven(sym, "SHORT", entry, size)
+
+            # 6. EMA exit (price crosses above EMA9 = momentum lost)
+            if config.EMA_EXIT_ENABLED:
+                ema9 = ind.get("ema9")
+                if ema9 and mark > ema9:
+                    entry_ts = state.get_entry_ts(sym, "SHORT")
+                    held_min = (time.time() - entry_ts) / 60 if entry_ts else 99
+                    if held_min >= config.EMA_EXIT_MIN_HOLD_MIN:
+                        _exit(pos_mgr, risk, tg, sym, "SHORT", size,
+                              mark, pnl, "ema_exit")
+                        continue
+
+        except Exception as e:
+            log.error(f"manage {sym}: {e}")
+
+
+def _exit(pos_mgr, risk, tg, sym, side, size, price, pnl, reason):
+    if pos_mgr.close_short(sym, size, reason):
+        risk.record_trade(pnl)
+        tg.exit_trade(config.BOT_NAME, sym, side, price, reason, pnl)
+
+
+# ── Signal scanning ────────────────────────────────────────────
+
+def _scan_and_enter(client: BingXClient, pos_mgr: PositionManager,
+                    risk: RiskManager, tg: TelegramClient,
+                    slots: int, equity: float) -> tuple:
+    n_sig   = 0
+    scores  = []
+
+    try:
+        symbols = client.get_top_symbols(config.TOP_N_SYMBOLS, config.MIN_VOLUME_USDT)
+    except Exception as e:
+        log.error(f"get_top_symbols: {e}")
+        return 0, 0.0, 0.0
+
+    open_syms = {p["symbol"] for p in client.get_positions()}
+
+    for sym in symbols:
+        if n_sig >= slots:
+            break
+        if utils.is_blacklisted(sym):        # FIX: normalized blacklist check
+            continue
+        if sym in open_syms:
+            continue
+
+        try:
+            candles = client.get_klines(sym, config.TIMEFRAME, 120)
+            if len(candles) < 60:
+                continue
+
+            ind   = get_indicators(candles)
+            atr   = ind.get("atr")
+            price = ind.get("close")
+            ema9  = ind.get("ema9")
+            ema21 = ind.get("ema21")
+            vol   = ind.get("volume")
+            vol_ma = ind.get("vol_ma")
+
+            if None in (atr, price, ema9, ema21):
+                continue
+
+            # Primary filter: EMA9 < EMA21 (downtrend required for SHORT)
+            if ema9 >= ema21:
+                continue
+
+            # EMA9_RALLY: price near EMA9 (pullback entry)
+            if config.EMA9_RALLY_ENABLED:
+                distance_pct = abs(price - ema9) / ema9 * 100
+                if distance_pct > config.EMA9_NEAR_PCT:
+                    continue
+                if vol and vol_ma and vol < vol_ma * config.EMA9_VOL_HIGH_MULT:
+                    continue
+
+            # RSI 15m filter
+            rsi15m_penalty = 0
+            if config.RSI15M_FILTER_ENABLED:
+                try:
+                    c15 = client.get_klines(sym, config.HTF_TIMEFRAME, 30)
+                    i15 = get_indicators(c15)
+                    rsi15m = i15.get("rsi")
+                    if rsi15m and rsi15m > config.RSI15M_SHORT_MAX:
+                        if config.RSI15M_REQUIRED:
+                            continue
+                        rsi15m_penalty = 8
+                except Exception:
+                    pass
+
+            # Composite score
+            score = _compute_score(price, ind, sym, client)
+            score -= rsi15m_penalty
+            score  = max(0, score)
+            scores.append(score)
+
+            if score < config.MIN_SCORE:
+                continue
+
+            # Sizing
+            qty = pos_mgr.calc_qty(sym, price, atr, equity, score)
+            if qty is None:
+                continue
+
+            # Margin check
+            margin_needed = qty * price / config.LEVERAGE
+            if client.get_available_margin() < margin_needed + config.MIN_MARGIN_USDT:
+                log.warning(f"Low margin for {sym}")
+                continue
+
+            # Open SHORT
+            ok = pos_mgr.open_short(sym, qty, atr)
+            if ok:
+                open_syms.add(sym)
+                n_sig += 1
+                risk.increment_daily_trades()
+                stop = state.get_trail(sym, "SHORT") or 0
+                tg.entry(config.BOT_NAME, sym, "SHORT", price, qty, stop, equity, score)
+                # Place initial SL + TP1
+                pos_mgr.place_tp_sl(sym, "SHORT", price, qty, atr)
+
+        except Exception as e:
+            log.error(f"scan {sym}: {e}")
+
+    avg_s = round(sum(scores) / len(scores), 1) if scores else 0.0
+    max_s = round(max(scores), 1) if scores else 0.0
+    return n_sig, avg_s, max_s
+
+
+# ── Composite scoring ──────────────────────────────────────────
+
+def _compute_score(price: float, ind: dict, sym: str,
+                   client: BingXClient) -> int:
+    """
+    Score 0-100 for SHORT setups.
+
+    Breakdown:
+      Base          : 40 pts  (passed primary filter)
+      ADX           : 0-15   (trend strength)
+      EMA9_VWAP     : ±9     (aligned=+9, counter=-9)
+      EMA55         : +6     (price below EMA55)
+      IBS pullback  : 0-12   (ibs_filter)
+      BB position   : 0-10   (bb_short_filter)
+      HTF counter   : -12    (counter_trend_penalty)
+
+    MIN_SCORE=55 → base(40) + ADX≥20(7) + small_extras(8)
+    FUEL_SCORE=62 → base(40) + ADX≥25(15) + EMA9_VWAP(9) - 2
+    SUP_SCORE=78  → base(40) + ADX≥25(15) + EMA9_VWAP(9) + EMA55(6) + IBS(8)
+    """
+    score = 40
+
+    # ADX strength
+    adx = ind.get("adx")
+    if adx:
+        if adx >= config.ADX_TREND:    score += 15
+        elif adx >= config.ADX_LATERAL: score += 7
+
+    # EMA9_VWAP (±9)
+    if config.EMA9_VWAP_ENABLED:
+        score += int(ema9_vwap_score(ind, config.EMA9_VWAP_BOOST))
+
+    # EMA55 boost
+    ema55 = ind.get("ema55")
+    if config.EMA55_BOOST_ENABLED and ema55 and price < ema55:
+        score += 6
+
+    # IBS pullback (0-12)
+    if config.IBS_PULLBACK_ENABLED:
+        score += int(ibs_score(ind))
+
+    # BB short (0-10)
+    if config.BB_SHORT_ENABLED:
+        score += int(bb_short_score(ind))
+
+    # HTF counter-trend penalty (-12)
+    try:
+        htf = client.get_klines(sym, config.HTF_TIMEFRAME, 40)
+        htf_ind = get_indicators(htf)
+        htf_ema9  = htf_ind.get("ema9")
+        htf_ema21 = htf_ind.get("ema21")
+        if htf_ema9 and htf_ema21 and htf_ema9 > htf_ema21:
+            score -= int(config.COUNTER_TREND_PENALTY)
+    except Exception:
+        pass
+
+    return max(0, score)
+
+
+if __name__ == "__main__":
+    main()
