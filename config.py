@@ -25,7 +25,8 @@ def _list(k, d=""):
 
 
 # ── Identity
-BOT_NAME = _str("BOT_NAME", "renewed-love")
+BOT_NAME   = _str("BOT_NAME", "renewed-love")
+SHORT_ONLY = _bool("SHORT_ONLY", "false")  # renewed-love trades LONG+SHORT
 
 # ── BingX
 API_KEY    = _str("BINGX_API_KEY")
