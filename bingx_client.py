@@ -1,10 +1,6 @@
 """
-BingX Perpetual Futures REST client — Hedge mode.
-HMAC-SHA256 signing: urlencode(sorted(params.items())).
-
-Additions vs previous version:
-  - cancel_all_open_orders(symbol)  → needed before every TP/SL placement
-  - place_limit_order(...)          → TP1 partial-close limit orders
+BingX Perpetual Futures REST client — Cross margin / Hedge mode.
+Signing: HMAC-SHA256 over urlencode(sorted(params)).
 """
 
 import hashlib
@@ -25,15 +21,15 @@ class BingXClient:
         self.base_url   = base_url.rstrip("/")
         self._session   = requests.Session()
         self._session.headers.update({"X-BX-APIKEY": api_key})
+        self._ticker_cache: dict  = {}
+        self._ticker_ts: float    = 0
 
     # ── Signing ───────────────────────────────────────────────
 
     def _sign(self, params: dict) -> str:
         qs = urllib.parse.urlencode(sorted(params.items()))
         return hmac.new(
-            self.secret_key.encode(),
-            qs.encode(),
-            hashlib.sha256,
+            self.secret_key.encode(), qs.encode(), hashlib.sha256
         ).hexdigest()
 
     @staticmethod
@@ -42,33 +38,36 @@ class BingXClient:
 
     # ── HTTP ──────────────────────────────────────────────────
 
-    def _get(self, path: str, params: dict = None) -> dict | list:
+    def _get(self, path: str, params: dict = None):
         p = dict(params or {})
         p["timestamp"] = self._ts()
+        p["recvWindow"] = 5000
         p["signature"] = self._sign(p)
-        r = self._session.get(f"{self.base_url}{path}", params=p, timeout=10)
+        r = self._session.get(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
         d = r.json()
         if d.get("code") != 0:
             raise RuntimeError(f"BingX [{d.get('code')}] {d.get('msg')}")
         return d.get("data") or {}
 
-    def _post(self, path: str, params: dict) -> dict | list:
+    def _post(self, path: str, params: dict):
         p = dict(params)
         p["timestamp"] = self._ts()
+        p["recvWindow"] = 5000
         p["signature"] = self._sign(p)
-        r = self._session.post(f"{self.base_url}{path}", params=p, timeout=10)
+        r = self._session.post(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
         d = r.json()
         if d.get("code") != 0:
             raise RuntimeError(f"BingX [{d.get('code')}] {d.get('msg')}")
         return d.get("data") or {}
 
-    def _delete(self, path: str, params: dict) -> dict | list:
+    def _delete(self, path: str, params: dict):
         p = dict(params)
         p["timestamp"] = self._ts()
+        p["recvWindow"] = 5000
         p["signature"] = self._sign(p)
-        r = self._session.delete(f"{self.base_url}{path}", params=p, timeout=10)
+        r = self._session.delete(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
         d = r.json()
         if d.get("code") != 0:
@@ -77,8 +76,7 @@ class BingXClient:
 
     # ── Market data ───────────────────────────────────────────
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 300) -> list:
-        """Returns candle list sorted oldest→newest."""
+    def get_klines(self, symbol: str, interval: str, limit: int = 120) -> list:
         raw = self._get(
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
@@ -100,27 +98,75 @@ class BingXClient:
         d = self._get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
         return float(d.get("markPrice", 0))
 
-    def get_ticker(self, symbol: str) -> dict:
-        return self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
-
-    def get_all_symbols(self) -> list:
-        """Returns list of contract dicts with symbol, tradeMinQuantity, etc."""
-        data = self._get("/openApi/swap/v2/quote/contracts")
-        return data if isinstance(data, list) else []
+    def get_funding_rate(self, symbol: str) -> float:
+        """Current funding rate for harvest filter."""
+        try:
+            d = self._get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
+            return float(d.get("lastFundingRate", 0))
+        except Exception:
+            return 0.0
 
     def get_symbol_info(self, symbol: str) -> dict:
-        for s in self.get_all_symbols():
+        for s in self.get_all_contracts():
             if s.get("symbol") == symbol:
                 return s
         return {}
+
+    def get_all_contracts(self) -> list:
+        data = self._get("/openApi/swap/v2/quote/contracts")
+        return data if isinstance(data, list) else []
+
+    def get_all_tickers(self) -> list:
+        """All 24h tickers — cached 60s to avoid hammering API."""
+        if time.time() - self._ticker_ts < 60:
+            return list(self._ticker_cache.values())
+        try:
+            data = self._get("/openApi/swap/v2/quote/ticker")
+            tickers = data if isinstance(data, list) else []
+            self._ticker_cache = {t.get("symbol"): t for t in tickers}
+            self._ticker_ts = time.time()
+            return tickers
+        except Exception as e:
+            log.warning(f"get_all_tickers: {e}")
+            return []
+
+    def get_top_symbols(self, top_n: int, min_volume_usdt: float) -> list:
+        """
+        Returns top_n symbols by 24h quote volume filtered by min_volume_usdt.
+        Enriches contract list with ticker volume (logs: 'enriqueciendo con /ticker').
+        """
+        contracts = self.get_all_contracts()
+        tickers   = {t.get("symbol"): t for t in self.get_all_tickers()}
+
+        valid = []
+        no_vol = 0
+        for c in contracts:
+            sym = c.get("symbol", "")
+            t   = tickers.get(sym, {})
+            vol = float(t.get("quoteVolume", t.get("volume", 0)))
+            if vol == 0:
+                no_vol += 1
+            if vol >= min_volume_usdt:
+                valid.append((sym, vol))
+
+        if no_vol:
+            log.info(f"contracts sin volumen → enriqueciendo con /ticker | {no_vol} sin datos")
+
+        valid.sort(key=lambda x: x[1], reverse=True)
+        log.info(f"get_top_symbols: {len(contracts)} total, {len(valid)} ≥ {min_volume_usdt:,.0f} vol")
+        return [s for s, _ in valid[:top_n]]
 
     # ── Account ───────────────────────────────────────────────
 
     def _balance_usdt(self) -> dict:
         data = self._get("/openApi/swap/v2/user/balance")
-        for asset in (data.get("balance") or []):
-            if asset.get("asset") == "USDT":
-                return asset
+        bal = data.get("balance") or {}
+        if isinstance(bal, dict):
+            return bal
+        if isinstance(bal, list):
+            for a in bal:
+                if isinstance(a, dict) and a.get("asset") == "USDT":
+                    return a
         return {}
 
     def get_equity(self) -> float:
@@ -158,10 +204,8 @@ class BingXClient:
     def set_leverage(self, symbol: str, leverage: int):
         for side in ("LONG", "SHORT"):
             try:
-                self._post(
-                    "/openApi/swap/v2/trade/leverage",
-                    {"symbol": symbol, "leverage": leverage, "side": side},
-                )
+                self._post("/openApi/swap/v2/trade/leverage",
+                           {"symbol": symbol, "leverage": leverage, "side": side})
             except Exception as e:
                 log.warning(f"set_leverage {side} {symbol}: {e}")
 
@@ -169,50 +213,33 @@ class BingXClient:
 
     def place_market_order(self, symbol: str, side: str,
                            position_side: str, quantity: float) -> dict:
-        """side=BUY|SELL  position_side=LONG|SHORT (Hedge mode)."""
-        return self._post(
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol":       symbol,
-                "side":         side,
-                "positionSide": position_side,
-                "type":         "MARKET",
-                "quantity":     str(quantity),
-            },
-        )
+        return self._post("/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": side,
+            "positionSide": position_side,
+            "type": "MARKET", "quantity": str(quantity),
+        })
 
     def place_limit_order(self, symbol: str, side: str,
                           position_side: str, price: float, quantity: float) -> dict:
-        """Limit order — used for TP partial closes."""
-        return self._post(
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol":       symbol,
-                "side":         side,
-                "positionSide": position_side,
-                "type":         "LIMIT",
-                "price":        f"{price:.8g}",
-                "quantity":     str(quantity),
-                "timeInForce":  "GTC",
-            },
-        )
+        return self._post("/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": side,
+            "positionSide": position_side,
+            "type": "LIMIT", "price": f"{price:.8g}",
+            "quantity": str(quantity), "timeInForce": "GTC",
+        })
 
     def place_stop_market(self, symbol: str, position_side: str,
                           stop_price: float, quantity: float) -> dict:
-        """Stop-market protective order."""
+        """Stop-market order in hedge mode — no closePosition, use quantity."""
         side = "SELL" if position_side == "LONG" else "BUY"
-        return self._post(
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol":        symbol,
-                "side":          side,
-                "positionSide":  position_side,
-                "type":          "STOP_MARKET",
-                "stopPrice":     f"{stop_price:.8g}",
-                "closePosition": "true",
-                "quantity":      str(quantity),
-            },
-        )
+        return self._post("/openApi/swap/v2/trade/order", {
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": position_side,
+            "type":         "STOP_MARKET",
+            "stopPrice":    f"{stop_price:.6f}",
+            "quantity":     f"{quantity:.6f}".rstrip("0").rstrip("."),
+        })
 
     def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
         side = "SELL" if position_side == "LONG" else "BUY"
@@ -230,33 +257,24 @@ class BingXClient:
 
     def cancel_order(self, symbol: str, order_id: str):
         try:
-            self._delete(
-                "/openApi/swap/v2/trade/order",
-                {"symbol": symbol, "orderId": order_id},
-            )
+            self._delete("/openApi/swap/v2/trade/order",
+                         {"symbol": symbol, "orderId": order_id})
         except Exception as e:
             log.warning(f"cancel_order {order_id}: {e}")
 
     def cancel_all_open_orders(self, symbol: str):
         """
-        FIX: Cancel every pending order for this symbol.
-        Must be called BEFORE placing new TP/SL orders to prevent
-        order accumulation (previously reached 18 orders on SAHARA).
-        Uses batch endpoint if available, falls back to per-order cancel.
+        FIX: cancel all pending orders before placing new TP/SL.
+        Prevents order accumulation (EURUSD had 24 orders).
         """
         try:
-            # Try batch cancel first (most efficient)
-            self._delete(
-                "/openApi/swap/v2/trade/allOpenOrders",
-                {"symbol": symbol},
-            )
+            self._delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
             log.debug(f"cancel_all_open_orders {symbol} (batch)")
         except Exception:
-            # Fallback: cancel one by one
             orders = self.get_open_orders(symbol)
             for o in orders:
                 oid = o.get("orderId") or o.get("id")
                 if oid:
                     self.cancel_order(symbol, str(oid))
             if orders:
-                log.debug(f"cancel_all_open_orders {symbol} (individual, n={len(orders)})")
+                log.debug(f"cancel_all_open_orders {symbol} (individual n={len(orders)})")
