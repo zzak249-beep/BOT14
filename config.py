@@ -160,3 +160,7 @@ PORT       = _int("PORT", 8080)
 WS_ENABLED = _bool("WS_ENABLED", "false")
 STATE_FILE = _str("STATE_FILE", "/tmp/bot_state.json")
 MASTER_URL = _str("MASTER_URL", "")
+
+# ── Telegram
+TELEGRAM_TOKEN = _str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT  = _str("TELEGRAM_CHAT_ID")
