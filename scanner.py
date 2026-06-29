@@ -33,7 +33,32 @@ logging.basicConfig(
 log = logging.getLogger("scanner")
 
 
+
+
+def _start_health_server():
+    """Minimal HTTP server for Railway healthcheck on /health."""
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *a):
+            pass  # suppress access logs
+
+    try:
+        port = getattr(config, "PORT", 8080)
+        srv = HTTPServer(("0.0.0.0", port), _H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        log.info(f"Health server :{ port}/health")
+    except Exception as e:
+        log.warning(f"Health server failed: {e}")
+
 def main():
+    _start_health_server()
     log.info(f"=== {config.BOT_NAME} starting (SHORT_ONLY={config.SHORT_ONLY}) ===")
 
     client  = BingXClient(config.API_KEY, config.SECRET_KEY, config.BASE_URL)
