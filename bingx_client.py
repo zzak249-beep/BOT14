@@ -41,7 +41,6 @@ class BingXClient:
     def _get(self, path: str, params: dict = None):
         p = dict(params or {})
         p["timestamp"] = self._ts()
-        p["recvWindow"] = 5000
         p["signature"] = self._sign(p)
         r = self._session.get(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
