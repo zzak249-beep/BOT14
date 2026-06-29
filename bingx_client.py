@@ -38,6 +38,7 @@ class BingXClient:
 
     # ── HTTP ──────────────────────────────────────────────────
 
+
     def _get(self, path: str, params: dict = None):
         p = dict(params or {})
         p["timestamp"] = self._ts()
@@ -50,10 +51,12 @@ class BingXClient:
         return d.get("data") or {}
 
     def _post(self, path: str, params: dict):
-        p = dict(params)
+        p   = dict(params)
         p["timestamp"] = self._ts()
-        p["signature"] = self._sign(p)
-        r = self._session.post(f"{self.base_url}{path}", data=p, timeout=12)  # body not URL
+        qs  = urllib.parse.urlencode(sorted(p.items()))
+        sig = hmac.new(self.secret_key.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        url = f"{self.base_url}{path}?{qs}&signature={sig}"
+        r   = self._session.post(url, timeout=12)
         r.raise_for_status()
         d = r.json()
         if d.get("code") != 0:
@@ -70,6 +73,7 @@ class BingXClient:
         if d.get("code") != 0:
             raise RuntimeError(f"BingX [{d.get('code')}] {d.get('msg')}")
         return d.get("data") or {}
+
 
     # ── Market data ───────────────────────────────────────────
 
