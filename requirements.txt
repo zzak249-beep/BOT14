@@ -1,5 +1,1 @@
-fastapi
-uvicorn[standard]
-aiohttp
-numpy
-python-dotenv
+requests>=2.31.0
