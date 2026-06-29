@@ -38,11 +38,9 @@ class BingXClient:
 
     # ── HTTP ──────────────────────────────────────────────────
 
-
     def _get(self, path: str, params: dict = None):
         p = dict(params or {})
         p["timestamp"] = self._ts()
-        p["recvWindow"] = 60000
         p["signature"] = self._sign(p)
         r = self._session.get(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
@@ -54,10 +52,8 @@ class BingXClient:
     def _post(self, path: str, params: dict):
         p = dict(params)
         p["timestamp"] = self._ts()
-        p["recvWindow"] = 60000
         p["signature"] = self._sign(p)
-        # FIX: BingX POST requires params in request BODY, not URL
-        r = self._session.post(f"{self.base_url}{path}", data=p, timeout=12)
+        r = self._session.post(f"{self.base_url}{path}", data=p, timeout=12)  # body not URL
         r.raise_for_status()
         d = r.json()
         if d.get("code") != 0:
@@ -67,7 +63,6 @@ class BingXClient:
     def _delete(self, path: str, params: dict):
         p = dict(params)
         p["timestamp"] = self._ts()
-        p["recvWindow"] = 60000
         p["signature"] = self._sign(p)
         r = self._session.delete(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
@@ -75,7 +70,6 @@ class BingXClient:
         if d.get("code") != 0:
             raise RuntimeError(f"BingX [{d.get('code')}] {d.get('msg')}")
         return d.get("data") or {}
-
 
     # ── Market data ───────────────────────────────────────────
 
