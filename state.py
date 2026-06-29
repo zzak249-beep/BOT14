@@ -13,7 +13,7 @@ import time
 
 log = logging.getLogger("state")
 
-_STATE_FILE = os.getenv("STATE_FILE", "/tmp/bot_state.json")
+_STATE_FILE = os.getenv("STATE_FILE", "/app/bot_state.json")
 
 
 # ── Internal I/O ──────────────────────────────────────────────
