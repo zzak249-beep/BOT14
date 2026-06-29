@@ -27,7 +27,7 @@ class BingXClient:
     # ── Signing ───────────────────────────────────────────────
 
     def _sign(self, params: dict) -> str:
-        qs = urllib.parse.urlencode(sorted(params.items()))
+        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         return hmac.new(
             self.secret_key.encode(), qs.encode(), hashlib.sha256
         ).hexdigest()
@@ -52,7 +52,6 @@ class BingXClient:
     def _post(self, path: str, params: dict):
         p = dict(params)
         p["timestamp"] = self._ts()
-        p["recvWindow"] = 5000
         p["signature"] = self._sign(p)
         r = self._session.post(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
@@ -64,7 +63,6 @@ class BingXClient:
     def _delete(self, path: str, params: dict):
         p = dict(params)
         p["timestamp"] = self._ts()
-        p["recvWindow"] = 5000
         p["signature"] = self._sign(p)
         r = self._session.delete(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
