@@ -164,3 +164,50 @@ MASTER_URL = _str("MASTER_URL", "")
 # ── Telegram
 TELEGRAM_TOKEN = _str("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT  = _str("TELEGRAM_CHAT_ID")
+
+# ── EMA9 Rally filter (crossover bot — rally disabled, uses crossover instead)
+EMA9_RALLY_ENABLED   = _bool("EMA9_RALLY_ENABLED",   "false")
+EMA9_NEAR_PCT        = _float("EMA9_NEAR_PCT",        1.0)
+EMA9_VOL_HIGH_MULT   = _float("EMA9_VOL_HIGH_MULT",   1.3)
+
+# ── Short-specific filters
+IBS_PULLBACK_ENABLED  = _bool("IBS_PULLBACK_ENABLED",  "false")
+BB_SHORT_ENABLED      = _bool("BB_SHORT_ENABLED",      "false")
+BB_SHORT_VETO_LONG    = _bool("BB_SHORT_VETO_LONG",    "false")
+EMA9_VWAP_ENABLED     = _bool("EMA9_VWAP_ENABLED",     "false")
+EMA9_VWAP_VETO_LONG   = _bool("EMA9_VWAP_VETO_LONG",   "false")
+EMA9_VWAP_BOOST       = _float("EMA9_VWAP_BOOST",      0.0)
+EMA55_BOOST_ENABLED   = _bool("EMA55_BOOST_ENABLED",   "false")
+RSI15M_FILTER_ENABLED = _bool("RSI15M_FILTER_ENABLED", "false")
+RSI15M_SHORT_MAX      = _float("RSI15M_SHORT_MAX",     70.0)
+RSI15M_REQUIRED       = _bool("RSI15M_REQUIRED",       "false")
+
+# ── Scoring
+SUP_SCORE    = _int("SUP_SCORE",   85)
+FUEL_SCORE   = _int("FUEL_SCORE",  70)
+MIN_SCORE    = _int("MIN_SCORE",   60)
+COUNTER_TREND_PENALTY = _float("COUNTER_TREND_PENALTY", 12.0)
+
+# ── Market structure / BTC regime
+MS_ENABLED          = _bool("MS_ENABLED",          "true")
+MS_LEN              = _int("MS_LEN",               10)
+BTC_REGIME_ENABLED  = _bool("BTC_REGIME_ENABLED",  "true")
+BTC_CORR_ENABLED    = _bool("BTC_CORR_ENABLED",    "true")
+BTC_CORR_THRESHOLD  = _float("BTC_CORR_THRESHOLD", 0.5)
+BTC_CORR_MAX_SAME   = _int("BTC_CORR_MAX_SAME",    3)
+MAX_SAME_DIRECTION  = _int("MAX_SAME_DIRECTION",   2)
+CORRELATION_WINDOW_SEC = _int("CORRELATION_WINDOW_SEC", 900)
+BTC_CORR_WINDOW_SEC = _int("BTC_CORR_WINDOW_SEC",  1800)
+
+# ── Misc entry params
+REQUIRE_TL_BREAK    = _bool("REQUIRE_TL_BREAK",    "false")
+LATERAL_ADX_MAX     = _float("LATERAL_ADX_MAX",    25.0)
+MAX_ADAPTIVE_OFFSET = _int("MAX_ADAPTIVE_OFFSET",  6)
+COPY_MIN_SCORE      = _int("COPY_MIN_SCORE",        62)
+COPY_SIZE_MULT      = _float("COPY_SIZE_MULT",      0.4)
+EXCLUSIVE_TOP_N     = _int("EXCLUSIVE_TOP_N",       30)
+COPY_MAX_ADVERSE_PCT = _float("COPY_MAX_ADVERSE_PCT", -0.3)
+HEDGE_LOSS_COUNT    = _int("HEDGE_LOSS_COUNT",      3)
+MASTER_URL          = _str("MASTER_URL",            "")
+WS_ENABLED          = _bool("WS_ENABLED",          "false")
+PORT                = _int("PORT",                  8080)
