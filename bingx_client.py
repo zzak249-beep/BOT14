@@ -38,6 +38,7 @@ class BingXClient:
 
     # ── HTTP ──────────────────────────────────────────────────
 
+
     def _get(self, path: str, params: dict = None):
         p = dict(params or {})
         p["timestamp"] = self._ts()
@@ -72,6 +73,7 @@ class BingXClient:
         if d.get("code") != 0:
             raise RuntimeError(f"BingX [{d.get('code')}] {d.get('msg')}")
         return d.get("data") or {}
+
 
     # ── Market data ───────────────────────────────────────────
 
@@ -229,15 +231,14 @@ class BingXClient:
 
     def place_stop_market(self, symbol: str, position_side: str,
                           stop_price: float, quantity: float) -> dict:
-        """Stop-market: closePosition=true so BingX uses actual position size (avoids 110424)."""
         side = "SELL" if position_side == "LONG" else "BUY"
+        qty_str = f"{quantity:.6f}".rstrip("0").rstrip(".") or str(quantity)
         return self._post("/openApi/swap/v2/trade/order", {
-            "symbol":        symbol,
-            "side":          side,
-            "positionSide":  position_side,
-            "type":          "STOP_MARKET",
-            "stopPrice":     f"{stop_price:.6f}",
-            "closePosition": "true",
+            "symbol": symbol, "side": side,
+            "positionSide": position_side,
+            "type": "STOP_MARKET",
+            "stopPrice": f"{stop_price:.6f}",
+            "quantity": qty_str,
         })
 
     def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
