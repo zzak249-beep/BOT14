@@ -227,3 +227,5 @@ UNICORN_RR          = _float("UNICORN_RR", 2.0)
 
 # ── Cooldown
 TRADE_COOLDOWN_SEC = _int("TRADE_COOLDOWN_SEC", 180)
+
+DIRECTION           = _str("DIRECTION", "BOTH")  # LONG | SHORT | BOTH
