@@ -142,8 +142,7 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
             if not qty: continue
 
             if direction == "LONG":
-                if not hasattr(pos_mgr, "open_long"): continue
-                ok = pos_mgr.open_long(sym, qty, sig["atr"])
+                ok = pos_mgr.open_long(sym, qty, atr_v)
             else:
                 ok = pos_mgr.open_short(sym, qty, sig["atr"])
             if ok:
