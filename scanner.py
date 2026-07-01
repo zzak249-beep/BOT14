@@ -132,9 +132,11 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
         if len(client.get_positions()) >= config.MAX_OPEN_TRADES:
+            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(client.get_positions())}/{config.MAX_OPEN_TRADES}")  # DEBUG temporal
             break
-        allowed, _ = risk.can_trade(equity)
+        allowed, why = risk.can_trade(equity)
         if not allowed:
+            log.warning(f"can_trade=False en {sym}: {why}")  # DEBUG temporal
             break
         try:
             candles = client.get_klines(sym, config.TIMEFRAME, 120)
@@ -188,9 +190,11 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
         if len(client.get_positions()) >= config.MAX_OPEN_TRADES:
+            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(client.get_positions())}/{config.MAX_OPEN_TRADES}")  # DEBUG temporal
             break
-        allowed, _ = risk.can_trade(equity)
+        allowed, why = risk.can_trade(equity)
         if not allowed:
+            log.warning(f"can_trade=False en {sym}: {why}")  # DEBUG temporal
             break
         try:
             c5m = client.get_klines(sym, "5m",  200)
