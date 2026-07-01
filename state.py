@@ -1,11 +1,16 @@
 """
 Persistent bot state — survives Railway restarts.
 Stores: entry_time, tp1_hit, trail_stop per symbol/side.
-
 Root cause fix: entry_time stored in RAM was wiped on every Railway
 redeploy → MAX_HOLD_MINUTES never triggered → positions open 20-26h.
-"""
 
+FIX (this version): get_tracked_positions() exposes which symbol/side
+pairs THIS bot has a recorded entry for — independent of the exchange's
+account-wide position list. scanner.py uses this so MAX_OPEN_TRADES and
+_manage_open_positions only count/touch positions this bot itself
+opened, not positions opened by other bots sharing the same BingX
+account.
+"""
 import json
 import logging
 import os
@@ -61,6 +66,29 @@ def is_max_hold_expired(symbol: str, side: str, max_minutes: int) -> bool:
         log.info(f"MAX_HOLD expired {symbol} {side} | elapsed={elapsed:.0f}m limit={max_minutes}m")
         return True
     return False
+
+
+# ── Tracked positions (this bot's own) ──────────────────────────
+
+def get_tracked_positions() -> list:
+    """
+    FIX: returns [(symbol, side), ...] for every position with a
+    recorded entry_ts — i.e. positions THIS bot opened and is tracking.
+
+    Used instead of client.get_positions(), which returns every open
+    position on the whole BingX account, including other bots'
+    positions if the account is shared.
+    """
+    d = _load()
+    out = []
+    for k in d:
+        if k.endswith("_entry_ts"):
+            base = k[: -len("_entry_ts")]
+            if "_" not in base:
+                continue
+            symbol, side = base.rsplit("_", 1)
+            out.append((symbol, side))
+    return out
 
 
 # ── TP1 hit flag ──────────────────────────────────────────────
