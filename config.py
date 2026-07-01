@@ -216,3 +216,14 @@ WS_ENABLED          = _bool("WS_ENABLED",          "false")
 PORT                = _int("PORT",                  8080)
 
 ADX_LATERAL = _float("ADX_LATERAL", 20.0)
+
+# ── Unicorn Model (multi-symbol scan)
+UNICORN_TOP_N    = _int("UNICORN_TOP_N", 150)   # símbolos para Unicorn scan
+UNICORN_SCAN_SEC = _int("UNICORN_SCAN_SEC", 300) # cada 5 min
+UNICORN_PIVOT_LEN   = _int("UNICORN_PIVOT_LEN", 5)
+UNICORN_SWEEP_LB    = _int("UNICORN_SWEEP_LB", 30)
+UNICORN_REQUIRE_FVG = _bool("UNICORN_REQUIRE_FVG", "true")
+UNICORN_RR          = _float("UNICORN_RR", 2.0)
+
+# ── Cooldown
+TRADE_COOLDOWN_SEC = _int("TRADE_COOLDOWN_SEC", 180)
