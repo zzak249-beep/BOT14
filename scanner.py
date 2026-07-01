@@ -144,9 +144,9 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
             if direction == "LONG":
                 ok = pos_mgr.open_long(sym, qty, atr_v)
             else:
-                ok = pos_mgr.open_short(sym, qty, sig["atr"])
+                ok = pos_mgr.open_short(sym, qty, atr_v)
             if ok:
-                pos_mgr.place_tp_sl(sym, direction, qty, mark, sig["atr"])
+                pos_mgr.place_tp_sl(sym, direction, qty, mark, atr_v)
                 tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
                 _open_symbols.add(sym)
                 opened += 1
