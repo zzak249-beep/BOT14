@@ -62,7 +62,7 @@ def _close_position(client, pos_mgr, risk, tg,
     price = client.get_mark_price(symbol)
     pnl   = pos["unrealizedPnl"]
     if side == "LONG":
-        pos_mgr.close_long(symbol, pos["size"], reason)
+        pos_mgr.close_short(symbol, pos['size'], reason)  # renewed-love SHORT only
     else:
         pos_mgr.close_short(symbol, pos["size"], reason)
     risk.record_trade(pnl)
@@ -115,7 +115,7 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
     for sym in symbols:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
-        if pos_mgr.count_open() >= config.MAX_OPEN_TRADES:
+        if len(client.get_positions()) >= config.MAX_OPEN_TRADES:
             break
         allowed, _ = risk.can_trade(equity)
         if not allowed:
@@ -142,6 +142,7 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
             if not qty: continue
 
             if direction == "LONG":
+                if not hasattr(pos_mgr, "open_long"): continue
                 ok = pos_mgr.open_long(sym, qty, sig["atr"])
             else:
                 ok = pos_mgr.open_short(sym, qty, sig["atr"])
@@ -171,7 +172,7 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
     for sym in uni_symbols:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
-        if pos_mgr.count_open() >= config.MAX_OPEN_TRADES:
+        if len(client.get_positions()) >= config.MAX_OPEN_TRADES:
             break
         allowed, _ = risk.can_trade(equity)
         if not allowed:
@@ -229,7 +230,7 @@ def main():
     log.info(f"=== {config.BOT_NAME} starting (SHORT_ONLY={config.SHORT_ONLY}) ===")
 
     client  = BingXClient(config.API_KEY, config.SECRET_KEY, config.BASE_URL)
-    pos_mgr = PositionManager(client, config)
+    pos_mgr = PositionManager(client)
     risk    = RiskManager(config)
     tg      = TelegramClient(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT)
 
