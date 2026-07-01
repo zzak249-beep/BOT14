@@ -142,7 +142,34 @@ class PositionManager:
             log.error(f"open_short {symbol}: {e}")
             return False
 
+    def open_long(self, symbol: str, qty: float, atr: float) -> bool:
+        try:
+            self.client.set_leverage(symbol, config.LEVERAGE)
+            self.client.place_market_order(symbol, "BUY", "LONG", qty)
+            state.save_entry(symbol, "LONG")
+            state.set_tp1_hit(symbol, "LONG", False)
+            state.set_be_moved(symbol, "LONG", False)
+            mark = self.client.get_mark_price(symbol)
+            init_stop = mark - atr * config.TRAIL_DISTANCE_ATR
+            state.save_trail(symbol, "LONG", init_stop)
+            log.info(f"OPEN LONG  {symbol}  qty={qty}  stop={init_stop:.6g}")
+            return True
+        except Exception as e:
+            log.error(f"open_long {symbol}: {e}")
+            return False
+
     # ── Exits ─────────────────────────────────────────────────
+
+    def close_long(self, symbol: str, qty: float, reason: str = "") -> bool:
+        try:
+            self.client.cancel_all_open_orders(symbol)
+            self.client.close_position(symbol, "LONG", qty)
+            state.clear(symbol, "LONG")
+            log.info(f"CLOSE LONG  {symbol}  qty={qty}  [{reason}]")
+            return True
+        except Exception as e:
+            log.error(f"close_long {symbol}: {e}")
+            return False
 
     def close_short(self, symbol: str, qty: float, reason: str = "") -> bool:
         try:
