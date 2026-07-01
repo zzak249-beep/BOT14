@@ -73,7 +73,7 @@ VOL_MA_PERIOD = _int("VOL_MA_PERIOD", 20)
 
 # ── Entry filters
 CROSS_LOOKBACK       = _int("CROSS_LOOKBACK", 1)
-ADX_MIN              = _int("ADX_MIN", 22)
+ADX_MIN              = _int("ADX_MIN", 15)
 ADX_TREND            = _int("ADX_TREND", 25)
 VWAP_SLOPE_MIN_PCT   = _float("VWAP_SLOPE_MIN_PCT", 0.008)
 MACD_REQUIRED        = _bool("MACD_REQUIRED", "true")
@@ -88,7 +88,7 @@ REQUIRE_TL_BREAK     = _bool("REQUIRE_TL_BREAK", "false")
 SLOPE_FILTER_ENABLED = _bool("SLOPE_FILTER_ENABLED", "true")
 
 # ── Scoring
-MIN_SCORE    = _int("MIN_SCORE", 60)
+MIN_SCORE    = _int("MIN_SCORE", 42)
 FUEL_SCORE   = _int("FUEL_SCORE", 70)
 SUP_SCORE    = _int("SUP_SCORE", 85)
 PRED_THR_STD  = _int("PRED_THR_STD", 55)
@@ -188,7 +188,7 @@ RSI15M_REQUIRED       = _bool("RSI15M_REQUIRED",       "false")
 # ── Scoring
 SUP_SCORE    = _int("SUP_SCORE",   85)
 FUEL_SCORE   = _int("FUEL_SCORE",  70)
-MIN_SCORE    = _int("MIN_SCORE",   60)
+MIN_SCORE    = _int("MIN_SCORE", 42)
 COUNTER_TREND_PENALTY = _float("COUNTER_TREND_PENALTY", 12.0)
 
 # ── Market structure / BTC regime
@@ -206,7 +206,7 @@ BTC_CORR_WINDOW_SEC = _int("BTC_CORR_WINDOW_SEC",  1800)
 REQUIRE_TL_BREAK    = _bool("REQUIRE_TL_BREAK",    "false")
 LATERAL_ADX_MAX     = _float("LATERAL_ADX_MAX",    25.0)
 MAX_ADAPTIVE_OFFSET = _int("MAX_ADAPTIVE_OFFSET",  6)
-COPY_MIN_SCORE      = _int("COPY_MIN_SCORE",        62)
+COPY_MIN_SCORE      = _int("COPY_MIN_SCORE", 50)
 COPY_SIZE_MULT      = _float("COPY_SIZE_MULT",      0.4)
 EXCLUSIVE_TOP_N     = _int("EXCLUSIVE_TOP_N",       30)
 COPY_MAX_ADVERSE_PCT = _float("COPY_MAX_ADVERSE_PCT", -0.3)
