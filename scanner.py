@@ -17,7 +17,7 @@ import config
 from bingx_client      import BingXClient
 from position_manager  import PositionManager
 from risk_manager      import RiskManager
-from strategy          import get_signal          # EMA9×VWAP
+from strategy          import get_indicators      # EMA9×VWAP indicators
 import strategy_unicorn as unicorn               # Unicorn Model
 from telegram_client   import TelegramClient
 
@@ -86,8 +86,8 @@ def _manage_open_positions(client, pos_mgr, risk, tg):
             if len(candles) < 20:
                 continue
 
-            sig = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH)
-            atr = sig.get("atr") or 0
+            ind = get_indicators(candles)
+            atr = ind.get("atr") or 0
             if not atr:
                 continue
 
@@ -124,16 +124,21 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
             candles = client.get_klines(sym, config.TIMEFRAME, 120)
             if len(candles) < 30:
                 continue
-            sig = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH)
-            if not sig["signal"]:
-                continue
-            direction = sig["signal"]
+            ind  = get_indicators(candles)
+            ind2 = get_indicators(candles[:-1]) if len(candles) > 2 else ind
+            ema9 = ind.get("ema9"); vwap = ind.get("vwap"); atr_v = ind.get("atr")
+            if not ema9 or not vwap or not atr_v: continue
+            prev_ema9 = ind2.get("ema9", ema9); prev_vwap = ind2.get("vwap", vwap)
+            cross_up   = ema9 > vwap and prev_ema9 <= prev_vwap
+            cross_down = ema9 < vwap and prev_ema9 >= prev_vwap
+            if not cross_up and not cross_down: continue
+            direction = "LONG" if cross_up else "SHORT"
             if direction == "LONG"  and config.DIRECTION not in ("LONG", "BOTH"): continue
             if direction == "SHORT" and config.DIRECTION not in ("SHORT", "BOTH"): continue
             if pos_mgr.has_position(sym, direction): continue
 
             mark = client.get_mark_price(sym)
-            qty  = pos_mgr.calc_qty(sym, mark, sig["atr"], equity)
+            qty  = pos_mgr.calc_qty(sym, mark, atr_v, equity)
             if not qty: continue
 
             if direction == "LONG":
@@ -145,7 +150,7 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
                 tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
                 _open_symbols.add(sym)
                 opened += 1
-                log.info(f"EMA9_VWAP {direction} {sym}  entry={mark:.6g}")
+                log.info(f"EMA9_VWAP {direction} {sym}  entry={mark:.6g}  ema9={ema9:.6g}  vwap={vwap:.6g}")
 
         except Exception as e:
             log.error(f"ema9_vwap {sym}: {e}")
