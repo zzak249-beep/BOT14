@@ -7,6 +7,19 @@ Estrategia 2 (profunda, cada 5min): Unicorn Model en top 150 símbolos
   → Win rate esperado: 60-65%  R/R: 2:1
 
 Sin TradingView de pago — todo Python, 100% automático.
+
+Fixes vs previous version:
+  1. place_tp_sl() recibía (qty, mark) en vez de (mark, qty) → sl_price
+     se calculaba sobre la qty en vez del precio real. Las órdenes
+     SL/TP1 quedaban sin colocar en el exchange (excepción silenciosa
+     tragada por el try/except de position_manager.py).
+  2. _close_position() llamaba a close_short() también para el lado
+     LONG → la posición LONG real nunca se cerraba en el exchange,
+     pero el bot la trataba como cerrada internamente.
+  3. _close_position() ahora respeta el bool que devuelven
+     close_long()/close_short(): si la llamada al exchange falla,
+     el estado interno (símbolo abierto, cooldown, Telegram) ya NO
+     se limpia como si el cierre hubiese tenido éxito.
 """
 import logging
 import threading
@@ -62,9 +75,12 @@ def _close_position(client, pos_mgr, risk, tg,
     price = client.get_mark_price(symbol)
     pnl   = pos["unrealizedPnl"]
     if side == "LONG":
-        pos_mgr.close_short(symbol, pos['size'], reason)  # renewed-love SHORT only
+        ok = pos_mgr.close_long(symbol, pos['size'], reason)    # FIX 2: era close_short
     else:
-        pos_mgr.close_short(symbol, pos["size"], reason)
+        ok = pos_mgr.close_short(symbol, pos["size"], reason)
+    if not ok:                                                   # FIX 3: no limpiar si falla el exchange
+        log.error(f"close_position {symbol} {side}: llamada al exchange falló, estado NO se limpia")
+        return
     risk.record_trade(pnl)
     tg.exit_trade(config.BOT_NAME, symbol, side, price, reason, pnl)
     _open_symbols.discard(symbol)
@@ -146,7 +162,7 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
             else:
                 ok = pos_mgr.open_short(sym, qty, atr_v)
             if ok:
-                pos_mgr.place_tp_sl(sym, direction, qty, mark, atr_v)
+                pos_mgr.place_tp_sl(sym, direction, mark, qty, atr_v)   # FIX 1: orden (mark, qty)
                 tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
                 _open_symbols.add(sym)
                 opened += 1
@@ -211,7 +227,7 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
                 ok = pos_mgr.open_short(sym, qty, atr)
 
             if ok:
-                pos_mgr.place_tp_sl(sym, direction, qty, mark, atr)
+                pos_mgr.place_tp_sl(sym, direction, mark, qty, atr)    # FIX 1: orden (mark, qty)
                 tg.entry(config.BOT_NAME, sym, direction, mark, qty,
                          sig["sl_price"], equity)
                 _open_symbols.add(sym)
