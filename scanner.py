@@ -174,7 +174,10 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
         try:
             c5m = client.get_klines(sym, "5m",  200)
             c1h = client.get_klines(sym, "1h",   60)
-            sig = unicorn.get_signal(c5m, c1h, config)
+            c15 = client.get_klines(sym, "15m",  30)
+            c30 = client.get_klines(sym, "30m",  20)
+            sig = unicorn.get_signal(c5m, c1h, config,
+                                     candles_15m=c15, candles_30m=c30)
 
             if not sig["signal"]:
                 continue
