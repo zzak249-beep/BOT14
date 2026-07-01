@@ -27,6 +27,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
+import state
 from bingx_client      import BingXClient
 from position_manager  import PositionManager
 from risk_manager      import RiskManager
@@ -90,11 +91,21 @@ def _close_position(client, pos_mgr, risk, tg,
 # ── Position manager ──────────────────────────────────────────
 
 def _manage_open_positions(client, pos_mgr, risk, tg):
-    positions = client.get_positions()
-    for pos in positions:
-        sym  = pos["symbol"]
-        side = pos["positionSide"]
-        if side not in ("LONG", "SHORT"):
+    """
+    FIX: itera state.get_tracked_positions() — posiciones que ESTE bot
+    abrió — en vez de client.get_positions() (toda la cuenta). Antes,
+    con la cuenta compartida entre varios bots, esto aplicaba el
+    trailing stop y max-hold de renewed-love a posiciones ajenas,
+    pudiendo cerrarlas sin que su propia estrategia interviniera.
+    """
+    for sym, side in state.get_tracked_positions():
+        pos = pos_mgr.get_position(sym, side)
+        if not pos:
+            # Ya no existe en el exchange (cerrada por SL/TP, a mano,
+            # u otro motivo) → limpiar el estado propio para no dejar
+            # un tracked-position zombie inflando MAX_OPEN_TRADES.
+            state.clear(sym, side)
+            log.info(f"state.clear {sym} {side}: ya no existe en el exchange")
             continue
         try:
             price   = client.get_mark_price(sym)
@@ -131,10 +142,9 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
     for sym in symbols:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
-        open_positions = client.get_positions()
-        if len(open_positions) >= config.MAX_OPEN_TRADES:
-            detail = ", ".join(f"{p['symbol']}:{p['positionSide']}" for p in open_positions)
-            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(open_positions)}/{config.MAX_OPEN_TRADES} → [{detail}]")  # DEBUG temporal
+        tracked = state.get_tracked_positions()   # FIX: solo propias, no toda la cuenta
+        if len(tracked) >= config.MAX_OPEN_TRADES:
+            log.warning(f"MAX_OPEN_TRADES (propias) alcanzado en {sym}: {len(tracked)}/{config.MAX_OPEN_TRADES} → {tracked}")
             break
         allowed, why = risk.can_trade(equity)
         if not allowed:
@@ -191,10 +201,9 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
     for sym in uni_symbols:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
-        open_positions = client.get_positions()
-        if len(open_positions) >= config.MAX_OPEN_TRADES:
-            detail = ", ".join(f"{p['symbol']}:{p['positionSide']}" for p in open_positions)
-            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(open_positions)}/{config.MAX_OPEN_TRADES} → [{detail}]")  # DEBUG temporal
+        tracked = state.get_tracked_positions()   # FIX: solo propias, no toda la cuenta
+        if len(tracked) >= config.MAX_OPEN_TRADES:
+            log.warning(f"MAX_OPEN_TRADES (propias) alcanzado en {sym}: {len(tracked)}/{config.MAX_OPEN_TRADES} → {tracked}")
             break
         allowed, why = risk.can_trade(equity)
         if not allowed:
