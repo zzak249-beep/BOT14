@@ -131,8 +131,10 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
     for sym in symbols:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
-        if len(client.get_positions()) >= config.MAX_OPEN_TRADES:
-            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(client.get_positions())}/{config.MAX_OPEN_TRADES}")  # DEBUG temporal
+        open_positions = client.get_positions()
+        if len(open_positions) >= config.MAX_OPEN_TRADES:
+            detail = ", ".join(f"{p['symbol']}:{p['positionSide']}" for p in open_positions)
+            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(open_positions)}/{config.MAX_OPEN_TRADES} → [{detail}]")  # DEBUG temporal
             break
         allowed, why = risk.can_trade(equity)
         if not allowed:
@@ -189,8 +191,10 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
     for sym in uni_symbols:
         if sym in config.BLACKLIST or sym in _open_symbols or _in_cooldown(sym):
             continue
-        if len(client.get_positions()) >= config.MAX_OPEN_TRADES:
-            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(client.get_positions())}/{config.MAX_OPEN_TRADES}")  # DEBUG temporal
+        open_positions = client.get_positions()
+        if len(open_positions) >= config.MAX_OPEN_TRADES:
+            detail = ", ".join(f"{p['symbol']}:{p['positionSide']}" for p in open_positions)
+            log.warning(f"MAX_OPEN_TRADES alcanzado en {sym}: {len(open_positions)}/{config.MAX_OPEN_TRADES} → [{detail}]")  # DEBUG temporal
             break
         allowed, why = risk.can_trade(equity)
         if not allowed:
