@@ -42,6 +42,32 @@ class RiskManager:
     def increment_daily_trades(self):
         self._day_trades += 1
 
+    # ── Missing methods called by position_monitor ────────────────────────────
+    def update_open_count(self, n: int):
+        """Track number of open positions (called by position_monitor)."""
+        self._open_count = n
+
+    def on_trade_opened(self, symbol: str = "", side: str = "", **kwargs):
+        """Hook called when a trade is opened."""
+        pass
+
+    def on_trade_closed(self, symbol: str = "", side: str = "", pnl: float = 0.0, **kwargs):
+        """Hook called when a trade is closed."""
+        if pnl != 0.0:
+            self.record_trade(pnl)
+
+    def new_day(self, equity: float):
+        """Force new day reset."""
+        self._reset(equity)
+
+    def can_open(self, equity: float) -> tuple:
+        """Alias for can_trade used by some position monitors."""
+        return self.can_trade(equity)
+
+    @property
+    def open_count(self) -> int:
+        return getattr(self, "_open_count", 0)
+
     @property
     def day_pnl(self) -> float:
         return self._day_pnl
