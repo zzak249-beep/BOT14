@@ -1,5 +1,5 @@
 """
-PositionManager — joyful-art SHORT-only scalper.
+PositionManager — renewed-love (LONG + SHORT, Unicorn Model).
 
 Fixes vs previous version:
   1. entry_time persisted via state.py (survives Railway restart)
