@@ -9,6 +9,12 @@ Fixes vs previous version:
      → fixes EURUSD 24-orders accumulation bug
   5. Notional check after rounding → skip if < MIN_NOTIONAL_USDT * 0.9
   6. Score-based tier sizing (STD / FUEL / SUP)
+  7. place_tp_sl(): sl_price/tp1_price y el lado de la orden TP1
+     estaban hardcodeados para SHORT únicamente ("SHORT SL above
+     entry" se aplicaba también a LONG). Un LONG real habría recibido
+     SL por encima de entrada (lado equivocado) y una orden TP1 BUY
+     (suma a la posición en vez de cerrarla). Ahora ambos son
+     side-aware. TP1 también manda reduceOnly=true.
 """
 
 import logging
@@ -243,15 +249,26 @@ class PositionManager:
         """
         FIX: cancel ALL orders BEFORE placing → eliminates accumulation bug.
         Places: 1 SL stop-market + 1 TP1 limit order.
+
+        FIX 7: sl_price/tp1_price y el lado de la orden TP1 son ahora
+        side-aware. Antes estaban hardcodeados para SHORT, así que un
+        LONG habría recibido SL por encima de entrada y TP1 como BUY.
         """
         try:
             self.client.cancel_all_open_orders(symbol)
         except Exception as e:
             log.warning(f"cancel_all {symbol}: {e}")
 
-        sl_price  = entry_price + atr * config.SL_ATR_MULT   # SHORT SL above entry
-        tp1_price = entry_price - atr * config.TP1_ATR_MULT  # SHORT TP1 below entry
-        tp_qty    = self._round_qty(symbol, qty * 0.5)
+        if side == "SHORT":
+            sl_price       = entry_price + atr * config.SL_ATR_MULT   # SL above entry
+            tp1_price      = entry_price - atr * config.TP1_ATR_MULT  # TP1 below entry
+            tp1_order_side = "BUY"                                    # cierra SHORT
+        else:  # LONG
+            sl_price       = entry_price - atr * config.SL_ATR_MULT   # SL below entry
+            tp1_price      = entry_price + atr * config.TP1_ATR_MULT  # TP1 above entry
+            tp1_order_side = "SELL"                                   # cierra LONG
+
+        tp_qty = self._round_qty(symbol, qty * 0.5)
 
         try:
             self.client.place_stop_market(symbol, side, sl_price, qty)
@@ -260,7 +277,8 @@ class PositionManager:
 
         if tp_qty >= self._min_qty(symbol):
             try:
-                self.client.place_limit_order(symbol, "BUY", side, tp1_price, tp_qty)
+                self.client.place_limit_order(symbol, tp1_order_side, side,
+                                              tp1_price, tp_qty, reduce_only=True)
             except Exception as e:
                 log.error(f"place_tp1 {symbol}: {e}")
 
