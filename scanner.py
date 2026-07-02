@@ -177,7 +177,10 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
                 ok = pos_mgr.open_short(sym, qty, atr_v)
             if ok:
                 pos_mgr.place_tp_sl(sym, direction, mark, qty, atr_v)   # FIX 1: orden (mark, qty)
-                tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
+                try:
+                    tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
+                except Exception as e:
+                    log.warning(f"telegram entry {sym}: {e}")   # FIX: no debe cortar el flujo
                 _open_symbols.add(sym)
                 opened += 1
                 log.info(f"EMA9_VWAP {direction} {sym}  entry={mark:.6g}  ema9={ema9:.6g}  vwap={vwap:.6g}")
@@ -245,8 +248,11 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
 
             if ok:
                 pos_mgr.place_tp_sl(sym, direction, mark, qty, atr)    # FIX 1: orden (mark, qty)
-                tg.entry(config.BOT_NAME, sym, direction, mark, qty,
-                         sig["sl_price"], equity)
+                try:
+                    tg.entry(config.BOT_NAME, sym, direction, mark, qty,
+                             sig["sl_price"], equity)
+                except Exception as e:
+                    log.warning(f"telegram entry {sym}: {e}")   # FIX: no debe cortar el flujo
                 _open_symbols.add(sym)
                 opened += 1
 
