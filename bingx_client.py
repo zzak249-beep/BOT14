@@ -1,6 +1,12 @@
 """
 BingX Perpetual Futures REST client — Cross margin / Hedge mode.
 Signing: HMAC-SHA256 over urlencode(sorted(params)).
+
+FIX: place_stop_market() y place_limit_order(reduce_only=True) ahora
+mandan reduceOnly=true. Sin esto, BingX trataba la orden de cierre
+como si necesitara margen nuevo propio en vez de reconocerla como
+reducción de la posición existente → error 110424 "order size must
+be less than the available amount".
 """
 
 import hashlib
@@ -221,16 +227,25 @@ class BingXClient:
         })
 
     def place_limit_order(self, symbol: str, side: str,
-                          position_side: str, price: float, quantity: float) -> dict:
-        return self._post("/openApi/swap/v2/trade/order", {
+                          position_side: str, price: float, quantity: float,
+                          reduce_only: bool = False) -> dict:
+        params = {
             "symbol": symbol, "side": side,
             "positionSide": position_side,
             "type": "LIMIT", "price": f"{price:.8g}",
             "quantity": str(quantity), "timeInForce": "GTC",
-        })
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"   # FIX: cierre, no orden nueva
+        return self._post("/openApi/swap/v2/trade/order", params)
 
     def place_stop_market(self, symbol: str, position_side: str,
                           stop_price: float, quantity: float) -> dict:
+        """
+        FIX: reduceOnly=true siempre — esta función solo se usa para
+        cerrar/reducir una posición existente (SL, breakeven), nunca
+        para abrir. Sin el flag, BingX pedía margen nuevo → [110424].
+        """
         side = "SELL" if position_side == "LONG" else "BUY"
         qty_str = f"{quantity:.6f}".rstrip("0").rstrip(".") or str(quantity)
         return self._post("/openApi/swap/v2/trade/order", {
@@ -239,6 +254,7 @@ class BingXClient:
             "type": "STOP_MARKET",
             "stopPrice": f"{stop_price:.6f}",
             "quantity": qty_str,
+            "reduceOnly": "true",
         })
 
     def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
