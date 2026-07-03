@@ -2,11 +2,15 @@
 BingX Perpetual Futures REST client — Cross margin / Hedge mode.
 Signing: HMAC-SHA256 over urlencode(sorted(params)).
 
-FIX: place_stop_market() y place_limit_order(reduce_only=True) ahora
-mandan reduceOnly=true. Sin esto, BingX trataba la orden de cierre
-como si necesitara margen nuevo propio en vez de reconocerla como
-reducción de la posición existente → error 110424 "order size must
-be less than the available amount".
+REVERTIDO (3 jul 2026): el fix anterior mandaba reduceOnly=true en
+place_stop_market() y place_limit_order(). Estaba mal — BingX en
+Hedge Mode RECHAZA la orden si ese campo va presente:
+[109400] "In the Hedge mode, the 'ReduceOnly' field can not be
+filled." positionSide+side ya desambiguan abrir vs cerrar en hedge
+mode; el flag es redundante y esta API lo trata como error, no como
+algo que ignora. El error 110424 original que motivó el fix
+incorrecto sigue sin explicación confirmada — vigilar si reaparece
+tras este revert, con logs frescos, no con la teoría anterior.
 """
 
 import hashlib
@@ -229,22 +233,21 @@ class BingXClient:
     def place_limit_order(self, symbol: str, side: str,
                           position_side: str, price: float, quantity: float,
                           reduce_only: bool = False) -> dict:
-        params = {
+        # REVERTIDO: ya no se manda reduceOnly (BingX lo rechaza en hedge
+        # mode). El parámetro reduce_only se acepta y se ignora, para no
+        # romper los call sites existentes que lo pasan.
+        return self._post("/openApi/swap/v2/trade/order", {
             "symbol": symbol, "side": side,
             "positionSide": position_side,
             "type": "LIMIT", "price": f"{price:.8g}",
             "quantity": str(quantity), "timeInForce": "GTC",
-        }
-        if reduce_only:
-            params["reduceOnly"] = "true"   # FIX: cierre, no orden nueva
-        return self._post("/openApi/swap/v2/trade/order", params)
+        })
 
     def place_stop_market(self, symbol: str, position_side: str,
                           stop_price: float, quantity: float) -> dict:
         """
-        FIX: reduceOnly=true siempre — esta función solo se usa para
-        cerrar/reducir una posición existente (SL, breakeven), nunca
-        para abrir. Sin el flag, BingX pedía margen nuevo → [110424].
+        REVERTIDO: ya no se manda reduceOnly — ver docstring del módulo.
+        positionSide+side ya desambiguan cierre en hedge mode.
         """
         side = "SELL" if position_side == "LONG" else "BUY"
         qty_str = f"{quantity:.6f}".rstrip("0").rstrip(".") or str(quantity)
@@ -254,7 +257,6 @@ class BingXClient:
             "type": "STOP_MARKET",
             "stopPrice": f"{stop_price:.6f}",
             "quantity": qty_str,
-            "reduceOnly": "true",
         })
 
     def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
