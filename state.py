@@ -145,3 +145,20 @@ def clear(symbol: str, side: str):
 
 def dump() -> dict:
     return _load()
+
+
+# ── Daily PnL/trades state (bot-wide, no por symbol/side) ───────
+
+def save_day_state(day_pnl: float, day_trades: int, day_start_eq: float, day: str):
+    d = _load()
+    d["_day_pnl"]      = day_pnl
+    d["_day_trades"]   = day_trades
+    d["_day_start_eq"] = day_start_eq
+    d["_day"]          = day
+    _save(d)
+
+
+def get_day_state() -> tuple:
+    """Returns (day_pnl, day_trades, day_start_eq, day_iso) — cualquiera puede ser None."""
+    d = _load()
+    return d.get("_day_pnl"), d.get("_day_trades"), d.get("_day_start_eq"), d.get("_day")
