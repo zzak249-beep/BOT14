@@ -33,6 +33,7 @@ def _load() -> dict:
 
 def _save(data: dict):
     try:
+        os.makedirs(os.path.dirname(_STATE_FILE) or ".", exist_ok=True)
         with open(_STATE_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
