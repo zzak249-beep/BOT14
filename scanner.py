@@ -171,6 +171,12 @@ def _scan_ema9_vwap(client, pos_mgr, risk, tg, symbols, equity) -> int:
             qty  = pos_mgr.calc_qty(sym, mark, atr_v, equity)
             if not qty: continue
 
+            # Margen disponible — evita abrir posiciones sin margen para protegerlas
+            margin_needed = qty * mark / config.LEVERAGE
+            if client.get_available_margin() < margin_needed * 1.5:
+                log.warning(f"Margen insuficiente para {sym}, skip")
+                continue
+
             if direction == "LONG":
                 ok = pos_mgr.open_long(sym, qty, atr_v)
             else:
@@ -232,6 +238,12 @@ def _scan_unicorn(client, pos_mgr, risk, tg, symbols, equity) -> int:
             atr  = sig["atr"]
             qty  = pos_mgr.calc_qty(sym, mark, atr, equity)
             if not qty: continue
+
+            # Margen disponible — evita abrir posiciones sin margen para protegerlas
+            margin_needed = qty * mark / config.LEVERAGE
+            if client.get_available_margin() < margin_needed * 1.5:
+                log.warning(f"Margen insuficiente para {sym}, skip")
+                continue
 
             fvg_tag = "+FVG" if sig["has_fvg"] else ""
             log.info(
