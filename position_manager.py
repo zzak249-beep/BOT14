@@ -270,6 +270,16 @@ class PositionManager:
 
         tp_qty = self._round_qty(symbol, qty * 0.5)
 
+        # DEBUG temporal: margen disponible justo antes del intento de SL,
+        # para contrastar contra el "available amount" que reporta BingX
+        # en el error 110424 — confirmar si es agotamiento real de margen
+        # o algo distinto, antes de tocar la lógica de apertura.
+        try:
+            avail = self.client.get_available_margin()
+            log.info(f"place_tp_sl {symbol}: margen disponible={avail:.2f} USDT antes de SL")
+        except Exception as e:
+            log.warning(f"get_available_margin {symbol}: {e}")
+
         try:
             self.client.place_stop_market(symbol, side, sl_price, qty)
         except Exception as e:
@@ -278,7 +288,7 @@ class PositionManager:
         if tp_qty >= self._min_qty(symbol):
             try:
                 self.client.place_limit_order(symbol, tp1_order_side, side,
-                                              tp1_price, tp_qty, reduce_only=True)
+                                              tp1_price, tp_qty)   # reduce_only ya no se usa
             except Exception as e:
                 log.error(f"place_tp1 {symbol}: {e}")
 
