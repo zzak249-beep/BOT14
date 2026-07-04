@@ -29,7 +29,15 @@ BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
 # ── Scanner ────────────────────────────────────────────────────────────
-SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 20)       # requests simultáneas
+# FIX: 20 en paralelo disparaba [100410] "trigger frequency limit" en
+# quote/klines de forma consistente en producción — no es un problema de
+# volumen total (eso lo redujo el dedup de scanner.py), es de ráfaga: 20
+# peticiones casi simultáneas por símbolo × N símbolos en el semáforo a
+# la vez. Bajado a 5 como punto de partida más conservador — sin datos
+# reales del límite exacto de BingX para este endpoint, esto sigue siendo
+# una suposición razonada, ajustar hacia arriba solo tras ver un ciclo
+# limpio sin ningún 100410.
+SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 5)       # requests simultáneas
 SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 45)     # ciclo completo del scanner
 MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 3_000_000)  # filtra símbolos ilíquidos
 NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
