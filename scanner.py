@@ -35,7 +35,16 @@ async def _evaluate_one(client, symbol, config, semaphore):
         try:
             candles_entry = await client.get_klines(symbol, config.ENTRY_TF, limit=150)
             candles_bias = await client.get_klines(symbol, config.BIAS_TF, limit=120)
-            candles_1h = await client.get_klines(symbol, config.HTF_C_TF, limit=60)
+
+            # FIX: BIAS_TF y HTF_C_TF son "1H" por defecto — sin esto, se
+            # pedían las mismas velas dos veces por símbolo, en cada ciclo.
+            # Con 297 símbolos eso es ~300 peticiones redundantes por ciclo,
+            # aportando directamente al 100410 (rate limit) visto en producción.
+            if config.HTF_C_TF == config.BIAS_TF:
+                candles_1h = candles_bias
+            else:
+                candles_1h = await client.get_klines(symbol, config.HTF_C_TF, limit=60)
+
             candles_15m = await client.get_klines(symbol, config.HTF_A_TF, limit=60)
             candles_30m = await client.get_klines(symbol, config.HTF_B_TF, limit=60)
 
