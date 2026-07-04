@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Entornos virtuales
+venv/
+env/
+.venv/
+ENV/
+
+# Variables de entorno / secretos
+.env
+.env.local
+
+# Datos persistentes locales (en Railway esto vive en el Volume /data)
+data/
+*.json
+!.env.example
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,231 +1,108 @@
+"""
+Configuración — Bot Supertrend + Unicorn Model (standalone)
+=============================================================
+Todo se lee de variables de entorno (Railway-friendly). Los defaults
+son razonables para arrancar pero DEBEN revisarse antes de operar real.
+"""
 import os
 
 
-def _bool(k, d="false"):
-    return os.getenv(k, d).strip().split("#")[0].strip().lower() in ("1", "true", "yes")
-
-def _float(k, d):
-    try:
-        return float(os.getenv(k, str(d)).strip().split("#")[0].strip())
-    except:
-        return d
-
-def _int(k, d):
-    try:
-        return int(os.getenv(k, str(d)).strip().split("#")[0].strip())
-    except:
-        return d
-
-def _str(k, d=""):
-    return os.getenv(k, d).strip().split("#")[0].strip()
-
-def _list(k, d=""):
-    v = _str(k, d)
-    return [x.strip() for x in v.split(",") if x.strip()] if v else []
+def _f(name, default):
+    return float(os.getenv(name, default))
 
 
-# ── Identity
-BOT_NAME   = _str("BOT_NAME", "renewed-love")
-SHORT_ONLY = _bool("SHORT_ONLY", "false")  # renewed-love trades LONG+SHORT
+def _i(name, default):
+    return int(os.getenv(name, default))
 
-# ── BingX
-API_KEY    = _str("BINGX_API_KEY")
-SECRET_KEY = _str("BINGX_SECRET_KEY")
-BASE_URL   = "https://open-api.bingx.com"
 
-# ── Trading universe
-TOP_N_SYMBOLS    = _int("TOP_N_SYMBOLS", 500)
-BLACKLIST        = _list("BLACKLIST", "ESPORTS,STABLEUSDT,EURUSD,SILVER,SILVERXAG,OILWTI,OILBRENT,PAXG,CUSDT,SYN,GOLD,GOLDXAU,XAU,GASOLINE")
-MIN_VOLUME_USDT  = _float("MIN_VOLUME_USDT", 50_000)
+def _b(name, default):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
-# ── Execution
-LEVERAGE          = _int("LEVERAGE", 7)
-FIXED_NOTIONAL_USDT  = _float("FIXED_NOTIONAL_USDT", 15.0)
-MIN_NOTIONAL_USDT    = _float("MIN_NOTIONAL_USDT", 12.0)
-MAX_NOTIONAL_USDT    = _float("MAX_NOTIONAL_USDT", 30.0)
-MAX_OPEN_TRADES      = _int("MAX_OPEN_TRADES", 5)
-MAX_DAILY_TRADES     = _int("MAX_DAILY_TRADES", 15)
-DAILY_LOSS_PCT       = _float("DAILY_LOSS_PCT", 5.0)
-CAPITAL              = _float("CAPITAL", 125.0)
-MIN_MARGIN_USDT      = _float("MIN_MARGIN_USDT", 1.0)
-LIMIT_ORDERS_ENABLED = _bool("LIMIT_ORDERS_ENABLED", "true")
-LIMIT_TIMEOUT_SECS   = _int("LIMIT_TIMEOUT_SECS", 15)
 
-# ── Timeframes
-TIMEFRAME      = _str("TIMEFRAME", "3m")
-HTF_TIMEFRAME  = _str("HTF_TIMEFRAME", "15m")
-HTF2_TIMEFRAME = _str("HTF2_TIMEFRAME", "1h")
-HTF5_TIMEFRAME = _str("HTF5_TIMEFRAME", "4h")
+# ── Credenciales BingX ────────────────────────────────────────────────
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
+DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
-# ── Indicator periods
-ATR_LEN    = _int("ATR_LEN", 14)
-ADX_LEN    = _int("ADX_LEN", 14)
-EMA9_PERIOD  = _int("EMA9_PERIOD", 9)
-EMA21_PERIOD = _int("EMA21_PERIOD", 21)
-MACD_FAST    = _int("MACD_FAST", 12)
-MACD_SLOW    = _int("MACD_SLOW", 26)
-MACD_SIGNAL  = _int("MACD_SIGNAL", 9)
-RSI_PERIOD   = _int("RSI_PERIOD", 14)
-RSI_MID      = _int("RSI_MID", 50)
-RSI_OB       = _int("RSI_OB", 70)
-RSI_OS       = _int("RSI_OS", 30)
-VOL_MA_PERIOD = _int("VOL_MA_PERIOD", 20)
+# ── Scanner ────────────────────────────────────────────────────────────
+SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 20)       # requests simultáneas
+SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 45)     # ciclo completo del scanner
+MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 3_000_000)  # filtra símbolos ilíquidos
+NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
+    "XAU", "XAG", "US30", "US100", "US500", "GER40", "UK100", "JP225",
+    "OIL", "WTI", "BRENT", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
+    "NZDUSD", "USDCAD", "USDCHF", "EURGBP", "EURJPY", "GBPJPY",
+]
+MAX_ACTIVE_POSITIONS = _i("MAX_ACTIVE_POSITIONS", 6)
 
-# ── Entry filters
-CROSS_LOOKBACK       = _int("CROSS_LOOKBACK", 1)
-ADX_MIN              = _int("ADX_MIN", 15)
-ADX_TREND            = _int("ADX_TREND", 25)
-VWAP_SLOPE_MIN_PCT   = _float("VWAP_SLOPE_MIN_PCT", 0.008)
-MACD_REQUIRED        = _bool("MACD_REQUIRED", "true")
-RSI_REQUIRED         = _bool("RSI_REQUIRED", "true")
-VOL_REQUIRED         = _bool("VOL_REQUIRED", "true")
-EMA21_REQUIRED       = _bool("EMA21_REQUIRED", "true")
-HTF_FILTER_ENABLED   = _bool("HTF_FILTER_ENABLED", "true")
-HTF_MIN_ALIGNED      = _int("HTF_MIN_ALIGNED", 1)
-VOL_MIN_MULT         = _float("VOL_MIN_MULT", 1.1)
-MIN_TIER             = _str("MIN_TIER", "STD")
-REQUIRE_TL_BREAK     = _bool("REQUIRE_TL_BREAK", "false")
-SLOPE_FILTER_ENABLED = _bool("SLOPE_FILTER_ENABLED", "true")
+# ── Timeframes ───────────────────────────────────────────────────────
+ENTRY_TF = os.getenv("ENTRY_TF", "3m")       # Unicorn Model — timing de entrada
+BIAS_TF = os.getenv("BIAS_TF", "1H")         # Supertrend — bias macro
+HTF_A_TF = os.getenv("HTF_A_TF", "15m")      # fuente liquidez A del Unicorn Model
+HTF_B_TF = os.getenv("HTF_B_TF", "30m")      # fuente liquidez B
+HTF_C_TF = os.getenv("HTF_C_TF", "1H")       # fuente liquidez C
 
-# ── Scoring
-MIN_SCORE    = _int("MIN_SCORE", 42)
-FUEL_SCORE   = _int("FUEL_SCORE", 70)
-SUP_SCORE    = _int("SUP_SCORE", 85)
-PRED_THR_STD  = _int("PRED_THR_STD", 55)
-PRED_THR_FUEL = _int("PRED_THR_FUEL", 68)
-PRED_THR_SUP  = _int("PRED_THR_SUP", 80)
-COUNTER_TREND_PENALTY = _float("COUNTER_TREND_PENALTY", 12.0)
+# ── Supertrend (BigBeluga custom) ─────────────────────────────────────
+ST_LEN = _i("ST_LEN", 50)
+ST_MULT = _f("ST_MULT", 3.5)
 
-# ── TP / SL / Trail  ← UPDATED VALUES
-SL_ATR_MULT         = _float("SL_ATR_MULT", 1.8)
-BREAKEVEN_ATR_MULT  = _float("BREAKEVEN_ATR_MULT", 1.0)    # era 1.5 → más rápido a BE
-TP1_ATR_MULT        = _float("TP1_ATR_MULT", 2.5)          # era 3.0 → TP1 más cercano
-TP2_ATR_MULT        = _float("TP2_ATR_MULT", 5.0)
-TRAIL_DISTANCE_ATR          = _float("TRAIL_DISTANCE_ATR", 2.0)          # era 2.5
-TRAIL_DISTANCE_ATR_POST_TP1 = _float("TRAIL_DISTANCE_ATR_POST_TP1", 1.0) # NEW — post-TP1 tight
-ATR_TRAIL_MULT      = _float("ATR_TRAIL_MULT", 2.5)         # legacy alias
-CB_ATR_MULT         = _float("CB_ATR_MULT", 4.0)
-CB_BARS             = _int("CB_BARS", 5)
+# ── Unicorn Model ──────────────────────────────────────────────────────
+UNICORN_SWEEP_LB = _i("UNICORN_SWEEP_LB", 30)     # lookback de velas para sweep
+UNICORN_REQUIRE_FVG = _b("UNICORN_REQUIRE_FVG", True)  # Unicorn Mode ON
+UNICORN_RR = _f("UNICORN_RR", 1.5)                # risk:reward del TP
+UNICORN_SL_ATR_BUFFER = _f("UNICORN_SL_ATR_BUFFER", 0.2)  # colchón extra en SL
+DIRECTION = os.getenv("DIRECTION", "BOTH")        # LONG | SHORT | BOTH
 
-# ── Time controls
-MAX_HOLD_MINUTES     = _int("MAX_HOLD_MINUTES", 90)   # era 120 → más agresivo en 3m TF
-TRADE_START_UTC      = _int("TRADE_START_UTC", 7)
-TRADE_END_UTC        = _int("TRADE_END_UTC", 21)
-SCAN_INTERVAL        = _int("SCAN_INTERVAL", 60)
-POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
+# Filtro de tamaño de breaker (en múltiplos de ATR) — descarta breakers
+# demasiado chicos (ruido) o demasiado grandes (movimiento ya agotado)
+BREAKER_MIN_ATR = _f("BREAKER_MIN_ATR", 0.3)
+BREAKER_MAX_ATR = _f("BREAKER_MAX_ATR", 3.0)
 
-# ── Kelly / sizing
-RISK_PCT           = _float("RISK_PCT", 1.5)
-KELLY_WIN_RATE     = _float("KELLY_WIN_RATE", 0.60)
-KELLY_RR           = _float("KELLY_RR", 1.5)
-KELLY_FRACTION     = _float("KELLY_FRACTION", 0.25)
-PRED_KELLY_FRAC    = _float("PRED_KELLY_FRAC", 0.25)
-PRED_KELLY_RR      = _float("PRED_KELLY_RR", 1.8)
+# ── Order Flow / Absorción (confirmación final, post Supertrend+Unicorn) ──
+ENABLE_ORDER_FLOW_FILTER = _b("ENABLE_ORDER_FLOW_FILTER", False)  # off por defecto
+ORDER_FLOW_TRADES_LIMIT = _i("ORDER_FLOW_TRADES_LIMIT", 1000)     # trades recientes a pedir
+ORDER_FLOW_MIN_ABSORPTION_RATIO = _f("ORDER_FLOW_MIN_ABSORPTION_RATIO", 0.55)
+ORDER_FLOW_MIN_VOLUME = _f("ORDER_FLOW_MIN_VOLUME", 0)  # volumen mínimo en la vela sweep (unidades base)
 
-# ── TP prediction
-PRED_TP1_RR        = _float("PRED_TP1_RR", 1.5)
-PRED_TP2_RR        = _float("PRED_TP2_RR", 3.0)
-PRED_SLD_MIN_ATR   = _float("PRED_SLD_MIN_ATR", 1.0)
-PRED_OB_MIN_SAMPLES = _int("PRED_OB_MIN_SAMPLES", 5)
-PRED_FIB_ENABLED   = _bool("PRED_FIB_ENABLED", "true")
+# ── Funding Rate + Open Interest ─────────────────────────────────────────
+ENABLE_FUNDING_OI_FILTER = _b("ENABLE_FUNDING_OI_FILTER", False)
+FUNDING_OI_MODE = os.getenv("FUNDING_OI_MODE", "inform")  # "inform" | "confirm"
+FUNDING_EXTREME_THRESHOLD = _f("FUNDING_EXTREME_THRESHOLD", 0.0005)
+OI_MIN_CHANGE_PCT = _f("OI_MIN_CHANGE_PCT", 1.0)
 
-# ── Optional modules
-BTC_CORR_ENABLED    = _bool("BTC_CORR_ENABLED", "true")
-BTC_CORR_THRESHOLD  = _float("BTC_CORR_THRESHOLD", 0.5)
-BTC_CORR_MAX_SAME   = _int("BTC_CORR_MAX_SAME", 3)
-BTC_CORR_WINDOW_SEC = _int("BTC_CORR_WINDOW_SEC", 1800)
-CORRELATION_WINDOW_SEC = _int("CORRELATION_WINDOW_SEC", 900)
-MAX_SAME_DIRECTION  = _int("MAX_SAME_DIRECTION", 2)
-OI_FILTER_ENABLED   = _bool("OI_FILTER_ENABLED", "true")
-OI_CASCADE_ENABLED  = _bool("OI_CASCADE_ENABLED", "true")
-FR_REGIME_ENABLED   = _bool("FR_REGIME_ENABLED", "false")
-VOL_REGIME_ENABLED  = _bool("VOL_REGIME_ENABLED", "false")
-CANDLE_TURN_ENABLED = _bool("CANDLE_TURN_ENABLED", "false")
-CB_ENABLED          = _bool("CB_ENABLED", "false")
-COMPLEMENT_MODE     = _str("COMPLEMENT_MODE", "DISABLED")
-HARVEST_ENABLED     = _bool("HARVEST_ENABLED", "false")
-HARVEST_FR_THR      = _float("HARVEST_FR_THR", 0.0010)
-FR_EXTREME_THR      = _float("FR_EXTREME_THR", 0.0005)
-RECONCILE_ON_STARTUP = _bool("RECONCILE_ON_STARTUP", "false")
+# ── Regime Filter (Choppiness Index) ────────────────────────────────────
+ENABLE_REGIME_FILTER = _b("ENABLE_REGIME_FILTER", True)
+REGIME_CHOP_LENGTH = _i("REGIME_CHOP_LENGTH", 14)
+REGIME_CHOP_THRESHOLD = _f("REGIME_CHOP_THRESHOLD", 61.8)
 
-# ── Exit rules
-EMA_EXIT_ENABLED       = _bool("EMA_EXIT_ENABLED", "true")
-EMA_EXIT_PERIOD        = _int("EMA_EXIT_PERIOD", 9)
-EMA_EXIT_MIN_HOLD_MIN  = _int("EMA_EXIT_MIN_HOLD_MIN", 30)
-SESSION_START          = _int("SESSION_START", 0)
-SESSION_END            = _int("SESSION_END", 24)
-MOMENTUM_EXIT_ENABLED  = _bool("MOMENTUM_EXIT_ENABLED", "true")
-MOMENTUM_EXIT_OB       = _int("MOMENTUM_EXIT_OB", 70)
-MOMENTUM_EXIT_OS       = _int("MOMENTUM_EXIT_OS", 30)
+# ── Correlation Manager ───────────────────────────────────────────────────
+ENABLE_CORRELATION_FILTER = _b("ENABLE_CORRELATION_FILTER", True)
+CORR_THRESHOLD = _f("CORR_THRESHOLD", 0.75)
+CORR_LOOKBACK = _i("CORR_LOOKBACK", 30)
+MAX_CORRELATED_POSITIONS = _i("MAX_CORRELATED_POSITIONS", 2)
 
-# ── Infrastructure
-PORT       = _int("PORT", 8080)
-WS_ENABLED = _bool("WS_ENABLED", "false")
-STATE_FILE = _str("STATE_FILE", "/tmp/bot_state.json")
-MASTER_URL = _str("MASTER_URL", "")
+# ── Persistencia (Railway Volume) ───────────────────────────────────────
+DATA_DIR = os.getenv("DATA_DIR", "/data")
 
-# ── Telegram
-TELEGRAM_TOKEN = _str("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT  = _str("TELEGRAM_CHAT_ID")
+# ── Setup Memory (aprendizaje adaptativo) ────────────────────────────────
+ENABLE_SETUP_MEMORY_FILTER = _b("ENABLE_SETUP_MEMORY_FILTER", True)
+SETUP_MEMORY_MIN_SAMPLES = _i("SETUP_MEMORY_MIN_SAMPLES", 15)
+SETUP_MEMORY_MIN_WIN_RATE = _f("SETUP_MEMORY_MIN_WIN_RATE", 0.35)
+SETUP_MEMORY_FILE = os.path.join(DATA_DIR, "unicorn_st_setup_memory.json")
 
-# ── EMA9 Rally filter (crossover bot — rally disabled, uses crossover instead)
-EMA9_RALLY_ENABLED   = _bool("EMA9_RALLY_ENABLED",   "false")
-EMA9_NEAR_PCT        = _float("EMA9_NEAR_PCT",        1.0)
-EMA9_VOL_HIGH_MULT   = _float("EMA9_VOL_HIGH_MULT",   1.3)
+# ── Gestión de riesgo ───────────────────────────────────────────────────
+RISK_PCT_PER_TRADE = _f("RISK_PCT_PER_TRADE", 0.5)   # % del balance por operación
+LEVERAGE = _i("LEVERAGE", 10)
+DAILY_MAX_LOSS_PCT = _f("DAILY_MAX_LOSS_PCT", 5.0)   # circuit breaker diario
+MAX_CONCURRENT_RISK_PCT = _f("MAX_CONCURRENT_RISK_PCT", 3.0)  # riesgo total abierto
 
-# ── Short-specific filters
-IBS_PULLBACK_ENABLED  = _bool("IBS_PULLBACK_ENABLED",  "false")
-BB_SHORT_ENABLED      = _bool("BB_SHORT_ENABLED",      "false")
-BB_SHORT_VETO_LONG    = _bool("BB_SHORT_VETO_LONG",    "false")
-EMA9_VWAP_ENABLED     = _bool("EMA9_VWAP_ENABLED",     "false")
-EMA9_VWAP_VETO_LONG   = _bool("EMA9_VWAP_VETO_LONG",   "false")
-EMA9_VWAP_BOOST       = _float("EMA9_VWAP_BOOST",      0.0)
-EMA55_BOOST_ENABLED   = _bool("EMA55_BOOST_ENABLED",   "false")
-RSI15M_FILTER_ENABLED = _bool("RSI15M_FILTER_ENABLED", "false")
-RSI15M_SHORT_MAX      = _float("RSI15M_SHORT_MAX",     70.0)
-RSI15M_REQUIRED       = _bool("RSI15M_REQUIRED",       "false")
+# ── Persistencia adicional (mismo Railway Volume) ───────────────────────
+JOURNAL_FILE = os.path.join(DATA_DIR, "unicorn_st_journal.json")
+STATE_FILE = os.path.join(DATA_DIR, "unicorn_st_state.json")
 
-# ── Scoring
-SUP_SCORE    = _int("SUP_SCORE",   85)
-FUEL_SCORE   = _int("FUEL_SCORE",  70)
-MIN_SCORE    = _int("MIN_SCORE", 42)
-COUNTER_TREND_PENALTY = _float("COUNTER_TREND_PENALTY", 12.0)
-
-# ── Market structure / BTC regime
-MS_ENABLED          = _bool("MS_ENABLED",          "true")
-MS_LEN              = _int("MS_LEN",               10)
-BTC_REGIME_ENABLED  = _bool("BTC_REGIME_ENABLED",  "true")
-BTC_CORR_ENABLED    = _bool("BTC_CORR_ENABLED",    "true")
-BTC_CORR_THRESHOLD  = _float("BTC_CORR_THRESHOLD", 0.5)
-BTC_CORR_MAX_SAME   = _int("BTC_CORR_MAX_SAME",    3)
-MAX_SAME_DIRECTION  = _int("MAX_SAME_DIRECTION",   2)
-CORRELATION_WINDOW_SEC = _int("CORRELATION_WINDOW_SEC", 900)
-BTC_CORR_WINDOW_SEC = _int("BTC_CORR_WINDOW_SEC",  1800)
-
-# ── Misc entry params
-REQUIRE_TL_BREAK    = _bool("REQUIRE_TL_BREAK",    "false")
-LATERAL_ADX_MAX     = _float("LATERAL_ADX_MAX",    25.0)
-MAX_ADAPTIVE_OFFSET = _int("MAX_ADAPTIVE_OFFSET",  6)
-COPY_MIN_SCORE      = _int("COPY_MIN_SCORE", 50)
-COPY_SIZE_MULT      = _float("COPY_SIZE_MULT",      0.4)
-EXCLUSIVE_TOP_N     = _int("EXCLUSIVE_TOP_N",       30)
-COPY_MAX_ADVERSE_PCT = _float("COPY_MAX_ADVERSE_PCT", -0.3)
-HEDGE_LOSS_COUNT    = _int("HEDGE_LOSS_COUNT",      3)
-MASTER_URL          = _str("MASTER_URL",            "")
-WS_ENABLED          = _bool("WS_ENABLED",          "false")
-PORT                = _int("PORT",                  8080)
-
-ADX_LATERAL = _float("ADX_LATERAL", 20.0)
-
-# ── Unicorn Model (multi-symbol scan)
-UNICORN_TOP_N    = _int("UNICORN_TOP_N", 150)   # símbolos para Unicorn scan
-UNICORN_SCAN_SEC = _int("UNICORN_SCAN_SEC", 300) # cada 5 min
-UNICORN_PIVOT_LEN   = _int("UNICORN_PIVOT_LEN", 5)
-UNICORN_SWEEP_LB    = _int("UNICORN_SWEEP_LB", 30)
-UNICORN_REQUIRE_FVG = _bool("UNICORN_REQUIRE_FVG", "true")
-UNICORN_RR          = _float("UNICORN_RR", 2.0)
-
-# ── Cooldown
-TRADE_COOLDOWN_SEC = _int("TRADE_COOLDOWN_SEC", 180)
-
-DIRECTION           = _str("DIRECTION", "BOTH")  # LONG | SHORT | BOTH
+# ── Logging ─────────────────────────────────────────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
