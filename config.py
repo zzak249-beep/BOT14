@@ -106,3 +106,6 @@ STATE_FILE = os.path.join(DATA_DIR, "unicorn_st_state.json")
 
 # ── Logging ─────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# ── Servidor de healthcheck (Railway) ────────────────────────────────────
+PORT = _i("PORT", 8080)
