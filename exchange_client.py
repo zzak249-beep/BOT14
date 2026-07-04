@@ -10,6 +10,15 @@ Implementa lo mínimo necesario para este bot:
 
 Firma HMAC-SHA256 según especificación estándar de BingX Swap V2 API.
 Requiere BINGX_API_KEY / BINGX_API_SECRET como variables de entorno.
+
+NOTA (añadida en revisión): la firma se calcula sobre
+urlencode(sorted(params.items())) — el orden alfabético importa para
+el HASH en sí, pero NO para el orden en que aiohttp serializa params=
+en la petición real. Esto es seguro solo si BingX reordena los
+parámetros recibidos antes de recalcular su propia firma (estándar en
+este esquema, y consistente con cómo lo hace el resto del fleet) — no
+confirmado con tráfico real contra BingX todavía. Si el primer
+POST/GET autenticado falla con error de firma, revisar esto primero.
 """
 import hashlib
 import hmac

@@ -17,6 +17,7 @@ No comparte código ni estado con otros bots (renewed-love / joyful-art).
 import asyncio
 import logging
 import sys
+import time
 
 import config
 from exchange_client import BingXClient
@@ -100,7 +101,8 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
         corr_mgr.register_open(symbol, side, corr)
         log.info("[%s] Posición %s abierta: qty=%.6f entry=%.6f SL=%.6f TP=%.6f",
                   symbol, side, qty, entry, sl, tp)
-        return {"symbol": symbol, "setup_key": setup_key, "risk_pct": risk_pct}
+        return {"symbol": symbol, "setup_key": setup_key, "risk_pct": risk_pct,
+                "opened_at_ms": int(time.time() * 1000)}
 
     log.error("[%s] Falló apertura de posición: %s", symbol, result)
     return None
@@ -129,7 +131,8 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
     for sig in signals:
         opened = await execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles)
         if opened:
-            pos_monitor.register_open(opened["symbol"], opened["setup_key"], opened["risk_pct"])
+            pos_monitor.register_open(opened["symbol"], opened["setup_key"],
+                                      opened["risk_pct"], opened["opened_at_ms"])
 
 
 async def main():
