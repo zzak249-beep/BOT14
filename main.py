@@ -17,7 +17,9 @@ No comparte código ni estado con otros bots (renewed-love / joyful-art).
 import asyncio
 import logging
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
 from exchange_client import BingXClient
@@ -36,6 +38,26 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 BTC_SYMBOL = "BTC-USDT"
+
+
+# FIX: este bot era el único del fleet sin servidor de healthcheck — si
+# Railway espera respuesta HTTP en algún puerto y nunca la recibe, puede
+# marcar el deploy como fallido aunque el proceso siga corriendo bien
+# por dentro, sin relación con ningún error de la API de BingX.
+def _start_health():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *a):
+            pass
+    try:
+        server = HTTPServer(("0.0.0.0", config.PORT), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        log.info("Health server :%d/health", config.PORT)
+    except Exception as e:
+        log.warning("Health server: %s", e)
 
 
 async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles):
@@ -136,6 +158,8 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
 
 
 async def main():
+    _start_health()
+
     if not config.BINGX_API_KEY or not config.BINGX_API_SECRET:
         log.warning("BINGX_API_KEY / BINGX_API_SECRET no configuradas — solo funcionará en DRY_RUN")
 
