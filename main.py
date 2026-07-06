@@ -33,7 +33,7 @@ from order_book_imbalance import confirms_direction as obi_confirms
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-06-signature-fix-demo-mode"
+CODE_VERSION = "2026-07-06-hex-confirmado-recvwindow"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -233,6 +233,15 @@ async def main():
         pos_monitor = PositionMonitor(client, journal, risk_mgr, setup_mem, corr_mgr)
         fast_on = getattr(config, "ENABLE_FAST_SCAN", True)
 
+        # Longitud exacta de las credenciales EN ESTE PROCESO, no lo que se
+        # piense haber pegado en Railway. Comparar este número contra lo que
+        # dio el diagnóstico local (85/82 la última vez que funcionó) — si no
+        # coincide, confirma sin dudas que Railway tiene algo distinto.
+        log.info(
+            "Credenciales cargadas | BINGX_API_KEY: %d caracteres | BINGX_API_SECRET: %d caracteres",
+            len(config.BINGX_API_KEY), len(config.BINGX_API_SECRET),
+        )
+
         log.info(
             "Bot iniciado | CODE_VERSION=%s | DRY_RUN=%s | BINGX_BASE_URL=%s (demo_mode=%s) | ENTRY_TF=%s | BIAS_TF=%s | OB_TF=%s | "
             "regime=%s corr=%s order_flow=%s funding_oi=%s setup_memory=%s "
@@ -245,6 +254,7 @@ async def main():
             getattr(config, "SCAN_ALL_SYMBOLS", True), fast_on,
             getattr(config, "FAST_SCAN_TOP_N", 60), getattr(config, "FAST_SCAN_INTERVAL_SEC", 60),
         )
+
 
         loops = [_slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened)]
         if fast_on:

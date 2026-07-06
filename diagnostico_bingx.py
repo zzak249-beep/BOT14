@@ -1,39 +1,70 @@
 """
 Diagnóstico de credenciales BingX — standalone, sin depender del resto del bot.
 ================================================================================
-Corré esto en TU máquina (no en Railway) para aislar el problema en segundos,
-sin esperar un redeploy. Va a mostrar exactamente qué string se firma y qué
-firma se genera, para que puedas comparar contra lo que BingX espera.
-
-Uso:
-    pip install aiohttp
-    export BINGX_API_KEY="tu_key_real"
-    export BINGX_API_SECRET="tu_secret_real"
-    python3 diagnostico_bingx.py
+CÓMO USAR (sin comandos, sin terminal):
+1. Abrí este archivo con el Bloc de notas (click derecho -> Abrir con -> Bloc de notas).
+2. Reemplazá AQUI_TU_KEY y AQUI_TU_SECRET de las dos líneas de abajo (entre las
+   comillas) por tu Key y Secret reales de BingX.
+3. Guardá el archivo (Ctrl+S) y cerralo.
+4. Hacé doble clic en "correr_diagnostico.bat" (tiene que estar en la misma carpeta).
+5. Se abre una ventana negra con el resultado. Copiá TODO el texto que aparece
+   (click derecho dentro de la ventana -> Seleccionar todo, después Enter o
+   click derecho de nuevo -> Copiar) y pegámelo.
 """
 import asyncio
+import base64
 import hashlib
 import hmac
-import os
 import time
 from urllib.parse import urlencode
 
 import aiohttp
 
-API_KEY = os.getenv("BINGX_API_KEY", "").strip()
-API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+# ── PONÉ TUS CREDENCIALES ACÁ ABAJO, ENTRE LAS COMILLAS ────────────────────
+API_KEY = "AQUI_TU_KEY"
+API_SECRET = "AQUI_TU_SECRET"
+# ────────────────────────────────────────────────────────────────────────
+
+_RAW_KEY = API_KEY
+_RAW_SECRET = API_SECRET
+API_KEY = API_KEY.strip()
+API_SECRET = API_SECRET.strip()
 BASE_URL = "https://open-api.bingx.com"
 
 
-def sign(params: dict, secret: str) -> str:
+def sign_hex(params: dict, secret: str) -> str:
     qs = urlencode(sorted(params.items()))
     return hmac.new(secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def sign_base64(params: dict, secret: str) -> str:
+    qs = urlencode(sorted(params.items()))
+    raw = hmac.new(secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(raw).decode("utf-8")
+
+
+async def try_balance(session, signature, params_without_sig):
+    params = dict(params_without_sig)
+    params["signature"] = signature
+    query_string = urlencode(sorted(params.items()))
+    url = f"{BASE_URL}/openApi/swap/v2/user/balance?{query_string}"
+    headers = {"X-BX-APIKEY": API_KEY}
+    async with session.request("GET", url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        return await resp.json(content_type=None)
 
 
 async def main():
     print("=" * 70)
     print("DIAGNÓSTICO DE CREDENCIALES BINGX")
     print("=" * 70)
+
+    if API_KEY == "AQUI_TU_KEY" or API_SECRET == "AQUI_TU_SECRET":
+        print("\n❌ Todavía no completaste tu Key/Secret en este archivo.")
+        print("   Abrí diagnostico_bingx.py con el Bloc de notas, reemplazá")
+        print("   AQUI_TU_KEY y AQUI_TU_SECRET por tus valores reales, guardá,")
+        print("   y volvé a hacer doble clic en correr_diagnostico.bat.")
+        input("\nApretá Enter para cerrar...")
+        return
 
     # Chequeo NUEVO: desincronización de reloj. BingX usa una ventana
     # (recvWindow) para aceptar el timestamp de la request — si el reloj de
@@ -76,56 +107,50 @@ async def main():
         return
 
     # Detectar espacios/saltos de línea invisibles — causa MUY común
-    raw_key = os.getenv("BINGX_API_KEY", "")
-    raw_secret = os.getenv("BINGX_API_SECRET", "")
-    if raw_key != API_KEY:
-        print(f"⚠️  BINGX_API_KEY tiene espacios/saltos de línea al principio o final "
-              f"(sin limpiar: {len(raw_key)} caracteres, limpio: {len(API_KEY)}). "
-              f"Esto solo podría pasar si Railway guardó la variable con espacios extra.")
-    if raw_secret != API_SECRET:
-        print(f"⚠️  BINGX_API_SECRET tiene espacios/saltos de línea al principio o final "
-              f"(sin limpiar: {len(raw_secret)} caracteres, limpio: {len(API_SECRET)}).")
+    if _RAW_KEY != API_KEY:
+        print("⚠️  Tu API_KEY tiene espacios/saltos de línea al principio o final del "
+              "texto que pegaste entre las comillas.")
+    if _RAW_SECRET != API_SECRET:
+        print("⚠️  Tu API_SECRET tiene espacios/saltos de línea al principio o final del "
+              "texto que pegaste entre las comillas.")
 
     # recvWindow explícito (10s, generoso) -- antes no se mandaba ninguno,
     # dependiendo del default de BingX. Se agrega por las dudas de que el
     # default sea más chico de lo esperado.
-    params = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
-    signature = sign(params, API_SECRET)
-    params["signature"] = signature
-    query_string = urlencode(sorted(params.items()))
-    url = f"{BASE_URL}/openApi/swap/v2/user/balance?{query_string}"
+    base_params = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
 
-    print(f"\nString exacta que se firmó: {urlencode(sorted({k: v for k, v in params.items() if k != 'signature'}.items()))}")
-    print(f"Firma HMAC-SHA256 generada: {signature}")
-    print(f"URL completa enviada:\n  {url}")
+    print("\n" + "=" * 70)
+    print("PROBANDO LAS DOS CODIFICACIONES DE FIRMA POSIBLES")
+    print("=" * 70)
 
-    print("\nEnviando request real a BingX...")
+    sig_hex = sign_hex(base_params, API_SECRET)
+    sig_b64 = sign_base64(base_params, API_SECRET)
+    print(f"\nFirma HEX:    {sig_hex}")
+    print(f"Firma BASE64: {sig_b64}")
+
     async with aiohttp.ClientSession() as session:
-        headers = {"X-BX-APIKEY": API_KEY}
-        async with session.request("GET", url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            data = await resp.json(content_type=None)
+        print("\n--- Probando con HEX (lo que usé hasta ahora) ---")
+        data_hex = await try_balance(session, sig_hex, base_params)
+        print(f"Respuesta: {data_hex}")
 
-    print(f"\nRespuesta de BingX: {data}")
+        print("\n--- Probando con BASE64 ---")
+        data_b64 = await try_balance(session, sig_b64, base_params)
+        print(f"Respuesta: {data_b64}")
 
-    if data.get("code") == 0:
-        print("\n✅ FUNCIONA — las credenciales y la firma están bien. El problema")
-        print("   está en otro lado (Railway no está pasando las variables igual,")
-        print("   o hay una versión vieja del código corriendo ahí).")
-    elif data.get("code") == 100001:
-        print("\n❌ Mismo error de firma acá, en tu máquina, con la misma lógica.")
-        print("   Esto descarta problemas de Railway/deploy — apunta directo a:")
-        print("   1. El BINGX_API_SECRET no es el que corresponde a ese BINGX_API_KEY")
-        print("      (par mezclado, o se regeneró uno de los dos sin actualizar el otro)")
-        print("   2. Hay caracteres invisibles en el secret que no se detectaron arriba")
-        print("   3. La API key fue revocada o expiró")
-        print("   -> Más rápido: andá a BingX, borrá esta key, creá una nueva,")
-        print("      copiala con cuidado (sin seleccionar espacios extra) y probá de nuevo.")
-    elif data.get("code") == 100413:
-        print("\n❌ API key null/no reconocida — la key en sí está mal, no es un tema de firma.")
+    print("\n" + "=" * 70)
+    if data_hex.get("code") == 0:
+        print("✅ HEX FUNCIONA — el problema no era la codificación, era otra cosa.")
+    elif data_b64.get("code") == 0:
+        print("✅✅✅ BASE64 FUNCIONA Y HEX NO — ERA ESTO. Avisame para que actualice")
+        print("   exchange_client.py a usar base64 en vez de hexdigest().")
     else:
-        print(f"\n❓ Error distinto a los esperados (code={data.get('code')}) — "
-              f"leé el mensaje de arriba, puede ser un tema de permisos de la key "
-              f"(¿tiene habilitado Futuros?) o de whitelist de IP.")
+        print("❌ Ninguna de las dos funcionó — la codificación no era la causa,")
+        print("   seguimos con las mismas credenciales/cuenta sin explicación clara.")
+    print("=" * 70)
+
+    input("\nListo. Copiá TODO este texto (click derecho -> Seleccionar todo, "
+          "después click derecho -> Copiar) y pegaselo a Claude. Apretá Enter para cerrar...")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
