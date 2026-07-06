@@ -20,9 +20,12 @@ este esquema, y consistente con cómo lo hace el resto del fleet) — no
 confirmado con tráfico real contra BingX todavía. Si el primer
 POST/GET autenticado falla con error de firma, revisar esto primero.
 """
+import asyncio
 import hashlib
 import hmac
 import logging
+import random
+import re
 import time
 from urllib.parse import urlencode
 
@@ -30,14 +33,68 @@ import aiohttp
 
 log = logging.getLogger("exchange_client")
 
+RATE_LIMIT_CODE = 100410
+RATE_LIMIT_SAFETY_CEILING_S = 600.0  # techo de SEGURIDAD solo por si el mensaje viniera
+                                      # corrupto/con un timestamp absurdo — NO es el caso normal.
+                                      # A diferencia de antes, ya NO reintentamos dentro del mismo
+                                      # request: cada intento adicional durante el "disabled period"
+                                      # parece hacer que BingX EXTIENDA el bloqueo (el log mostraba
+                                      # el tiempo de espera calculado sin bajar hacia 0, ciclo tras
+                                      # ciclo) — reintentar activamente perpetuaba el problema.
+DEFAULT_MIN_REQUEST_INTERVAL_S = 0.2  # ~5 req/s — más conservador que el intento anterior (~8 req/s);
+                                        # si el rate limit se extiende con cada request adicional
+                                        # recibida durante el bloqueo, más vale pecar de lento
+
+
+def _parse_unblock_wait_s(msg):
+    """
+    Extrae el epoch en ms de mensajes tipo:
+    "code:100410:The endpoint trigger frequency limit rule is currently in
+    the disabled period and will be unblocked after 1783232851826"
+    Devuelve segundos a esperar (>=0), o un default conservador si no
+    puede parsear el mensaje (BingX podría cambiar el formato del texto).
+    """
+    match = re.search(r"unblocked after (\d+)", msg or "")
+    if not match:
+        return 3.0
+    unblock_ms = int(match.group(1))
+    wait_s = (unblock_ms / 1000) - time.time()
+    return max(0.0, wait_s)
+
 
 class BingXClient:
-    def __init__(self, api_key, api_secret, base_url, dry_run=True):
+    def __init__(self, api_key, api_secret, base_url, dry_run=True,
+                 min_request_interval=DEFAULT_MIN_REQUEST_INTERVAL_S):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
         self._session = None
+        # Estado COMPARTIDO entre todas las corutinas que usan esta misma
+        # instancia (todo scan_universe corre sobre un único BingXClient).
+        # Antes cada corutina calculaba su propia espera de forma aislada al
+        # recibir un 100410 -> con SCAN_CONCURRENCY en paralelo, todas volvían
+        # a pegarle casi al mismo tiempo y se re-bloqueaban en cadena. Ahora
+        # una sola marca de tiempo gobierna a todas.
+        self._rate_limit_until = 0.0     # epoch seconds
+        self._last_request_at = 0.0
+        self._pacing_lock = asyncio.Lock()
+        self._min_request_interval = min_request_interval
+
+    async def _wait_for_slot(self):
+        """Espera compartida antes de CUALQUIER request: respeta el cooldown
+        activo (si BingX ya nos rate-limitó) y un espaciado mínimo entre
+        requests consecutivas, para no volver a disparar una ráfaga."""
+        async with self._pacing_lock:
+            now = time.time()
+            wait_cooldown = max(0.0, self._rate_limit_until - now)
+            if wait_cooldown > 0:
+                wait_cooldown += random.uniform(0, 1.0)  # jitter: no todas despiertan juntas
+            wait_pacing = max(0.0, self._last_request_at + self._min_request_interval - now)
+            wait_s = max(wait_cooldown, wait_pacing)
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            self._last_request_at = time.time()
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession()
@@ -54,6 +111,7 @@ class BingXClient:
         ).hexdigest()
 
     async def _request(self, method, path, params=None, signed=False):
+        await self._wait_for_slot()
         params = dict(params or {})
         if signed:
             params["timestamp"] = int(time.time() * 1000)
@@ -63,7 +121,21 @@ class BingXClient:
         try:
             async with self._session.request(method, url, params=params, headers=headers, timeout=15) as resp:
                 data = await resp.json(content_type=None)
-                if data.get("code") not in (0, None):
+                code = data.get("code")
+                if code == RATE_LIMIT_CODE:
+                    wait_s = min(_parse_unblock_wait_s(data.get("msg", "")), RATE_LIMIT_SAFETY_CEILING_S)
+                    # Cooldown COMPARTIDO, sin reintento: cualquier otra corutina (para
+                    # este u otro endpoint) va a esperar este "hasta cuándo" en su
+                    # próximo _wait_for_slot ANTES de disparar su request. No reintentamos
+                    # aquí mismo porque cada intento adicional durante el "disabled period"
+                    # parece extender el bloqueo en vez de solo rechazarlo (ver nota arriba).
+                    self._rate_limit_until = max(self._rate_limit_until, time.time() + wait_s)
+                    log.warning(
+                        "Rate limit BingX (100410) en [%s %s] — cooldown compartido ~%.1fs, "
+                        "se abandona este request (sin reintentar)",
+                        method, path, wait_s,
+                    )
+                elif code not in (0, None):
                     log.warning("BingX API error [%s %s]: %s", method, path, data)
                 return data
         except Exception as e:
@@ -188,6 +260,32 @@ class BingXClient:
                 continue
         trades.sort(key=lambda x: x["time"])
         return trades
+
+    async def get_order_book(self, symbol, limit=20):
+        """
+        Libro de órdenes público (bids/asks) para Order Book Imbalance
+        (order_book_imbalance.py). Devuelve {"bids": [[price, qty], ...],
+        "asks": [[price, qty], ...]} o {} si falla.
+
+        NOTA: el path exacto de este endpoint NO se confirmó contra tráfico
+        real de BingX — se infirió de wrappers de terceros (ej. clientes PHP/
+        C# no oficiales) que exponen un método `getDepth(symbol, limit)`,
+        pero no de la documentación oficial verificada en vivo. Mismo criterio
+        que get_recent_trades: revisar contra la documentación vigente antes
+        de operar en real, y no sorprenderse si el nombre de campo real
+        difiere (bids/asks vs a/b, strings vs floats, etc. — ya se maneja
+        defensivamente abajo, pero solo hasta donde se pudo anticipar).
+        """
+        params = {"symbol": symbol, "limit": limit}
+        data = await self._request("GET", "/openApi/swap/v2/quote/depth", params, signed=False)
+        raw = data.get("data", {}) if isinstance(data, dict) else {}
+        try:
+            bids = [[float(p), float(q)] for p, q in raw.get("bids", [])]
+            asks = [[float(p), float(q)] for p, q in raw.get("asks", [])]
+            return {"bids": bids, "asks": asks}
+        except (KeyError, ValueError, TypeError):
+            log.warning("No se pudo parsear order book de %s: %s", symbol, raw)
+            return {}
 
     async def get_funding_rate(self, symbol):
         """Funding rate actual del símbolo. Devuelve float (ej. 0.0001 = 0.01%)."""

@@ -29,30 +29,56 @@ BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
 # ── Scanner ────────────────────────────────────────────────────────────
-# FIX: 20 en paralelo disparaba [100410] "trigger frequency limit" en
-# quote/klines de forma consistente en producción — no es un problema de
-# volumen total (eso lo redujo el dedup de scanner.py), es de ráfaga: 20
-# peticiones casi simultáneas por símbolo × N símbolos en el semáforo a
-# la vez. Bajado a 5 como punto de partida más conservador — sin datos
-# reales del límite exacto de BingX para este endpoint, esto sigue siendo
-# una suposición razonada, ajustar hacia arriba solo tras ver un ciclo
-# limpio sin ningún 100410.
-SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 5)       # requests simultáneas
-SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 45)     # ciclo completo del scanner
-MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 3_000_000)  # filtra símbolos ilíquidos
+SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 5)        # bajado de 8: el rate limit 100410 seguía en
+                                                     # loop porque cada reintento durante el bloqueo
+                                                     # parece extenderlo — ver exchange_client.py.
+                                                     # Menos concurrencia = ráfaga inicial más chica
+                                                     # antes de que el cooldown compartido se conozca.
+SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 420)    # 45s (default viejo) era irreal con
+                                                     # SCAN_ALL_SYMBOLS=True: ~694 símbolos x 5
+                                                     # klines c/u ≈ 3470 requests/ciclo, y con el
+                                                     # espaciado de exchange_client.py (~8 req/s)
+                                                     # un ciclo completo tarda ~7 min de por sí
+MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 3_000_000)  # filtra símbolos ilíquidos (solo si SCAN_ALL_SYMBOLS=False)
+SCAN_ALL_SYMBOLS = _b("SCAN_ALL_SYMBOLS", True)  # True = ignora MIN_24H_VOLUME_USDT, escanea TODO BingX (menos no-cripto)
 NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
     "XAU", "XAG", "US30", "US100", "US500", "GER40", "UK100", "JP225",
     "OIL", "WTI", "BRENT", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
     "NZDUSD", "USDCAD", "USDCHF", "EURGBP", "EURJPY", "GBPJPY",
+    # Acciones/ETFs tokenizados (BingX "TradFi" — NO son cripto, confirmado
+    # tras ver NCSKMSFT2USD y NCSKQQQ2USD colarse con SCAN_ALL_SYMBOLS=True).
+    # "NCSK" es el prefijo del proveedor institucional; el resto son tickers
+    # directos o con sufijo de tokenización (ON=Ondo, X=xStocks) que BingX
+    # también lista. Lista best-effort, no exhaustiva — BingX sigue agregando
+    # acciones tokenizadas, revisar periódicamente igual que con forex/índices.
+    "NCSK", "NCCO", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
+    "PLTR", "HOOD", "MSTR", "CRCL", "QQQ", "SPY",
 ]
+REQUIRE_USDT_QUOTE = _b("REQUIRE_USDT_QUOTE", True)  # excluye pares que no cotizan en USDT
+                                                       # (ej. KAITO-USDC) — todo el risk_manager
+                                                       # asume balance y PnL en USDT; mezclar
+                                                       # otras monedas de cotización sin verificar
+                                                       # el margen real es un riesgo aparte, no
+                                                       # solo un tema de "no es cripto"
+
+# ── Loop rápido (símbolos de mayor volumen, más frecuente) ───────────────
+# Corre EN PARALELO al barrido completo (lento), sobre el mismo BingXClient
+# -> comparte el pacing/cooldown de rate limit, no suma presión extra "gratis".
+# Un asyncio.Lock protege la sección de apertura de posición para que los dos
+# loops no abran más posiciones que MAX_ACTIVE_POSITIONS por una condición de
+# carrera (ver main.py).
+ENABLE_FAST_SCAN = _b("ENABLE_FAST_SCAN", True)
+FAST_SCAN_TOP_N = _i("FAST_SCAN_TOP_N", 60)
+FAST_SCAN_INTERVAL_SEC = _i("FAST_SCAN_INTERVAL_SEC", 60)
 MAX_ACTIVE_POSITIONS = _i("MAX_ACTIVE_POSITIONS", 6)
 
 # ── Timeframes ───────────────────────────────────────────────────────
 ENTRY_TF = os.getenv("ENTRY_TF", "3m")       # Unicorn Model — timing de entrada
-BIAS_TF = os.getenv("BIAS_TF", "1H")         # Supertrend — bias macro
+BIAS_TF = os.getenv("BIAS_TF", "1h")         # Supertrend — bias macro (BingX exige minúscula: 1h, no 1H)
 HTF_A_TF = os.getenv("HTF_A_TF", "15m")      # fuente liquidez A del Unicorn Model
 HTF_B_TF = os.getenv("HTF_B_TF", "30m")      # fuente liquidez B
-HTF_C_TF = os.getenv("HTF_C_TF", "1H")       # fuente liquidez C
+HTF_C_TF = os.getenv("HTF_C_TF", "1h")       # fuente liquidez C (BingX exige minúscula: 1h, no 1H)
+OB_TF = os.getenv("OB_TF", "15m")            # Order Block Engine (BigBeluga) — su propio timeframe
 
 # ── Supertrend (BigBeluga custom) ─────────────────────────────────────
 ST_LEN = _i("ST_LEN", 50)
@@ -69,6 +95,35 @@ DIRECTION = os.getenv("DIRECTION", "BOTH")        # LONG | SHORT | BOTH
 # demasiado chicos (ruido) o demasiado grandes (movimiento ya agotado)
 BREAKER_MIN_ATR = _f("BREAKER_MIN_ATR", 0.3)
 BREAKER_MAX_ATR = _f("BREAKER_MAX_ATR", 3.0)
+
+# ── Order Block Engine (BigBeluga) — segundo motor de entrada, en paralelo ─
+# al Unicorn Model: si Unicorn no confirma, se intenta este. Usa el MISMO
+# ST_LEN/ST_MULT de arriba para su propia tendencia interna (así ambos
+# motores están de acuerdo en qué es "tendencia" si corrieran sobre las
+# mismas velas). Solo entra si además coincide con el Supertrend de BIAS_TF.
+ENABLE_OB_ENGINE = _b("ENABLE_OB_ENGINE", True)
+OB_PIVOT_LEN = _i("OB_PIVOT_LEN", 7)              # barras a cada lado para confirmar un pivote
+OB_MIN_BUY_PCT = _f("OB_MIN_BUY_PCT", 50.0)       # % mínimo de volumen comprador para aceptar retest LONG
+OB_MIN_SELL_PCT = _f("OB_MIN_SELL_PCT", 50.0)     # % mínimo de volumen vendedor para aceptar retest SHORT
+OB_DELETE_ON_BREAK = _b("OB_DELETE_ON_BREAK", True)  # invalida el Order Block si el precio lo rompe del todo
+OB_RR = _f("OB_RR", 1.5)                          # risk:reward del TP en señales del Order Block Engine
+OB_SL_ATR_BUFFER = _f("OB_SL_ATR_BUFFER", 0.2)    # colchón ATR extra en el SL
+
+# ── CVD Filter (Cumulative Volume Delta, sin llamada extra a la API) ─────
+# Inspirado en tu Confluence Gate de TradingView. Reusa candles_entry
+# (ENTRY_TF) como timeframe fino para aproximar volumen intrabar — no pide
+# velas 1m aparte. Off por defecto hasta validar en DRY_RUN, mismo criterio
+# que Order Flow / Funding-OI.
+ENABLE_CVD_FILTER = _b("ENABLE_CVD_FILTER", False)
+CVD_LOOKBACK = _i("CVD_LOOKBACK", 20)              # velas finas hacia atrás (mismo default que cvd_len en Pine)
+
+# ── Order Book Imbalance (OBI) — confirmación final, libro de órdenes en vivo ──
+# Distinto de todo lo demás: no mira velas ni trades ejecutados, mira lo que
+# está PARADO en el libro ahora mismo. Off por defecto hasta validar contra
+# BingX real — mismo criterio que Order Flow/Funding-OI.
+ENABLE_OBI_FILTER = _b("ENABLE_OBI_FILTER", False)
+OBI_LEVELS = _i("OBI_LEVELS", 20)                  # niveles de profundidad a considerar
+OBI_THRESHOLD = _f("OBI_THRESHOLD", 0.15)          # desequilibrio mínimo (-1 a 1) para confirmar
 
 # ── Order Flow / Absorción (confirmación final, post Supertrend+Unicorn) ──
 ENABLE_ORDER_FLOW_FILTER = _b("ENABLE_ORDER_FLOW_FILTER", False)  # off por defecto
@@ -114,6 +169,3 @@ STATE_FILE = os.path.join(DATA_DIR, "unicorn_st_state.json")
 
 # ── Logging ─────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-
-# ── Servidor de healthcheck (Railway) ────────────────────────────────────
-PORT = _i("PORT", 8080)

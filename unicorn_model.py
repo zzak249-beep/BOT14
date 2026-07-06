@@ -148,7 +148,7 @@ def get_signal(candles_entry, candles_1h, config, candles_15m=None, candles_30m=
         levels += _get_htf_levels(candles_15m, "15m")
     if candles_30m and len(candles_30m) >= 3:
         levels += _get_htf_levels(candles_30m, "30m")
-    levels += _get_htf_levels(candles_1h, "1H")
+    levels += _get_htf_levels(candles_1h, "1h")
     if not levels:
         return result
 
@@ -206,7 +206,7 @@ def get_signal(candles_entry, candles_1h, config, candles_15m=None, candles_30m=
             "entry_price": entry, "sl_price": sl, "tp_price": tp,
             "swept_level": level["price"], "breaker_top": b_top, "breaker_bottom": b_bot,
             "fvg_top": fvg_top, "fvg_bottom": fvg_bot, "has_fvg": has_fvg,
-            "level_type": level.get("type", ""), "htf": level.get("htf", "1H"),
+            "level_type": level.get("type", ""), "htf": level.get("htf", "1h"),
             "atr": atr, "risk": risk, "sweep_candle_time": sweep_candle_time,
         }
 
