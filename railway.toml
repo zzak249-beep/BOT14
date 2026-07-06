@@ -2,8 +2,12 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python main.py"
-healthcheckPath = "/health"
-healthcheckTimeout = 60
+startCommand = "python3 main.py"
 restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+restartPolicyMaxRetries = 10
+
+# Sin healthcheckPath a propósito: este bot es un worker puro de asyncio
+# (dos loops de scan en background), no expone ningún servidor HTTP. El
+# railway.toml que traía este repo antes (BOT14) tenía healthcheckPath=/health
+# con timeout=60s -> Railway esperaba una respuesta que este código nunca
+# iba a dar, y mataba el deploy con "Healthcheck failed" cada vez.

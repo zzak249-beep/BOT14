@@ -11,14 +11,18 @@ Implementa lo mínimo necesario para este bot:
 Firma HMAC-SHA256 según especificación estándar de BingX Swap V2 API.
 Requiere BINGX_API_KEY / BINGX_API_SECRET como variables de entorno.
 
-NOTA (añadida en revisión): la firma se calcula sobre
-urlencode(sorted(params.items())) — el orden alfabético importa para
-el HASH en sí, pero NO para el orden en que aiohttp serializa params=
-en la petición real. Esto es seguro solo si BingX reordena los
-parámetros recibidos antes de recalcular su propia firma (estándar en
-este esquema, y consistente con cómo lo hace el resto del fleet) — no
-confirmado con tráfico real contra BingX todavía. Si el primer
-POST/GET autenticado falla con error de firma, revisar esto primero.
+RESUELTO (confirmado en producción, no solo en teoría): la advertencia que
+tenía esta nota — que aiohttp podía serializar params= en un orden distinto
+al usado para firmar — SÍ era el problema real: el primer POST de apertura
+de posición en real falló con 100001 "Signature verification failed". La
+causa exacta: `_request` armaba el dict de params y dejaba que aiohttp lo
+serializara en orden de INSERCIÓN, mientras `_sign` calculaba el hash sobre
+el mismo dict en orden ALFABÉTICO — nunca iban a coincidir salvo por
+casualidad. Fix: `_request` ahora construye la URL completa a mano con
+`urlencode(sorted(params.items()))`, la MISMA función usada para firmar,
+así la query string que se firma y la que se manda son byte por byte
+idénticas. Verificado parseando la URL resultante con yarl (el mismo parser
+que usa aiohttp por debajo) para confirmar que no la reordena de nuevo.
 """
 import asyncio
 import hashlib
@@ -65,8 +69,12 @@ def _parse_unblock_wait_s(msg):
 class BingXClient:
     def __init__(self, api_key, api_secret, base_url, dry_run=True,
                  min_request_interval=DEFAULT_MIN_REQUEST_INTERVAL_S):
-        self.api_key = api_key
-        self.api_secret = api_secret
+        # .strip() por si alguien instancia el cliente directamente sin pasar
+        # por config.py (que ya limpia) — un espacio/salto de línea invisible
+        # en la key o el secret produce el mismo síntoma que una firma mal
+        # calculada: "Signature verification failed".
+        self.api_key = (api_key or "").strip()
+        self.api_secret = (api_secret or "").strip()
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
         self._session = None
@@ -117,9 +125,22 @@ class BingXClient:
             params["timestamp"] = int(time.time() * 1000)
             params["signature"] = self._sign(params)
         headers = {"X-BX-APIKEY": self.api_key} if signed else {}
+
+        # CRÍTICO: la query string real tiene que ser BYTE POR BYTE la misma
+        # que se usó para calcular la firma (mismo orden alfabético). Si se
+        # deja que aiohttp serialice un dict vía params=, lo hace en orden de
+        # INSERCIÓN, no alfabético — casi nunca coinciden, y BingX rechaza la
+        # firma con 100001 "Signature verification failed" (confirmado en
+        # producción: el primer POST real de apertura de posición falló
+        # exactamente por esto). Se construye la URL completa a mano en vez
+        # de confiar en el parámetro params= de aiohttp.
+        query_string = urlencode(sorted(params.items())) if params else ""
         url = f"{self.base_url}{path}"
+        if query_string:
+            url = f"{url}?{query_string}"
+
         try:
-            async with self._session.request(method, url, params=params, headers=headers, timeout=15) as resp:
+            async with self._session.request(method, url, headers=headers, timeout=15) as resp:
                 data = await resp.json(content_type=None)
                 code = data.get("code")
                 if code == RATE_LIMIT_CODE:

@@ -30,6 +30,11 @@ from position_monitor import PositionMonitor
 from scanner import get_symbol_universe, get_top_n_symbols, scan_universe
 from order_book_imbalance import confirms_direction as obi_confirms
 
+# Fingerprint de versión — subilo cada vez que cambies algo importante.
+# Sirve para confirmar en el log de arranque que un redeploy realmente
+# trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
+CODE_VERSION = "2026-07-06-deployed-to-BOT14-renewed-love"
+
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -40,7 +45,8 @@ log = logging.getLogger("main")
 BTC_SYMBOL = "BTC-USDT"
 
 
-async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles, exec_lock):
+async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles,
+                          exec_lock, recently_opened):
     symbol = sig["symbol"]
     side = sig["signal"]
     entry = sig["entry_price"]
@@ -51,6 +57,16 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
     # Todo lo de acá abajo (chequeo de riesgo -> apertura -> registro) queda
     # serializado entre el loop rápido y el lento — ver docstring del módulo.
     async with exec_lock:
+        now_ms = int(time.time() * 1000)
+        cooldown_ms = getattr(config, "DEDUP_COOLDOWN_SEC", 300) * 1000
+        last_opened = recently_opened.get(symbol)
+        if last_opened is not None and (now_ms - last_opened) < cooldown_ms:
+            log.info("[%s] Señal descartada por dedup (ya se abrió hace %.0fs, cooldown=%ss)",
+                      symbol, (now_ms - last_opened) / 1000, cooldown_ms // 1000)
+            journal.record({"symbol": symbol, "event": "signal_rejected",
+                             "reason": "dedup_cooldown", "signal": sig})
+            return None
+
         open_positions = await client.get_open_positions()
         if any(p["symbol"] == symbol for p in open_positions):
             log.info("[%s] Ya hay posición abierta, se omite señal", symbol)
@@ -123,6 +139,7 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
         if result.get("code") == 0:
             risk_mgr.register_open_risk(risk_pct)
             corr_mgr.register_open(symbol, side, corr)
+            recently_opened[symbol] = now_ms
             log.info("[%s] Posición %s abierta: qty=%.6f entry=%.6f SL=%.6f TP=%.6f",
                       symbol, side, qty, entry, sl, tp)
             return {"symbol": symbol, "setup_key": setup_key, "risk_pct": risk_pct,
@@ -132,13 +149,15 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
         return None
 
 
-async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, symbols, exec_lock, tag="slow"):
+async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, symbols, exec_lock,
+                     recently_opened, tag="slow"):
     balance = await client.get_balance_usdt()
     if balance <= 0:
         log.warning("[%s] Balance no disponible o cero, se omite ciclo", tag)
         return
 
-    await pos_monitor.check_closures(balance)
+    async with exec_lock:
+        await pos_monitor.check_closures(balance)
 
     if risk_mgr.daily_loss_breached(balance):
         log.warning("[%s] Circuit breaker diario activo — no se buscan nuevas señales", tag)
@@ -154,13 +173,14 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
     signals = await scan_universe(client, symbols, config)
     for sig in signals:
         opened = await execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr,
-                                       sig, balance, btc_candles, exec_lock)
+                                       sig, balance, btc_candles, exec_lock, recently_opened)
         if opened:
-            pos_monitor.register_open(opened["symbol"], opened["setup_key"],
-                                      opened["risk_pct"], opened["opened_at_ms"])
+            async with exec_lock:
+                pos_monitor.register_open(opened["symbol"], opened["setup_key"],
+                                          opened["risk_pct"], opened["opened_at_ms"])
 
 
-async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock):
+async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened):
     symbols = await get_symbol_universe(client, config)
     last_refresh = asyncio.get_event_loop().time()
 
@@ -172,14 +192,14 @@ async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor
                 last_refresh = now
 
             await run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
-                             symbols, exec_lock, tag="slow")
+                             symbols, exec_lock, recently_opened, tag="slow")
         except Exception as e:
             log.exception("[slow] Error en ciclo: %s", e)
 
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
 
-async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock):
+async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened):
     top_n = getattr(config, "FAST_SCAN_TOP_N", 60)
     interval = getattr(config, "FAST_SCAN_INTERVAL_SEC", 60)
 
@@ -187,7 +207,7 @@ async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor
         try:
             symbols = await get_top_n_symbols(client, config, top_n)
             await run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
-                             symbols, exec_lock, tag="fast")
+                             symbols, exec_lock, recently_opened, tag="fast")
         except Exception as e:
             log.exception("[fast] Error en ciclo: %s", e)
 
@@ -203,6 +223,7 @@ async def main():
     setup_mem = SetupMemory(config.SETUP_MEMORY_FILE)
     corr_mgr = CorrelationManager(config)
     exec_lock = asyncio.Lock()
+    recently_opened = {}  # symbol -> timestamp_ms, dedup entre loop rápido y lento
 
     async with BingXClient(
         config.BINGX_API_KEY, config.BINGX_API_SECRET,
@@ -213,10 +234,11 @@ async def main():
         fast_on = getattr(config, "ENABLE_FAST_SCAN", True)
 
         log.info(
-            "Bot iniciado | DRY_RUN=%s | ENTRY_TF=%s | BIAS_TF=%s | OB_TF=%s | "
+            "Bot iniciado | CODE_VERSION=%s | DRY_RUN=%s | BINGX_BASE_URL=%s (demo_mode=%s) | ENTRY_TF=%s | BIAS_TF=%s | OB_TF=%s | "
             "regime=%s corr=%s order_flow=%s funding_oi=%s setup_memory=%s "
             "ob_engine=%s scan_all_symbols=%s | fast_scan=%s top_n=%s interval=%ss",
-            config.DRY_RUN, config.ENTRY_TF, config.BIAS_TF, getattr(config, "OB_TF", "15m"),
+            CODE_VERSION, config.DRY_RUN, config.BINGX_BASE_URL, getattr(config, "BINGX_DEMO_MODE", False),
+            config.ENTRY_TF, config.BIAS_TF, getattr(config, "OB_TF", "15m"),
             config.ENABLE_REGIME_FILTER, config.ENABLE_CORRELATION_FILTER,
             config.ENABLE_ORDER_FLOW_FILTER, config.ENABLE_FUNDING_OI_FILTER,
             config.ENABLE_SETUP_MEMORY_FILTER, getattr(config, "ENABLE_OB_ENGINE", True),
@@ -224,9 +246,9 @@ async def main():
             getattr(config, "FAST_SCAN_TOP_N", 60), getattr(config, "FAST_SCAN_INTERVAL_SEC", 60),
         )
 
-        loops = [_slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock)]
+        loops = [_slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened)]
         if fast_on:
-            loops.append(_fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock))
+            loops.append(_fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened))
 
         await asyncio.gather(*loops)
 

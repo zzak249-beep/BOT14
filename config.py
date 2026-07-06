@@ -23,9 +23,21 @@ def _b(name, default):
 
 
 # ── Credenciales BingX ────────────────────────────────────────────────
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
-BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
+# .strip() es a propósito: un espacio o salto de línea invisible al pegar
+# la variable en Railway hace que la firma HMAC nunca coincida, con el
+# mismo síntoma exacto que un secret genuinamente incorrecto ("Signature
+# verification failed") — y es mucho más común de lo que parece.
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+BINGX_DEMO_MODE = _b("BINGX_DEMO_MODE", False)  # True = usa el dominio Demo/VST de BingX
+                                                  # (open-api-vst.bingx.com) en vez del real.
+                                                  # Si tu API key se generó estando en modo
+                                                  # "Demo Trading" (VST) de BingX, es probable
+                                                  # que NO sea válida contra el dominio real —
+                                                  # mismo síntoma que un secret incorrecto
+                                                  # (100001 Signature verification failed).
+_DEFAULT_BASE_URL = "https://open-api-vst.bingx.com" if BINGX_DEMO_MODE else "https://open-api.bingx.com"
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", _DEFAULT_BASE_URL)
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
 # ── Scanner ────────────────────────────────────────────────────────────
@@ -51,7 +63,11 @@ NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
     # directos o con sufijo de tokenización (ON=Ondo, X=xStocks) que BingX
     # también lista. Lista best-effort, no exhaustiva — BingX sigue agregando
     # acciones tokenizadas, revisar periódicamente igual que con forex/índices.
-    "NCSK", "NCCO", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
+    # "NCS" y "NCC" cubren toda la familia de acciones/ETFs/índices tokenizados
+    # de este proveedor institucional (ya vimos NCSK-MSFT, NCSI-NASDAQ, NCCO-GOLD,
+    # NCSK-QQQ, NCSK-SPCX...) — prefijo de 3 letras en vez de perseguir cada
+    # variante nueva una por una.
+    "NCS", "NCC", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
     "PLTR", "HOOD", "MSTR", "CRCL", "QQQ", "SPY",
 ]
 REQUIRE_USDT_QUOTE = _b("REQUIRE_USDT_QUOTE", True)  # excluye pares que no cotizan en USDT
@@ -124,6 +140,14 @@ CVD_LOOKBACK = _i("CVD_LOOKBACK", 20)              # velas finas hacia atrás (m
 ENABLE_OBI_FILTER = _b("ENABLE_OBI_FILTER", False)
 OBI_LEVELS = _i("OBI_LEVELS", 20)                  # niveles de profundidad a considerar
 OBI_THRESHOLD = _f("OBI_THRESHOLD", 0.15)          # desequilibrio mínimo (-1 a 1) para confirmar
+
+# ── Deduplicación de señales ──────────────────────────────────────────────
+# El loop rápido y el lento pueden evaluar el mismo símbolo en ventanas
+# superpuestas y encontrar la MISMA señal (mismas velas, mismo resultado).
+# El chequeo de "ya hay posición abierta" no alcanza para evitar esto en
+# DRY_RUN (las posiciones simuladas nunca aparecen en BingX real) — este
+# cooldown lo cubre en los dos modos, independiente de si hay posición real.
+DEDUP_COOLDOWN_SEC = _i("DEDUP_COOLDOWN_SEC", 300)
 
 # ── Order Flow / Absorción (confirmación final, post Supertrend+Unicorn) ──
 ENABLE_ORDER_FLOW_FILTER = _b("ENABLE_ORDER_FLOW_FILTER", False)  # off por defecto

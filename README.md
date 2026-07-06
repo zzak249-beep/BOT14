@@ -222,6 +222,12 @@ nuevos), todos ejecutables sin red:
   umbral, y un end-to-end dentro de `execute_signal` real (libro a favor abre,
   libro en contra no)
 
+**Ya validado en producción (no solo en teoría):**
+- **Firma HMAC-SHA256**: el primer POST real de apertura de posición falló
+  con "Signature verification failed" — causa encontrada y arreglada
+  (`_request` ahora firma y envía la MISMA query string, ver
+  `exchange_client.py`). Confirmado con la URL real parseada por yarl.
+
 **Lo que NO fue validado** (requiere acceso a BingX real):
 1. Nombres exactos de los endpoints en `exchange_client.py` — el de
    `get_order_book()` es el menos confirmado de todos, se infirió de
