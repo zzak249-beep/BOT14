@@ -123,9 +123,8 @@ class BingXClient:
         params = dict(params or {})
         if signed:
             params["timestamp"] = int(time.time() * 1000)
-            params["recvWindow"] = 10000  # igual que el diagnóstico que confirmó funcionar
             params["signature"] = self._sign(params)
-        headers = {"X-BX-APIKEY": self.api_key}
+        headers = {"X-BX-APIKEY": self.api_key} if signed else {}
 
         # CRÍTICO: la query string real tiene que ser BYTE POR BYTE la misma
         # que se usó para calcular la firma (mismo orden alfabético). Si se
