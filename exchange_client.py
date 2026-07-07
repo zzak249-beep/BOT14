@@ -123,8 +123,9 @@ class BingXClient:
         params = dict(params or {})
         if signed:
             params["timestamp"] = int(time.time() * 1000)
+            params["recvWindow"] = 10000  # igual que el diagnóstico que confirmó funcionar
             params["signature"] = self._sign(params)
-        headers = {"X-BX-APIKEY": self.api_key} if signed else {}
+        headers = {"X-BX-APIKEY": self.api_key}
 
         # CRÍTICO: la query string real tiene que ser BYTE POR BYTE la misma
         # que se usó para calcular la firma (mismo orden alfabético). Si se
@@ -218,13 +219,22 @@ class BingXClient:
         return ok
 
     async def open_position(self, symbol, side, quantity, sl_price=None, tp_price=None):
-        """side: 'LONG' o 'SHORT'."""
+        """
+        side: 'LONG' o 'SHORT'.
+        Devuelve el dict de la orden de mercado, con dos claves agregadas:
+        "sl_placed" y "tp_placed" (bool) — antes esto no se exponía, y si
+        _place_stop fallaba, la posición quedaba registrada como "abierta
+        con éxito" igual, sin que nadie se enterara de que el SL/TP nunca
+        llegó a existir en BingX (confirmado en real: 4 de 6 posiciones
+        abiertas sin ningún SL puesto, dos de ellas con pérdidas grandes
+        sin freno).
+        """
         if self.dry_run:
             log.info(
                 "[DRY_RUN] open_position %s %s qty=%s SL=%s TP=%s",
                 symbol, side, quantity, sl_price, tp_price,
             )
-            return {"code": 0, "dry_run": True}
+            return {"code": 0, "dry_run": True, "sl_placed": True, "tp_placed": True}
 
         order_side = "BUY" if side == "LONG" else "SELL"
         params = {
@@ -236,13 +246,30 @@ class BingXClient:
             log.error("Error abriendo posición %s %s: %s", symbol, side, data)
             return data
 
+        sl_placed = True
+        tp_placed = True
+
         if sl_price:
-            await self._place_stop(symbol, side, "STOP_MARKET", sl_price, quantity)
+            sl_result = await self._place_stop(symbol, side, "STOP_MARKET", sl_price, quantity)
+            sl_placed = sl_result.get("code") == 0
+            if not sl_placed:
+                log.error(
+                    "🚨 CRÍTICO: posición %s %s quedó ABIERTA SIN STOP LOSS — "
+                    "%s no se pudo colocar. Revisar y proteger manualmente ya mismo.",
+                    symbol, side, sl_price,
+                )
+
         if tp_price:
-            await self._place_stop(symbol, side, "TAKE_PROFIT_MARKET", tp_price, quantity)
+            tp_result = await self._place_stop(symbol, side, "TAKE_PROFIT_MARKET", tp_price, quantity)
+            tp_placed = tp_result.get("code") == 0
+            if not tp_placed:
+                log.warning("[%s] TP no se pudo colocar (%s) — la posición sigue con SL, no es crítico", symbol, tp_price)
+
+        data["sl_placed"] = sl_placed
+        data["tp_placed"] = tp_placed
         return data
 
-    async def _place_stop(self, symbol, position_side, order_type, stop_price, quantity):
+    async def _place_stop(self, symbol, position_side, order_type, stop_price, quantity, _retry=0):
         close_side = "SELL" if position_side == "LONG" else "BUY"
         params = {
             "symbol": symbol, "side": close_side, "positionSide": position_side,
@@ -252,6 +279,9 @@ class BingXClient:
         data = await self._request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
         if data.get("code") != 0:
             log.error("Error colocando %s para %s: %s", order_type, symbol, data)
+            if _retry < 1:
+                log.info("Reintentando colocar %s para %s (1 solo reintento)", order_type, symbol)
+                return await self._place_stop(symbol, position_side, order_type, stop_price, quantity, _retry=1)
         return data
 
     async def get_recent_trades(self, symbol, limit=1000):
