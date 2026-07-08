@@ -28,6 +28,8 @@ from supertrend_engine import get_trend
 from unicorn_model import get_signal as get_unicorn_signal
 from order_block_engine import get_signal as get_ob_signal
 from cvd_filter import confirms_direction as cvd_confirms
+from rsi_filter import confirms_direction as rsi_confirms
+from vwap_filter import confirms_direction as vwap_confirms
 from regime_filter import is_trending_regime
 
 log = logging.getLogger("combined_engine")
@@ -47,6 +49,31 @@ def _check_cvd(symbol, direction, candles_entry, config):
     return bool(cvd_info["confirms"]), cvd_info
 
 
+def _check_rsi(symbol, direction, candles_entry, config):
+    """Mismo patrón que _check_cvd — RSI evalúa el momento actual, no una
+    foto congelada del pasado (igual razón que se agregó al superscript)."""
+    if not getattr(config, "ENABLE_RSI_FILTER", False):
+        return True, {"skipped": True}
+    rsi_info = rsi_confirms(candles_entry, direction, config)
+    if rsi_info["confirms"] is None:
+        return True, rsi_info
+    if not rsi_info["confirms"]:
+        log.info("[%s] %s descartado por RSI: %s", symbol, direction, rsi_info["reason"])
+    return bool(rsi_info["confirms"]), rsi_info
+
+
+def _check_vwap(symbol, direction, candles_entry, config):
+    """Mismo patrón que _check_cvd — VWAP pondera por volumen, no solo precio."""
+    if not getattr(config, "ENABLE_VWAP_FILTER", False):
+        return True, {"skipped": True}
+    vwap_info = vwap_confirms(candles_entry, direction, config)
+    if vwap_info["confirms"] is None:
+        return True, vwap_info
+    if not vwap_info["confirms"]:
+        log.info("[%s] %s descartado por VWAP: %s", symbol, direction, vwap_info["reason"])
+    return bool(vwap_info["confirms"]), vwap_info
+
+
 def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                      config, candles_15m=None, candles_30m=None, candles_ob=None):
     """
@@ -60,7 +87,7 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
     out = {
         "symbol": symbol, "signal": None, "reason": None,
         "supertrend": None, "unicorn": None, "order_block": None,
-        "regime": None, "engine": None, "cvd": None,
+        "regime": None, "engine": None, "cvd": None, "rsi": None, "vwap": None,
     }
 
     if getattr(config, "ENABLE_REGIME_FILTER", True):
@@ -86,7 +113,11 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
         if uni_dir == st["trend"]:
             cvd_ok, cvd_info = _check_cvd(symbol, uni["signal"], candles_entry, config)
             out["cvd"] = cvd_info
-            if cvd_ok:
+            rsi_ok, rsi_info = _check_rsi(symbol, uni["signal"], candles_entry, config)
+            out["rsi"] = rsi_info
+            vwap_ok, vwap_info = _check_vwap(symbol, uni["signal"], candles_entry, config)
+            out["vwap"] = vwap_info
+            if cvd_ok and rsi_ok and vwap_ok:
                 out["signal"] = uni["signal"]
                 out["entry_price"] = uni["entry_price"]
                 out["sl_price"] = uni["sl_price"]
@@ -104,7 +135,9 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                     uni["tp_price"], uni["has_fvg"], uni["htf"],
                 )
                 return out
-            out["reason"] = f"cvd_rejected_unicorn: {cvd_info.get('reason')}"
+            rejected_by = "cvd" if not cvd_ok else "rsi" if not rsi_ok else "vwap"
+            rejected_reason = (cvd_info if not cvd_ok else rsi_info if not rsi_ok else vwap_info).get("reason")
+            out["reason"] = f"{rejected_by}_rejected_unicorn: {rejected_reason}"
         else:
             out["reason"] = (
                 f"direction_conflict: unicorn={uni['signal']} "
@@ -121,7 +154,11 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
             if ob_dir == st["trend"]:
                 cvd_ok, cvd_info = _check_cvd(symbol, ob["signal"], candles_entry, config)
                 out["cvd"] = cvd_info
-                if cvd_ok:
+                rsi_ok, rsi_info = _check_rsi(symbol, ob["signal"], candles_entry, config)
+                out["rsi"] = rsi_info
+                vwap_ok, vwap_info = _check_vwap(symbol, ob["signal"], candles_entry, config)
+                out["vwap"] = vwap_info
+                if cvd_ok and rsi_ok and vwap_ok:
                     out["signal"] = ob["signal"]
                     out["entry_price"] = ob["entry_price"]
                     out["sl_price"] = ob["sl_price"]
@@ -137,7 +174,9 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                         ob["tp_price"], ob["reason"],
                     )
                     return out
-                out["reason"] = f"cvd_rejected_order_block: {cvd_info.get('reason')}"
+                rejected_by = "cvd" if not cvd_ok else "rsi" if not rsi_ok else "vwap"
+                rejected_reason = (cvd_info if not cvd_ok else rsi_info if not rsi_ok else vwap_info).get("reason")
+                out["reason"] = f"{rejected_by}_rejected_order_block: {rejected_reason}"
 
     if out["reason"] is None:
         out["reason"] = "no_setup_from_any_engine"

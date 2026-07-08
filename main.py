@@ -33,7 +33,7 @@ from order_book_imbalance import confirms_direction as obi_confirms
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-07-fix-sl-tp-silencioso"
+CODE_VERSION = "2026-07-07-rsi-vwap-filters"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),

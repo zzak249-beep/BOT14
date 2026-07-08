@@ -149,6 +149,13 @@ OBI_THRESHOLD = _f("OBI_THRESHOLD", 0.15)          # desequilibrio mínimo (-1 a
 # cooldown lo cubre en los dos modos, independiente de si hay posición real.
 DEDUP_COOLDOWN_SEC = _i("DEDUP_COOLDOWN_SEC", 300)
 
+# ── RSI Filter (momento actual, no congelado) ────────────────────────────
+ENABLE_RSI_FILTER = _b("ENABLE_RSI_FILTER", False)
+RSI_LENGTH = _i("RSI_LENGTH", 14)
+
+# ── VWAP Filter (precio ponderado por volumen) ───────────────────────────
+ENABLE_VWAP_FILTER = _b("ENABLE_VWAP_FILTER", False)
+
 # ── Order Flow / Absorción (confirmación final, post Supertrend+Unicorn) ──
 ENABLE_ORDER_FLOW_FILTER = _b("ENABLE_ORDER_FLOW_FILTER", False)  # off por defecto
 ORDER_FLOW_TRADES_LIMIT = _i("ORDER_FLOW_TRADES_LIMIT", 1000)     # trades recientes a pedir
