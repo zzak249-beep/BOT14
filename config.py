@@ -153,6 +153,11 @@ OBI_THRESHOLD = _f("OBI_THRESHOLD", 0.15)          # desequilibrio mínimo (-1 a
 # DRY_RUN (las posiciones simuladas nunca aparecen en BingX real) — este
 # cooldown lo cubre en los dos modos, independiente de si hay posición real.
 DEDUP_COOLDOWN_SEC = _i("DEDUP_COOLDOWN_SEC", 300)
+POST_CLOSE_COOLDOWN_SEC = _i("POST_CLOSE_COOLDOWN_SEC", 900)  # tras cerrar una posición,
+                                                               # no reabrir el mismo símbolo
+                                                               # por este tiempo (observado en
+                                                               # real: UNI reabrió 1 min después
+                                                               # de cerrar, 3 trades en el día)
 
 # ── RSI Filter (momento actual, no congelado) ────────────────────────────
 ENABLE_RSI_FILTER = _b("ENABLE_RSI_FILTER", False)

@@ -33,7 +33,7 @@ from order_book_imbalance import confirms_direction as obi_confirms
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-08-side-en-cierre"
+CODE_VERSION = "2026-07-08-precision-closeposition-postclose"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -46,7 +46,7 @@ BTC_SYMBOL = "BTC-USDT"
 
 
 async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles,
-                          exec_lock, recently_opened):
+                          exec_lock, recently_opened, recently_closed):
     symbol = sig["symbol"]
     side = sig["signal"]
     entry = sig["entry_price"]
@@ -65,6 +65,19 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
                       symbol, (now_ms - last_opened) / 1000, cooldown_ms // 1000)
             journal.record({"symbol": symbol, "event": "signal_rejected",
                              "reason": "dedup_cooldown", "signal": sig})
+            return None
+
+        # Cooldown post-cierre: no reabrir el mismo símbolo enseguida después
+        # de cerrar una posición en él (observado en real con UNI-USDT:
+        # cierre 16:26, reapertura 16:27 — 3 trades el mismo día). El dedup
+        # de arriba no cubre esto porque mira la APERTURA anterior, no el cierre.
+        post_close_ms = getattr(config, "POST_CLOSE_COOLDOWN_SEC", 900) * 1000
+        last_closed = recently_closed.get(symbol)
+        if last_closed is not None and (now_ms - last_closed) < post_close_ms:
+            log.info("[%s] Señal descartada por cooldown post-cierre (cerró hace %.0fs, cooldown=%ss)",
+                      symbol, (now_ms - last_closed) / 1000, post_close_ms // 1000)
+            journal.record({"symbol": symbol, "event": "signal_rejected",
+                             "reason": "post_close_cooldown", "signal": sig})
             return None
 
         open_positions = await client.get_open_positions()
@@ -104,6 +117,24 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
         if qty <= 0:
             log.warning("[%s] Tamaño de posición inválido, se omite", symbol)
             return None
+
+        # Redondear qty y precios a la precisión REAL del símbolo antes de
+        # ordenar. Sin esto, la orden de mercado se llena redondeada por
+        # BingX pero el bot sigue creyendo la cantidad original -> el SL/TP
+        # excede la posición real -> 110424 (confirmado con KAITO-USDT).
+        specs = await client.get_contract_specs(symbol)
+        if specs:
+            qty = client.round_qty(qty, specs["quantityPrecision"])
+            sl = client.round_price(sl, specs["pricePrecision"])
+            tp = client.round_price(tp, specs["pricePrecision"])
+            if qty <= 0:
+                log.warning("[%s] Tamaño quedó en 0 tras redondear a la precisión del símbolo (%s decimales), se omite",
+                             symbol, specs["quantityPrecision"])
+                journal.record({"symbol": symbol, "event": "signal_rejected",
+                                 "reason": "qty_cero_tras_redondeo", "signal": sig})
+                return None
+        else:
+            log.warning("[%s] Sin especificaciones de contrato disponibles — se ordena sin redondear (riesgo de 110424 en SL/TP)", symbol)
 
         obi_info = {"skipped": True}
         if getattr(config, "ENABLE_OBI_FILTER", False):
@@ -156,7 +187,7 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
 
 
 async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, symbols, exec_lock,
-                     recently_opened, tag="slow"):
+                     recently_opened, recently_closed, tag="slow"):
     balance = await client.get_balance_usdt()
     if balance <= 0:
         log.warning("[%s] Balance no disponible o cero, se omite ciclo", tag)
@@ -179,14 +210,14 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
     signals = await scan_universe(client, symbols, config)
     for sig in signals:
         opened = await execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr,
-                                       sig, balance, btc_candles, exec_lock, recently_opened)
+                                       sig, balance, btc_candles, exec_lock, recently_opened, recently_closed)
         if opened:
             async with exec_lock:
                 pos_monitor.register_open(opened["symbol"], opened["setup_key"],
                                           opened["risk_pct"], opened["opened_at_ms"], opened["side"])
 
 
-async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened):
+async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed):
     symbols = await get_symbol_universe(client, config)
     last_refresh = asyncio.get_event_loop().time()
 
@@ -198,14 +229,14 @@ async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor
                 last_refresh = now
 
             await run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
-                             symbols, exec_lock, recently_opened, tag="slow")
+                             symbols, exec_lock, recently_opened, recently_closed, tag="slow")
         except Exception as e:
             log.exception("[slow] Error en ciclo: %s", e)
 
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
 
-async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened):
+async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed):
     top_n = getattr(config, "FAST_SCAN_TOP_N", 60)
     interval = getattr(config, "FAST_SCAN_INTERVAL_SEC", 60)
 
@@ -213,7 +244,7 @@ async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor
         try:
             symbols = await get_top_n_symbols(client, config, top_n)
             await run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
-                             symbols, exec_lock, recently_opened, tag="fast")
+                             symbols, exec_lock, recently_opened, recently_closed, tag="fast")
         except Exception as e:
             log.exception("[fast] Error en ciclo: %s", e)
 
@@ -230,13 +261,14 @@ async def main():
     corr_mgr = CorrelationManager(config)
     exec_lock = asyncio.Lock()
     recently_opened = {}  # symbol -> timestamp_ms, dedup entre loop rápido y lento
+    recently_closed = {}  # symbol -> timestamp_ms del último cierre, cooldown post-cierre
 
     async with BingXClient(
         config.BINGX_API_KEY, config.BINGX_API_SECRET,
         config.BINGX_BASE_URL, dry_run=config.DRY_RUN,
     ) as client:
 
-        pos_monitor = PositionMonitor(client, journal, risk_mgr, setup_mem, corr_mgr)
+        pos_monitor = PositionMonitor(client, journal, risk_mgr, setup_mem, corr_mgr, recently_closed)
         fast_on = getattr(config, "ENABLE_FAST_SCAN", True)
 
         # Longitud exacta de las credenciales EN ESTE PROCESO, no lo que se
@@ -262,9 +294,9 @@ async def main():
         )
 
 
-        loops = [_slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened)]
+        loops = [_slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed)]
         if fast_on:
-            loops.append(_fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened))
+            loops.append(_fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed))
 
         await asyncio.gather(*loops)
 

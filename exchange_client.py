@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import math
 import random
 import re
 import time
@@ -88,6 +89,14 @@ class BingXClient:
         self._last_request_at = 0.0
         self._pacing_lock = asyncio.Lock()
         self._min_request_interval = min_request_interval
+        # Caché de especificaciones de contrato (precisión de qty/precio por
+        # símbolo). Se llena UNA vez con /quote/contracts y se reutiliza —
+        # sin esto, el bot mandaba cantidades con 6 decimales a símbolos que
+        # aceptan menos, la orden de mercado se llenaba REDONDEADA, y el
+        # SL/TP por la cantidad sin redondear excedía la posición real ->
+        # 110424 "order size must be less than the available amount"
+        # (confirmado en producción con KAITO-USDT).
+        self._contract_specs = {}
 
     async def _wait_for_slot(self):
         """Espera compartida antes de CUALQUIER request: respeta el cooldown
@@ -165,6 +174,41 @@ class BingXClient:
             return {"code": -1, "msg": str(e)}
 
     # ── Datos públicos ────────────────────────────────────────────────
+    async def get_contract_specs(self, symbol):
+        """Devuelve {"quantityPrecision": int, "pricePrecision": int} para el
+        símbolo, cacheado. Si el endpoint falla o el símbolo no aparece,
+        devuelve None — el caller decide qué hacer (no inventar precisión)."""
+        if symbol in self._contract_specs:
+            return self._contract_specs[symbol]
+        try:
+            data = await self._request("GET", "/openApi/swap/v2/quote/contracts", signed=False)
+            items = data.get("data", []) if isinstance(data, dict) else []
+            for it in items:
+                sym = it.get("symbol")
+                if not sym:
+                    continue
+                try:
+                    self._contract_specs[sym] = {
+                        "quantityPrecision": int(it.get("quantityPrecision", 4)),
+                        "pricePrecision": int(it.get("pricePrecision", 4)),
+                    }
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            log.warning("No se pudieron obtener las especificaciones de contratos: %s", e)
+        return self._contract_specs.get(symbol)
+
+    @staticmethod
+    def round_qty(qty, quantity_precision):
+        """Redondea SIEMPRE hacia abajo (floor) a la precisión del símbolo —
+        hacia arriba arriesgaría exceder el margen o la posición real."""
+        factor = 10 ** quantity_precision
+        return math.floor(qty * factor) / factor
+
+    @staticmethod
+    def round_price(price, price_precision):
+        return round(price, price_precision)
+
     async def get_all_symbols_with_volume(self):
         """Devuelve [{symbol, volume_24h_usdt}, ...] para todos los perpetuos."""
         data = await self._request("GET", "/openApi/swap/v2/quote/ticker", signed=False)
@@ -271,10 +315,18 @@ class BingXClient:
 
     async def _place_stop(self, symbol, position_side, order_type, stop_price, quantity, _retry=0):
         close_side = "SELL" if position_side == "LONG" else "BUY"
+        # closePosition=true: al dispararse, cierra TODA la posición de ese
+        # positionSide — sin mandar quantity. Esto elimina de raíz el error
+        # 110424 ("order size must be less than the available amount"), que
+        # pasaba porque la orden de mercado se llenaba con la cantidad
+        # redondeada a la precisión del símbolo, y el stop por la cantidad
+        # SIN redondear excedía la posición real (confirmado con KAITO-USDT).
+        # El parámetro quantity se conserva en la firma por compatibilidad
+        # pero ya no se envía.
         params = {
             "symbol": symbol, "side": close_side, "positionSide": position_side,
-            "type": order_type, "stopPrice": stop_price, "quantity": quantity,
-            "workingType": "MARK_PRICE",
+            "type": order_type, "stopPrice": stop_price,
+            "closePosition": "true", "workingType": "MARK_PRICE",
         }
         data = await self._request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
         if data.get("code") != 0:

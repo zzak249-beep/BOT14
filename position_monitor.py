@@ -11,12 +11,13 @@ el PnL realizado y:
   5. Libera el riesgo abierto reservado (risk_manager)
 """
 import logging
+import time
 
 log = logging.getLogger("position_monitor")
 
 
 class PositionMonitor:
-    def __init__(self, client, journal, risk_mgr, setup_memory, corr_mgr):
+    def __init__(self, client, journal, risk_mgr, setup_memory, corr_mgr, recently_closed=None):
         self.client = client
         self.journal = journal
         self.risk_mgr = risk_mgr
@@ -24,6 +25,12 @@ class PositionMonitor:
         self.corr_mgr = corr_mgr
         # symbol -> metadata registrada al abrir (setup_key, risk_pct, etc.)
         self.tracked = {}
+        # symbol -> timestamp_ms del último CIERRE. Compartido con
+        # execute_signal para el cooldown post-cierre: se observó en real
+        # (UNI-USDT) que el bot cerraba una posición y reabría la misma
+        # moneda 1 minuto después, 3 veces en el día — el dedup de apertura
+        # no cubre este caso porque la posición anterior ya no existe.
+        self.recently_closed = recently_closed if recently_closed is not None else {}
 
     def register_open(self, symbol, setup_key, risk_pct, opened_at_ms, side=None):
         self.tracked[symbol] = {"setup_key": setup_key, "risk_pct": risk_pct,
@@ -66,6 +73,7 @@ class PositionMonitor:
         self.corr_mgr.register_close(symbol)
         self.setup_memory.record_outcome(meta["setup_key"], is_win)
 
+        self.recently_closed[symbol] = int(time.time() * 1000)
         self.journal.record({
             "symbol": symbol, "event": "position_closed", "side": meta.get("side"),
             "pnl": pnl, "is_win": is_win, "setup_key": meta["setup_key"],
