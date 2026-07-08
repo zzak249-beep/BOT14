@@ -25,9 +25,9 @@ class PositionMonitor:
         # symbol -> metadata registrada al abrir (setup_key, risk_pct, etc.)
         self.tracked = {}
 
-    def register_open(self, symbol, setup_key, risk_pct, opened_at_ms):
+    def register_open(self, symbol, setup_key, risk_pct, opened_at_ms, side=None):
         self.tracked[symbol] = {"setup_key": setup_key, "risk_pct": risk_pct,
-                                "opened_at_ms": opened_at_ms}
+                                "opened_at_ms": opened_at_ms, "side": side}
 
     async def check_closures(self, balance):
         if not self.tracked:
@@ -67,7 +67,7 @@ class PositionMonitor:
         self.setup_memory.record_outcome(meta["setup_key"], is_win)
 
         self.journal.record({
-            "symbol": symbol, "event": "position_closed",
+            "symbol": symbol, "event": "position_closed", "side": meta.get("side"),
             "pnl": pnl, "is_win": is_win, "setup_key": meta["setup_key"],
         })
         log.info("[%s] Posición cerrada | PnL=%.4f | %s | setup=%s",
