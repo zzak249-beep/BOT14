@@ -29,11 +29,12 @@ from correlation_manager import CorrelationManager
 from position_monitor import PositionMonitor
 from scanner import get_symbol_universe, get_top_n_symbols, scan_universe
 from order_book_imbalance import confirms_direction as obi_confirms
+from state_store import StateStore
 
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-09-fix109400-qty-real"
+CODE_VERSION = "2026-07-09-rr2-min-notional"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -43,6 +44,41 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 BTC_SYMBOL = "BTC-USDT"
+
+
+def _save_state(state, recently_opened, recently_closed, pos_monitor, risk_mgr, corr_mgr):
+    state.save(recently_opened, recently_closed, pos_monitor.tracked,
+               risk_mgr.snapshot(), corr_mgr.open_exposure)
+
+
+async def _reconcile_positions(client, pos_monitor, risk_mgr, corr_mgr):
+    """Al arrancar: adopta posiciones REALES abiertas en BingX que no estén
+    en pos_monitor.tracked (abiertas antes del primer deploy con state_store,
+    o manualmente). Sin esto quedan huérfanas: su cierre no alimenta el PnL
+    diario ni libera riesgo, y no cuentan para el límite de correlación.
+    Se asume su SL/TP ya colocado (no se dispara auto-repair a ciegas) y se
+    les imputa RISK_PCT_PER_TRADE como aproximación de riesgo abierto."""
+    try:
+        positions = await client.get_open_positions()
+    except Exception as e:
+        log.warning("No se pudieron leer posiciones para reconciliar al arranque: %s", e)
+        return
+    adopted = 0
+    for p in positions:
+        symbol = p.get("symbol")
+        if not symbol or symbol in pos_monitor.tracked:
+            continue
+        side = p.get("positionSide") or (
+            "LONG" if float(p.get("positionAmt", 0)) > 0 else "SHORT")
+        pos_monitor.register_open(
+            symbol, "adopted|preexistente", config.RISK_PCT_PER_TRADE,
+            int(time.time() * 1000), side, sl_placed=True, tp_placed=True)
+        risk_mgr.register_open_risk(config.RISK_PCT_PER_TRADE)
+        corr_mgr.register_open(symbol, side, None)
+        adopted += 1
+        log.info("[%s] Posición preexistente ADOPTADA (%s) — su cierre ahora sí alimenta riesgo/journal", symbol, side)
+    if adopted:
+        log.info("Reconciliación: %d posiciones adoptadas al arranque", adopted)
 
 
 async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles,
@@ -93,7 +129,54 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
                                  "reason": f"setup_memory: {reason}", "signal": sig})
                 return None
 
-        risk_pct = config.RISK_PCT_PER_TRADE
+        qty = risk_mgr.calc_position_size(balance, entry, sl)
+        if qty <= 0:
+            log.warning("[%s] Tamaño de posición inválido, se omite", symbol)
+            return None
+
+        # ── Notional mínimo: inflar trades demasiado chicos, con tope ──
+        # Los notionals chicos vienen de SLs lejanos (caso LDO: 4 USDT de
+        # notional = SL a ~11%) — inflarlos multiplica el riesgo real de ESE
+        # trade, por eso el tope MIN_NOTIONAL_MAX_RISK_PCT.
+        min_notional = getattr(config, "MIN_NOTIONAL_USDT", 0.0)
+        bumped = False
+        if min_notional > 0 and qty * entry < min_notional:
+            qty = min_notional / entry
+            bumped = True
+
+        specs = await client.get_contract_specs(symbol)
+        if specs:
+            qty = client.round_qty(qty, specs["quantityPrecision"])
+            if bumped and 0 < qty * entry < min_notional:
+                # el redondeo truncó por debajo del mínimo: un paso de
+                # precisión hacia arriba para no quedar corto
+                qty = client.round_qty(qty + 10 ** -specs["quantityPrecision"],
+                                        specs["quantityPrecision"])
+            sl = client.round_price(sl, specs["pricePrecision"])
+            tp = client.round_price(tp, specs["pricePrecision"])
+            if qty <= 0:
+                log.warning("[%s] Tamaño quedó en 0 tras redondear a la precisión del símbolo (%s decimales), se omite",
+                             symbol, specs["quantityPrecision"])
+                journal.record({"symbol": symbol, "event": "signal_rejected",
+                                 "reason": "qty_cero_tras_redondeo", "signal": sig})
+                return None
+        else:
+            log.warning("[%s] Sin especificaciones de contrato disponibles — se ordena sin redondear (riesgo de 110424 en SL/TP)", symbol)
+
+        # Riesgo EFECTIVO con la cantidad final (refleja el bump y el
+        # redondeo) — es lo que se chequea, se reserva y luego se libera.
+        risk_pct = qty * abs(entry - sl) / balance * 100
+        if bumped:
+            max_risk = getattr(config, "MIN_NOTIONAL_MAX_RISK_PCT", 1.5)
+            if risk_pct > max_risk:
+                log.info("[%s] Señal descartada: inflar a %.0f USDT de notional dejaría el riesgo en %.2f%% (> tope %.2f%%)",
+                          symbol, min_notional, risk_pct, max_risk)
+                journal.record({"symbol": symbol, "event": "signal_rejected",
+                                 "reason": f"min_notional_riesgo_excesivo: {risk_pct:.2f}%", "signal": sig})
+                return None
+            log.info("[%s] Notional inflado al mínimo: qty=%.6f (~%.2f USDT), riesgo efectivo %.2f%%",
+                      symbol, qty, qty * entry, risk_pct)
+
         can_open, reason = risk_mgr.can_open_new_position(balance, len(open_positions), risk_pct)
         if not can_open:
             log.warning("[%s] Señal descartada por risk manager: %s", symbol, reason)
@@ -112,29 +195,6 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
                     return None
             except Exception as e:
                 log.warning("[%s] No se pudo evaluar correlación, se permite por defecto: %s", symbol, e)
-
-        qty = risk_mgr.calc_position_size(balance, entry, sl)
-        if qty <= 0:
-            log.warning("[%s] Tamaño de posición inválido, se omite", symbol)
-            return None
-
-        # Redondear qty y precios a la precisión REAL del símbolo antes de
-        # ordenar. Sin esto, la orden de mercado se llena redondeada por
-        # BingX pero el bot sigue creyendo la cantidad original -> el SL/TP
-        # excede la posición real -> 110424 (confirmado con KAITO-USDT).
-        specs = await client.get_contract_specs(symbol)
-        if specs:
-            qty = client.round_qty(qty, specs["quantityPrecision"])
-            sl = client.round_price(sl, specs["pricePrecision"])
-            tp = client.round_price(tp, specs["pricePrecision"])
-            if qty <= 0:
-                log.warning("[%s] Tamaño quedó en 0 tras redondear a la precisión del símbolo (%s decimales), se omite",
-                             symbol, specs["quantityPrecision"])
-                journal.record({"symbol": symbol, "event": "signal_rejected",
-                                 "reason": "qty_cero_tras_redondeo", "signal": sig})
-                return None
-        else:
-            log.warning("[%s] Sin especificaciones de contrato disponibles — se ordena sin redondear (riesgo de 110424 en SL/TP)", symbol)
 
         obi_info = {"skipped": True}
         if getattr(config, "ENABLE_OBI_FILTER", False):
@@ -190,14 +250,17 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
 
 
 async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, symbols, exec_lock,
-                     recently_opened, recently_closed, tag="slow"):
+                     recently_opened, recently_closed, state, tag="slow"):
     balance = await client.get_balance_usdt()
     if balance <= 0:
         log.warning("[%s] Balance no disponible o cero, se omite ciclo", tag)
         return
 
     async with exec_lock:
+        tracked_before = len(pos_monitor.tracked)
         await pos_monitor.check_closures(balance)
+        if len(pos_monitor.tracked) != tracked_before:
+            _save_state(state, recently_opened, recently_closed, pos_monitor, risk_mgr, corr_mgr)
 
     if risk_mgr.daily_loss_breached(balance):
         log.warning("[%s] Circuit breaker diario activo — no se buscan nuevas señales", tag)
@@ -221,9 +284,10 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
                                           sl_price=opened.get("sl_price"), tp_price=opened.get("tp_price"),
                                           sl_placed=opened.get("sl_placed", True),
                                           tp_placed=opened.get("tp_placed", True))
+                _save_state(state, recently_opened, recently_closed, pos_monitor, risk_mgr, corr_mgr)
 
 
-async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed):
+async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed, state):
     symbols = await get_symbol_universe(client, config)
     last_refresh = asyncio.get_event_loop().time()
 
@@ -235,14 +299,14 @@ async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor
                 last_refresh = now
 
             await run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
-                             symbols, exec_lock, recently_opened, recently_closed, tag="slow")
+                             symbols, exec_lock, recently_opened, recently_closed, state, tag="slow")
         except Exception as e:
             log.exception("[slow] Error en ciclo: %s", e)
 
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
 
-async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed):
+async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed, state):
     top_n = getattr(config, "FAST_SCAN_TOP_N", 60)
     interval = getattr(config, "FAST_SCAN_INTERVAL_SEC", 60)
 
@@ -250,7 +314,7 @@ async def _fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor
         try:
             symbols = await get_top_n_symbols(client, config, top_n)
             await run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
-                             symbols, exec_lock, recently_opened, recently_closed, tag="fast")
+                             symbols, exec_lock, recently_opened, recently_closed, state, tag="fast")
         except Exception as e:
             log.exception("[fast] Error en ciclo: %s", e)
 
@@ -277,6 +341,34 @@ async def main():
         pos_monitor = PositionMonitor(client, journal, risk_mgr, setup_mem, corr_mgr, recently_closed)
         fast_on = getattr(config, "ENABLE_FAST_SCAN", True)
 
+        # ── Restauración de estado (sobrevive redeploys de Railway) ──────
+        # Antes TODO esto era RAM: cada redeploy borraba cooldowns, riesgo
+        # abierto, exposición correlacionada, circuit breaker diario y el
+        # tracking de posiciones (confirmado en el deploy 2026-07-09 08:47).
+        state = StateStore(config.STATE_FILE)
+        snap = state.load()
+        recently_opened.update(snap.get("recently_opened", {}))
+        recently_closed.update(snap.get("recently_closed", {}))
+        pos_monitor.tracked.update(snap.get("tracked", {}))
+        risk_mgr.restore(snap.get("risk"))
+        corr_mgr.open_exposure.update(snap.get("corr_exposure", {}))
+        if snap:
+            log.info(
+                "Estado restaurado de %s | tracked=%d recently_opened=%d recently_closed=%d corr_exposure=%d",
+                config.STATE_FILE, len(pos_monitor.tracked), len(recently_opened),
+                len(recently_closed), len(corr_mgr.open_exposure),
+            )
+        else:
+            log.info("Sin estado previo en %s — arranque en frío", config.STATE_FILE)
+
+        # Posiciones reales abiertas que no estén en tracked (abiertas antes
+        # de este fix, o a mano) se adoptan para que cuenten en riesgo y
+        # correlación y su cierre alimente el sistema. En DRY_RUN no: las
+        # posiciones reales de la cuenta no son de este bot simulado.
+        if not config.DRY_RUN:
+            await _reconcile_positions(client, pos_monitor, risk_mgr, corr_mgr)
+            _save_state(state, recently_opened, recently_closed, pos_monitor, risk_mgr, corr_mgr)
+
         # Longitud exacta de las credenciales EN ESTE PROCESO, no lo que se
         # piense haber pegado en Railway. Comparar este número contra lo que
         # dio el diagnóstico local (85/82 la última vez que funcionó) — si no
@@ -300,9 +392,9 @@ async def main():
         )
 
 
-        loops = [_slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed)]
+        loops = [_slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed, state)]
         if fast_on:
-            loops.append(_fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed))
+            loops.append(_fast_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed, state))
 
         await asyncio.gather(*loops)
 

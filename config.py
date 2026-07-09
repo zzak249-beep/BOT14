@@ -108,7 +108,7 @@ ST_MULT = _f("ST_MULT", 3.5)
 # ── Unicorn Model ──────────────────────────────────────────────────────
 UNICORN_SWEEP_LB = _i("UNICORN_SWEEP_LB", 30)     # lookback de velas para sweep
 UNICORN_REQUIRE_FVG = _b("UNICORN_REQUIRE_FVG", True)  # Unicorn Mode ON
-UNICORN_RR = _f("UNICORN_RR", 1.5)                # risk:reward del TP
+UNICORN_RR = _f("UNICORN_RR", 2.0)                # risk:reward del TP (subido de 1.5: TP más largo pedido)
 UNICORN_SL_ATR_BUFFER = _f("UNICORN_SL_ATR_BUFFER", 0.2)  # colchón extra en SL
 DIRECTION = os.getenv("DIRECTION", "BOTH")        # LONG | SHORT | BOTH
 
@@ -127,7 +127,7 @@ OB_PIVOT_LEN = _i("OB_PIVOT_LEN", 7)              # barras a cada lado para conf
 OB_MIN_BUY_PCT = _f("OB_MIN_BUY_PCT", 50.0)       # % mínimo de volumen comprador para aceptar retest LONG
 OB_MIN_SELL_PCT = _f("OB_MIN_SELL_PCT", 50.0)     # % mínimo de volumen vendedor para aceptar retest SHORT
 OB_DELETE_ON_BREAK = _b("OB_DELETE_ON_BREAK", True)  # invalida el Order Block si el precio lo rompe del todo
-OB_RR = _f("OB_RR", 1.5)                          # risk:reward del TP en señales del Order Block Engine
+OB_RR = _f("OB_RR", 2.0)                          # risk:reward del TP (subido de 1.5, igual que UNICORN_RR)
 OB_SL_ATR_BUFFER = _f("OB_SL_ATR_BUFFER", 0.2)    # colchón ATR extra en el SL
 
 # ── CVD Filter (Cumulative Volume Delta, sin llamada extra a la API) ─────
@@ -200,6 +200,17 @@ SETUP_MEMORY_FILE = os.path.join(DATA_DIR, "unicorn_st_setup_memory.json")
 
 # ── Gestión de riesgo ───────────────────────────────────────────────────
 RISK_PCT_PER_TRADE = _f("RISK_PCT_PER_TRADE", 0.5)   # % del balance por operación
+
+# ── Notional mínimo por trade ────────────────────────────────────────────
+# El sizing por riesgo produce notionals minúsculos cuando el SL queda lejos
+# (visto en real: LDO-USDT con 4 USDT de notional porque el SL estaba ~11%
+# abajo). Si el notional calculado queda por debajo de este mínimo, se INFLA
+# la cantidad hasta alcanzarlo — PERO inflar un trade de SL lejano multiplica
+# su riesgo real, así que hay un tope: si el riesgo efectivo tras inflar
+# supera MIN_NOTIONAL_MAX_RISK_PCT, el trade se descarta (queda en el journal
+# como min_notional_riesgo_excesivo). 0 = desactivado.
+MIN_NOTIONAL_USDT = _f("MIN_NOTIONAL_USDT", 10.0)
+MIN_NOTIONAL_MAX_RISK_PCT = _f("MIN_NOTIONAL_MAX_RISK_PCT", 1.5)
 LEVERAGE = _i("LEVERAGE", 10)
 DAILY_MAX_LOSS_PCT = _f("DAILY_MAX_LOSS_PCT", 5.0)   # circuit breaker diario
 MAX_CONCURRENT_RISK_PCT = _f("MAX_CONCURRENT_RISK_PCT", 3.0)  # riesgo total abierto
