@@ -33,7 +33,7 @@ from order_book_imbalance import confirms_direction as obi_confirms
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-08-precision-closeposition-postclose"
+CODE_VERSION = "2026-07-09-fix109400-qty-real"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -180,7 +180,10 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
                     "revisar y proteger manualmente ya mismo.", symbol,
                 )
             return {"symbol": symbol, "setup_key": setup_key, "risk_pct": risk_pct,
-                    "opened_at_ms": int(time.time() * 1000), "side": side}
+                    "opened_at_ms": int(time.time() * 1000), "side": side,
+                    "sl_price": sl, "tp_price": tp,
+                    "sl_placed": result.get("sl_placed") is not False,
+                    "tp_placed": result.get("tp_placed") is not False}
 
         log.error("[%s] Falló apertura de posición: %s", symbol, result)
         return None
@@ -214,7 +217,10 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
         if opened:
             async with exec_lock:
                 pos_monitor.register_open(opened["symbol"], opened["setup_key"],
-                                          opened["risk_pct"], opened["opened_at_ms"], opened["side"])
+                                          opened["risk_pct"], opened["opened_at_ms"], opened["side"],
+                                          sl_price=opened.get("sl_price"), tp_price=opened.get("tp_price"),
+                                          sl_placed=opened.get("sl_placed", True),
+                                          tp_placed=opened.get("tp_placed", True))
 
 
 async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock, recently_opened, recently_closed):

@@ -32,9 +32,12 @@ class PositionMonitor:
         # no cubre este caso porque la posición anterior ya no existe.
         self.recently_closed = recently_closed if recently_closed is not None else {}
 
-    def register_open(self, symbol, setup_key, risk_pct, opened_at_ms, side=None):
+    def register_open(self, symbol, setup_key, risk_pct, opened_at_ms, side=None,
+                       sl_price=None, tp_price=None, sl_placed=True, tp_placed=True):
         self.tracked[symbol] = {"setup_key": setup_key, "risk_pct": risk_pct,
-                                "opened_at_ms": opened_at_ms, "side": side}
+                                "opened_at_ms": opened_at_ms, "side": side,
+                                "sl_price": sl_price, "tp_price": tp_price,
+                                "needs_sl": not sl_placed, "needs_tp": not tp_placed}
 
     async def check_closures(self, balance):
         if not self.tracked:
@@ -47,6 +50,43 @@ class PositionMonitor:
         for symbol in closed_symbols:
             meta = self.tracked.pop(symbol)
             await self._handle_closure(symbol, meta, balance)
+
+        # AUTO-REPARACIÓN de SL/TP: si una posición quedó abierta con el SL
+        # o el TP sin colocar, reintentarlos en cada ciclo hasta que entren —
+        # antes solo se logueaba el 🚨 y la posición quedaba desprotegida
+        # esperando intervención manual. El SL va primero: es la protección;
+        # el TP es la toma de ganancia, importante pero no crítico.
+        for symbol, meta in self.tracked.items():
+            if symbol not in open_symbols:
+                continue
+            if meta.get("needs_sl") and meta.get("sl_price"):
+                try:
+                    result = await self.client._place_stop(
+                        symbol, meta.get("side") or "LONG", "STOP_MARKET",
+                        meta["sl_price"], None)
+                    if result.get("code") == 0:
+                        meta["needs_sl"] = False
+                        log.info("✅ [%s] SL auto-reparado: colocado en %s tras fallo inicial",
+                                  symbol, meta["sl_price"])
+                    else:
+                        log.warning("🚨 [%s] Auto-reparación de SL sigue fallando: %s — se reintenta el próximo ciclo",
+                                     symbol, result)
+                except Exception as e:
+                    log.warning("🚨 [%s] Auto-reparación de SL falló con excepción: %s", symbol, e)
+            if meta.get("needs_tp") and meta.get("tp_price"):
+                try:
+                    result = await self.client._place_stop(
+                        symbol, meta.get("side") or "LONG", "TAKE_PROFIT_MARKET",
+                        meta["tp_price"], None)
+                    if result.get("code") == 0:
+                        meta["needs_tp"] = False
+                        log.info("✅ [%s] TP auto-reparado: colocado en %s tras fallo inicial",
+                                  symbol, meta["tp_price"])
+                    else:
+                        log.warning("[%s] Auto-reparación de TP sigue fallando: %s — se reintenta el próximo ciclo",
+                                     symbol, result)
+                except Exception as e:
+                    log.warning("[%s] Auto-reparación de TP falló con excepción: %s", symbol, e)
 
     async def _handle_closure(self, symbol, meta, balance):
         # FIX: income_history traía las últimas 5 entradas del símbolo sin

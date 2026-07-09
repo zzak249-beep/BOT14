@@ -290,11 +290,22 @@ class BingXClient:
             log.error("Error abriendo posición %s %s: %s", symbol, side, data)
             return data
 
+        # Pausa breve: dejar que la posición termine de asentarse en BingX
+        # antes de colocar los stops — reduce el caso de carrera donde el
+        # stop llega antes de que el servidor registre la posición llenada.
+        await asyncio.sleep(0.4)
+
+        # Cantidad REAL de la posición según BingX — una sola consulta, se
+        # usa para el SL y el TP. Si no se puede leer (raro), se cae a la
+        # cantidad pedida, y _place_stop refresca en su reintento igual.
+        real_qty = await self._get_real_position_amt(symbol, side)
+        stop_qty = real_qty if real_qty else quantity
+
         sl_placed = True
         tp_placed = True
 
         if sl_price:
-            sl_result = await self._place_stop(symbol, side, "STOP_MARKET", sl_price, quantity)
+            sl_result = await self._place_stop(symbol, side, "STOP_MARKET", sl_price, stop_qty)
             sl_placed = sl_result.get("code") == 0
             if not sl_placed:
                 log.error(
@@ -304,38 +315,73 @@ class BingXClient:
                 )
 
         if tp_price:
-            tp_result = await self._place_stop(symbol, side, "TAKE_PROFIT_MARKET", tp_price, quantity)
+            tp_result = await self._place_stop(symbol, side, "TAKE_PROFIT_MARKET", tp_price, stop_qty)
             tp_placed = tp_result.get("code") == 0
             if not tp_placed:
-                log.warning("[%s] TP no se pudo colocar (%s) — la posición sigue con SL, no es crítico", symbol, tp_price)
+                if sl_placed:
+                    log.warning("[%s] TP no se pudo colocar (%s) — la posición sigue con SL, no es crítico", symbol, tp_price)
+                else:
+                    log.error("🚨 [%s] TP tampoco se pudo colocar (%s) — posición SIN SL NI TP", symbol, tp_price)
 
         data["sl_placed"] = sl_placed
         data["tp_placed"] = tp_placed
         return data
 
+        data["sl_placed"] = sl_placed
+        data["tp_placed"] = tp_placed
+        return data
+
+    async def _get_real_position_amt(self, symbol, position_side):
+        """Cantidad REAL de la posición según BingX (positionAmt) — la fuente
+        de verdad para colocar stops, inmune a redondeos y fills parciales."""
+        try:
+            positions = await self.get_open_positions()
+            for p in positions:
+                if p.get("symbol") == symbol and p.get("positionSide", position_side) == position_side:
+                    amt = abs(float(p.get("positionAmt", 0)))
+                    if amt > 0:
+                        return amt
+        except Exception as e:
+            log.warning("No se pudo leer la cantidad real de %s: %s", symbol, e)
+        return None
+
     async def _place_stop(self, symbol, position_side, order_type, stop_price, quantity, _retry=0):
         close_side = "SELL" if position_side == "LONG" else "BUY"
-        # closePosition=true: al dispararse, cierra TODA la posición de ese
-        # positionSide — sin mandar quantity. Esto elimina de raíz el error
-        # 110424 ("order size must be less than the available amount"), que
-        # pasaba porque la orden de mercado se llenaba con la cantidad
-        # redondeada a la precisión del símbolo, y el stop por la cantidad
-        # SIN redondear excedía la posición real (confirmado con KAITO-USDT).
-        # El parámetro quantity se conserva en la firma por compatibilidad
-        # pero ya no se envía.
+        # CONFIRMADO EN PRODUCCIÓN (INJ-USDT, code 109400 "parameter quantity
+        # or stopPrice is must"): BingX NO acepta closePosition=true sin
+        # quantity en este endpoint — la cantidad es OBLIGATORIA siempre, a
+        # diferencia de otros exchanges. Estrategia definitiva: usar siempre
+        # quantity, y que sea la REAL que BingX reporta (positionAmt), no la
+        # calculada por el bot — así tampoco puede pasar el 110424 original
+        # (cantidad calculada > posición realmente llenada, caso KAITO).
+        qty = quantity
+        if qty is None or qty <= 0:
+            qty = await self._get_real_position_amt(symbol, position_side)
+        if qty is None or qty <= 0:
+            log.error("No hay cantidad disponible para %s de %s — ¿posición no visible todavía?",
+                       order_type, symbol)
+            return {"code": -1, "msg": "sin cantidad disponible para el stop"}
+
         params = {
             "symbol": symbol, "side": close_side, "positionSide": position_side,
             "type": order_type, "stopPrice": stop_price,
-            "closePosition": "true", "workingType": "MARK_PRICE",
+            "quantity": qty, "workingType": "MARK_PRICE",
         }
         data = await self._request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
-        if data.get("code") != 0:
-            log.error("Error colocando %s para %s: %s", order_type, symbol, data)
-            if _retry < 1:
-                log.info("Reintentando colocar %s para %s (1 solo reintento)", order_type, symbol)
-                return await self._place_stop(symbol, position_side, order_type, stop_price, quantity, _retry=1)
-        return data
+        if data.get("code") == 0:
+            return data
 
+        log.error("Error colocando %s para %s (qty=%s): %s", order_type, symbol, qty, data)
+        if _retry < 1:
+            # Reintento con la cantidad REAL refrescada — cubre carrera de
+            # asentamiento y cualquier diferencia entre lo pedido y lo llenado.
+            await asyncio.sleep(0.8)
+            real = await self._get_real_position_amt(symbol, position_side)
+            log.info("Reintentando colocar %s para %s (1 solo reintento, qty real=%s)",
+                      order_type, symbol, real)
+            return await self._place_stop(symbol, position_side, order_type, stop_price,
+                                           real if real else qty, _retry=1)
+        return data
     async def get_recent_trades(self, symbol, limit=1000):
         """
         Trades públicos recientes (se agregan client-side en order_flow.py).
