@@ -64,6 +64,38 @@ class RiskManager:
             return False, "max_concurrent_risk_reached"
         return True, "ok"
 
+    def snapshot(self):
+        """Estado serializable para state_store — contraparte de restore()."""
+        return {
+            "daily_pnl": self.daily_pnl,
+            "daily_start_balance": self.daily_start_balance,
+            "current_day": self.current_day.isoformat(),
+            "open_risk_pct": self.open_risk_pct,
+        }
+
+    def restore(self, snap):
+        """Restaura estado tras un redeploy. open_risk_pct se restaura
+        SIEMPRE (las posiciones abiertas sobreviven al redeploy); los
+        contadores diarios solo si el snapshot es de HOY — un snapshot de
+        ayer no debe revivir el circuit breaker de ayer."""
+        if not snap:
+            return
+        self.open_risk_pct = float(snap.get("open_risk_pct", 0.0))
+        try:
+            day = datetime.date.fromisoformat(snap.get("current_day", ""))
+        except (ValueError, TypeError):
+            return
+        if day != datetime.date.today():
+            log.info("Snapshot de riesgo de otro día (%s) — solo se restaura open_risk_pct=%.2f%%",
+                      day, self.open_risk_pct)
+            return
+        self.current_day = day
+        self.daily_pnl = float(snap.get("daily_pnl", 0.0))
+        dsb = snap.get("daily_start_balance")
+        self.daily_start_balance = float(dsb) if dsb is not None else None
+        log.info("Estado de riesgo restaurado: daily_pnl=%.4f open_risk=%.2f%%",
+                  self.daily_pnl, self.open_risk_pct)
+
     def register_open_risk(self, risk_pct):
         self.open_risk_pct += risk_pct
 
