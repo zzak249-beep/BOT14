@@ -211,6 +211,22 @@ RISK_PCT_PER_TRADE = _f("RISK_PCT_PER_TRADE", 0.5)   # % del balance por operaci
 # como min_notional_riesgo_excesivo). 0 = desactivado.
 MIN_NOTIONAL_USDT = _f("MIN_NOTIONAL_USDT", 10.0)
 MIN_NOTIONAL_MAX_RISK_PCT = _f("MIN_NOTIONAL_MAX_RISK_PCT", 1.5)
+
+# ── Distancia mínima del SL ──────────────────────────────────────────────
+# Confirmado en real (noche 2026-07-10, 8/8 pérdidas): los SL estructurales
+# de 3m quedan dentro del ruido (GUN saltó con -0.24%, AAVE duró 19s), y el
+# sizing por riesgo hace que SL cerca = notional enorme = comisiones hasta
+# 26% del riesgo. Si el SL estructural queda a menos de este % del entry,
+# se ensancha hasta el mínimo y el TP se recalcula al RR configurado. El
+# riesgo USDT no cambia (baja la cantidad); el stop sale del ruido.
+MIN_SL_DIST_PCT = _f("MIN_SL_DIST_PCT", 1.0)
+
+# ── Freno por racha de pérdidas ──────────────────────────────────────────
+# 8 pérdidas consecutivas en ~6h (misma noche) = chop que el regime filter
+# de 1h no detecta. Tras N pérdidas seguidas se pausan entradas nuevas por
+# X minutos (las posiciones abiertas y sus SL/TP no se tocan).
+MAX_CONSECUTIVE_LOSSES = _i("MAX_CONSECUTIVE_LOSSES", 4)
+LOSS_STREAK_PAUSE_MIN = _i("LOSS_STREAK_PAUSE_MIN", 120)
 LEVERAGE = _i("LEVERAGE", 10)
 DAILY_MAX_LOSS_PCT = _f("DAILY_MAX_LOSS_PCT", 5.0)   # circuit breaker diario
 MAX_CONCURRENT_RISK_PCT = _f("MAX_CONCURRENT_RISK_PCT", 3.0)  # riesgo total abierto
