@@ -34,7 +34,7 @@ from state_store import StateStore
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-09-rr2-min-notional"
+CODE_VERSION = "2026-07-10-slfloor-streak"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -88,6 +88,27 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
     entry = sig["entry_price"]
     sl = sig["sl_price"]
     tp = sig["tp_price"]
+
+    # ── Piso de distancia del SL: sacar el stop del ruido de 3m ─────────
+    # (confirmado en real: stops estructurales a <0.4% saltaban en segundos
+    # y el notional inflado por el sizing hacía que la comisión fuera hasta
+    # el 26% del riesgo). Se ensancha el SL al mínimo y el TP se recalcula
+    # al RR del motor — el riesgo USDT es el mismo, con menos cantidad.
+    min_sl_pct = getattr(config, "MIN_SL_DIST_PCT", 0.0)
+    if min_sl_pct > 0 and entry > 0:
+        dist_pct = abs(entry - sl) / entry * 100
+        if dist_pct < min_sl_pct:
+            rr = (getattr(config, "UNICORN_RR", 2.0) if sig.get("engine") == "unicorn"
+                  else getattr(config, "OB_RR", 2.0))
+            if sig["signal"] == "LONG":
+                sl = entry * (1 - min_sl_pct / 100)
+                tp = entry + rr * (entry - sl)
+            else:
+                sl = entry * (1 + min_sl_pct / 100)
+                tp = entry - rr * (sl - entry)
+            log.info("[%s] SL ensanchado: %.3f%% -> %.2f%% del entry (fuera del ruido), TP recalculado a %.1fR",
+                      symbol, dist_pct, min_sl_pct, rr)
+            sig["sl_widened"] = True
     setup_key = sig.get("setup_key", "unknown")
 
     # Todo lo de acá abajo (chequeo de riesgo -> apertura -> registro) queda
