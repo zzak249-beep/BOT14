@@ -227,6 +227,16 @@ MIN_SL_DIST_PCT = _f("MIN_SL_DIST_PCT", 1.0)
 # X minutos (las posiciones abiertas y sus SL/TP no se tocan).
 MAX_CONSECUTIVE_LOSSES = _i("MAX_CONSECUTIVE_LOSSES", 4)
 LOSS_STREAK_PAUSE_MIN = _i("LOSS_STREAK_PAUSE_MIN", 120)
+
+# ── Posiciones adoptadas y contadores de riesgo ──────────────────────────
+# Confirmado en real (2026-07-10): un trade MANUAL (LDO, -17.42) quedó
+# adoptado al reiniciar el bot y su cierre activó el circuit breaker diario
+# (-12%), frenando al bot por un error que no era suyo. Con False (default),
+# el PnL de posiciones adoptadas se registra en el journal pero NO alimenta
+# el breaker diario ni la racha de pérdidas. OJO: si NO tenés Volume en
+# /data, las posiciones PROPIAS del bot se vuelven "adoptadas" tras cada
+# redeploy y quedarían excluidas — montá el Volume primero.
+ADOPTED_COUNTS_IN_RISK = _b("ADOPTED_COUNTS_IN_RISK", False)
 LEVERAGE = _i("LEVERAGE", 10)
 DAILY_MAX_LOSS_PCT = _f("DAILY_MAX_LOSS_PCT", 5.0)   # circuit breaker diario
 MAX_CONCURRENT_RISK_PCT = _f("MAX_CONCURRENT_RISK_PCT", 3.0)  # riesgo total abierto
