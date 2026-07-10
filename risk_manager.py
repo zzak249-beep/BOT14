@@ -4,6 +4,7 @@ límite de riesgo concurrente total.
 """
 import datetime
 import logging
+import time
 
 log = logging.getLogger("risk_manager")
 
@@ -15,6 +16,8 @@ class RiskManager:
         self.daily_start_balance = None
         self.current_day = datetime.date.today()
         self.open_risk_pct = 0.0  # suma del % de riesgo de posiciones abiertas
+        self.consecutive_losses = 0
+        self.paused_until = 0.0  # epoch: freno por racha de pérdidas
 
     def _reset_if_new_day(self, balance):
         today = datetime.date.today()
@@ -27,6 +30,19 @@ class RiskManager:
     def register_realized_pnl(self, pnl_usdt, balance):
         self._reset_if_new_day(balance)
         self.daily_pnl += pnl_usdt
+        # Racha de pérdidas: N seguidas -> pausa temporal de entradas nuevas
+        if pnl_usdt < 0:
+            self.consecutive_losses += 1
+            max_losses = getattr(self.config, "MAX_CONSECUTIVE_LOSSES", 0)
+            if max_losses > 0 and self.consecutive_losses >= max_losses:
+                pause_min = getattr(self.config, "LOSS_STREAK_PAUSE_MIN", 120)
+                self.paused_until = time.time() + pause_min * 60
+                log.warning(
+                    "Racha de %d pérdidas consecutivas — pausa de entradas nuevas por %d min",
+                    self.consecutive_losses, pause_min)
+                self.consecutive_losses = 0
+        elif pnl_usdt > 0:
+            self.consecutive_losses = 0
 
     def daily_loss_breached(self, balance):
         self._reset_if_new_day(balance)
@@ -58,6 +74,9 @@ class RiskManager:
     def can_open_new_position(self, balance, open_positions_count, new_risk_pct):
         if self.daily_loss_breached(balance):
             return False, "daily_loss_breached"
+        if time.time() < self.paused_until:
+            remaining = int((self.paused_until - time.time()) / 60)
+            return False, f"loss_streak_pause ({remaining} min restantes)"
         if open_positions_count >= self.config.MAX_ACTIVE_POSITIONS:
             return False, "max_active_positions_reached"
         if self.open_risk_pct + new_risk_pct > self.config.MAX_CONCURRENT_RISK_PCT:
@@ -71,6 +90,8 @@ class RiskManager:
             "daily_start_balance": self.daily_start_balance,
             "current_day": self.current_day.isoformat(),
             "open_risk_pct": self.open_risk_pct,
+            "consecutive_losses": self.consecutive_losses,
+            "paused_until": self.paused_until,
         }
 
     def restore(self, snap):
@@ -81,6 +102,8 @@ class RiskManager:
         if not snap:
             return
         self.open_risk_pct = float(snap.get("open_risk_pct", 0.0))
+        self.consecutive_losses = int(snap.get("consecutive_losses", 0))
+        self.paused_until = float(snap.get("paused_until", 0.0))
         try:
             day = datetime.date.fromisoformat(snap.get("current_day", ""))
         except (ValueError, TypeError):
