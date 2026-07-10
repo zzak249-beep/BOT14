@@ -1,303 +1,133 @@
 """
-PositionManager — renewed-love (LONG + SHORT, Unicorn Model).
-
-Fixes vs previous version:
-  1. entry_time persisted via state.py (survives Railway restart)
-  2. Trail stop persisted via state.py (survives restart)
-  3. TP1 flag persisted → TRAIL_DISTANCE_ATR_POST_TP1 tighter trail after TP1
-  4. cancel_all_open_orders() BEFORE every TP/SL placement
-     → fixes EURUSD 24-orders accumulation bug
-  5. Notional check after rounding → skip if < MIN_NOTIONAL_USDT * 0.9
-  6. Score-based tier sizing (STD / FUEL / SUP)
-  7. place_tp_sl(): sl_price/tp1_price y el lado de la orden TP1
-     estaban hardcodeados para SHORT únicamente ("SHORT SL above
-     entry" se aplicaba también a LONG). Un LONG real habría recibido
-     SL por encima de entrada (lado equivocado) y una orden TP1 BUY
-     (suma a la posición en vez de cerrarla). Ahora ambos son
-     side-aware. TP1 también manda reduceOnly=true.
+Position Monitor — detecta cierres de posiciones y retroalimenta el sistema
+================================================================================
+Sondea periódicamente las posiciones abiertas en BingX. Cuando detecta que
+una posición que estaba abierta ya no lo está, la considera cerrada, obtiene
+el PnL realizado y:
+  1. Registra el resultado en el journal
+  2. Actualiza el circuit breaker diario (risk_manager)
+  3. Actualiza la memoria estadística del setup (setup_memory)
+  4. Libera la exposición correlacionada (correlation_manager)
+  5. Libera el riesgo abierto reservado (risk_manager)
 """
-
 import logging
-import math
+import time
 
-import config
-import state
-from bingx_client import BingXClient
-
-log = logging.getLogger("pos_mgr")
+log = logging.getLogger("position_monitor")
 
 
-# ── Expose trail functions from strategy module ────────────────
-
-def update_trailing_stop(side, price, atr, mult, current):
-    if side == "SHORT":
-        candidate = price + atr * mult
-        return candidate if current is None else min(current, candidate)
-    else:
-        candidate = price - atr * mult
-        return candidate if current is None else max(current, candidate)
-
-
-def trail_stop_hit(side, price, stop):
-    if stop is None:
-        return False
-    return price >= stop if side == "SHORT" else price <= stop
-
-
-# ─────────────────────────────────────────────────────────────
-
-class PositionManager:
-    def __init__(self, client: BingXClient):
+class PositionMonitor:
+    def __init__(self, client, journal, risk_mgr, setup_memory, corr_mgr, recently_closed=None):
         self.client = client
+        self.journal = journal
+        self.risk_mgr = risk_mgr
+        self.setup_memory = setup_memory
+        self.corr_mgr = corr_mgr
+        # symbol -> metadata registrada al abrir (setup_key, risk_pct, etc.)
+        self.tracked = {}
+        # symbol -> timestamp_ms del último CIERRE. Compartido con
+        # execute_signal para el cooldown post-cierre: se observó en real
+        # (UNI-USDT) que el bot cerraba una posición y reabría la misma
+        # moneda 1 minuto después, 3 veces en el día — el dedup de apertura
+        # no cubre este caso porque la posición anterior ya no existe.
+        self.recently_closed = recently_closed if recently_closed is not None else {}
 
-    # ── Symbol info ───────────────────────────────────────────
+    def register_open(self, symbol, setup_key, risk_pct, opened_at_ms, side=None,
+                       sl_price=None, tp_price=None, sl_placed=True, tp_placed=True):
+        self.tracked[symbol] = {"setup_key": setup_key, "risk_pct": risk_pct,
+                                "opened_at_ms": opened_at_ms, "side": side,
+                                "sl_price": sl_price, "tp_price": tp_price,
+                                "needs_sl": not sl_placed, "needs_tp": not tp_placed}
 
-    def _sym_info(self, symbol: str) -> dict:
+    async def check_closures(self, balance):
+        if not self.tracked:
+            return
+
+        open_positions = await self.client.get_open_positions()
+        open_symbols = {p["symbol"] for p in open_positions}
+
+        closed_symbols = [s for s in self.tracked if s not in open_symbols]
+        for symbol in closed_symbols:
+            meta = self.tracked.pop(symbol)
+            await self._handle_closure(symbol, meta, balance)
+
+        # AUTO-REPARACIÓN de SL/TP: si una posición quedó abierta con el SL
+        # o el TP sin colocar, reintentarlos en cada ciclo hasta que entren —
+        # antes solo se logueaba el 🚨 y la posición quedaba desprotegida
+        # esperando intervención manual. El SL va primero: es la protección;
+        # el TP es la toma de ganancia, importante pero no crítico.
+        for symbol, meta in self.tracked.items():
+            if symbol not in open_symbols:
+                continue
+            if meta.get("needs_sl") and meta.get("sl_price"):
+                try:
+                    result = await self.client._place_stop(
+                        symbol, meta.get("side") or "LONG", "STOP_MARKET",
+                        meta["sl_price"], None)
+                    if result.get("code") == 0:
+                        meta["needs_sl"] = False
+                        log.info("✅ [%s] SL auto-reparado: colocado en %s tras fallo inicial",
+                                  symbol, meta["sl_price"])
+                    else:
+                        log.warning("🚨 [%s] Auto-reparación de SL sigue fallando: %s — se reintenta el próximo ciclo",
+                                     symbol, result)
+                except Exception as e:
+                    log.warning("🚨 [%s] Auto-reparación de SL falló con excepción: %s", symbol, e)
+            if meta.get("needs_tp") and meta.get("tp_price"):
+                try:
+                    result = await self.client._place_stop(
+                        symbol, meta.get("side") or "LONG", "TAKE_PROFIT_MARKET",
+                        meta["tp_price"], None)
+                    if result.get("code") == 0:
+                        meta["needs_tp"] = False
+                        log.info("✅ [%s] TP auto-reparado: colocado en %s tras fallo inicial",
+                                  symbol, meta["tp_price"])
+                    else:
+                        log.warning("[%s] Auto-reparación de TP sigue fallando: %s — se reintenta el próximo ciclo",
+                                     symbol, result)
+                except Exception as e:
+                    log.warning("[%s] Auto-reparación de TP falló con excepción: %s", symbol, e)
+
+    async def _handle_closure(self, symbol, meta, balance):
+        # FIX: income_history traía las últimas 5 entradas del símbolo sin
+        # filtrar por fecha — si el bot ya había operado ese símbolo antes,
+        # PnL de trades viejos se sumaba al del trade que se acaba de cerrar.
+        # Ahora solo cuenta lo posterior a opened_at_ms.
         try:
-            return self.client.get_symbol_info(symbol)
-        except Exception:
-            return {}
+            income = await self.client.get_income_history(symbol, limit=10)
+        except Exception as e:
+            log.warning("[%s] No se pudo obtener income history al cerrar: %s", symbol, e)
+            income = []
 
-    def _round_qty(self, symbol: str, qty: float) -> float:
-        info   = self._sym_info(symbol)
-        scale  = int(info.get("quantityScale", 3))
-        factor = 10 ** scale
-        return math.floor(qty * factor) / factor
+        opened_at_ms = meta.get("opened_at_ms", 0)
+        income_this_trade = [i for i in income if i.get("time", 0) >= opened_at_ms]
+        if len(income) > len(income_this_trade):
+            log.debug("[%s] %d entradas de income descartadas por ser anteriores a la apertura",
+                      symbol, len(income) - len(income_this_trade))
 
-    def _min_qty(self, symbol: str) -> float:
-        info = self._sym_info(symbol)
-        return float(info.get("tradeMinQuantity", 0.001))
+        pnl = sum(i["income"] for i in income_this_trade) if income_this_trade else 0.0
+        is_win = pnl > 0
 
-    # ── Position sizing ───────────────────────────────────────
-
-    def calc_qty(self, symbol: str, mark_price: float,
-                 atr: float, equity: float, score: int = 0) -> float | None:
-        """
-        Risk-based sizing with score-tier multiplier.
-        Returns None → caller should skip this symbol.
-
-        FIX: checks actual notional AFTER rounding.
-        Coins with very low prices get lot-size rounded below MIN_NOTIONAL.
-        """
-        if mark_price <= 0 or atr <= 0:
-            return None
-
-        risk_usdt = equity * (config.RISK_PCT / 100.0)
-        sl_usdt   = atr * config.SL_ATR_MULT
-        qty       = risk_usdt / sl_usdt
-
-        # Score-based tier multiplier
-        if score >= config.SUP_SCORE:
-            qty *= 1.5
-        elif score >= config.FUEL_SCORE:
-            qty *= 1.0
+        # Posiciones ADOPTADAS (manuales/preexistentes): su PnL se journalea
+        # pero no alimenta breaker/racha ni la memoria de setups — un error
+        # manual no debe frenar al bot (caso LDO -17.42, 2026-07-10).
+        is_adopted = str(meta.get("setup_key", "")).startswith("adopted")
+        counts_in_risk = (not is_adopted) or getattr(
+            self.risk_mgr.config, "ADOPTED_COUNTS_IN_RISK", False)
+        if counts_in_risk:
+            self.risk_mgr.register_realized_pnl(pnl, balance)
         else:
-            qty *= 0.7
+            log.info("[%s] Cierre ADOPTADO (PnL=%.4f) — excluido del circuit breaker y la racha",
+                      symbol, pnl)
+        self.risk_mgr.release_open_risk(meta["risk_pct"])
+        self.corr_mgr.register_close(symbol)
+        if not is_adopted:
+            self.setup_memory.record_outcome(meta["setup_key"], is_win)
 
-        # Notional cap
-        if mark_price > 0:
-            qty = min(qty, config.MAX_NOTIONAL_USDT / mark_price)
-
-        # Round to symbol precision
-        qty = self._round_qty(symbol, qty)
-        qty = max(qty, self._min_qty(symbol))
-
-        # FIX: reject if actual notional is below minimum after rounding
-        actual = qty * mark_price
-        if actual < config.MIN_NOTIONAL_USDT * 0.90:
-            log.warning(f"SKIP {symbol}: notional {actual:.2f} < min {config.MIN_NOTIONAL_USDT}")
-            return None
-
-        return qty
-
-    # ── Position queries ──────────────────────────────────────
-
-    def get_position(self, symbol: str, side: str) -> dict | None:
-        for p in self.client.get_positions(symbol):
-            if p["positionSide"] == side:
-                return p
-        return None
-
-    def has_position(self, symbol: str, side: str = None) -> bool:
-        return self.get_position(symbol, side or "SHORT") is not None
-
-    # ── Max hold ──────────────────────────────────────────────
-
-    def is_max_hold_expired(self, symbol: str, side: str) -> bool:
-        """
-        FIX: reads entry_time from disk (state.py).
-        Previously wiped on every Railway redeploy → positions held 20-26h.
-        """
-        return state.is_max_hold_expired(symbol, side, config.MAX_HOLD_MINUTES)
-
-    # ── Entries ───────────────────────────────────────────────
-
-    def open_short(self, symbol: str, qty: float, atr: float) -> bool:
-        try:
-            self.client.set_leverage(symbol, config.LEVERAGE)
-            self.client.place_market_order(symbol, "SELL", "SHORT", qty)
-            state.save_entry(symbol, "SHORT")
-            state.set_tp1_hit(symbol, "SHORT", False)
-            state.set_be_moved(symbol, "SHORT", False)
-            mark = self.client.get_mark_price(symbol)
-            init_stop = mark + atr * config.TRAIL_DISTANCE_ATR
-            state.save_trail(symbol, "SHORT", init_stop)
-            log.info(f"OPEN SHORT {symbol}  qty={qty}  stop={init_stop:.6g}")
-            return True
-        except Exception as e:
-            log.error(f"open_short {symbol}: {e}")
-            return False
-
-    def open_long(self, symbol: str, qty: float, atr: float) -> bool:
-        try:
-            self.client.set_leverage(symbol, config.LEVERAGE)
-            self.client.place_market_order(symbol, "BUY", "LONG", qty)
-            state.save_entry(symbol, "LONG")
-            state.set_tp1_hit(symbol, "LONG", False)
-            state.set_be_moved(symbol, "LONG", False)
-            mark = self.client.get_mark_price(symbol)
-            init_stop = mark - atr * config.TRAIL_DISTANCE_ATR
-            state.save_trail(symbol, "LONG", init_stop)
-            log.info(f"OPEN LONG  {symbol}  qty={qty}  stop={init_stop:.6g}")
-            return True
-        except Exception as e:
-            log.error(f"open_long {symbol}: {e}")
-            return False
-
-    # ── Exits ─────────────────────────────────────────────────
-
-    def close_long(self, symbol: str, qty: float, reason: str = "") -> bool:
-        try:
-            self.client.cancel_all_open_orders(symbol)
-            self.client.close_position(symbol, "LONG", qty)
-            state.clear(symbol, "LONG")
-            log.info(f"CLOSE LONG  {symbol}  qty={qty}  [{reason}]")
-            return True
-        except Exception as e:
-            log.error(f"close_long {symbol}: {e}")
-            return False
-
-    def close_short(self, symbol: str, qty: float, reason: str = "") -> bool:
-        try:
-            self.client.cancel_all_open_orders(symbol)   # FIX: cancel first
-            self.client.close_position(symbol, "SHORT", qty)
-            state.clear(symbol, "SHORT")
-            log.info(f"CLOSE SHORT {symbol}  qty={qty}  [{reason}]")
-            return True
-        except Exception as e:
-            log.error(f"close_short {symbol}: {e}")
-            return False
-
-    # ── Trail stop ────────────────────────────────────────────
-
-    def tick_trail(self, symbol: str, side: str,
-                   price: float, atr: float) -> tuple:
-        """
-        FIX post-TP1: uses TRAIL_DISTANCE_ATR_POST_TP1 (tighter) after TP1 hit.
-        Previously trail stayed at original width → gave back large profits.
-        Returns (new_stop: float, is_hit: bool).
-        """
-        tp1_done = state.is_tp1_hit(symbol, side)
-        mult     = (config.TRAIL_DISTANCE_ATR_POST_TP1
-                    if tp1_done else config.TRAIL_DISTANCE_ATR)
-        current  = state.get_trail(symbol, side)
-
-        if side == "SHORT":
-            candidate = price + atr * mult
-            new_stop  = candidate if current is None else min(current, candidate)
-            hit       = price >= new_stop
-        else:
-            candidate = price - atr * mult
-            new_stop  = candidate if current is None else max(current, candidate)
-            hit       = price <= new_stop
-
-        state.save_trail(symbol, side, new_stop)
-        return new_stop, hit
-
-    # ── TP / Breakeven ─────────────────────────────────────────
-
-    def should_take_tp1(self, symbol: str, side: str,
-                         price: float, entry: float, atr: float) -> bool:
-        if state.is_tp1_hit(symbol, side):
-            return False
-        dist = config.TP1_ATR_MULT * atr
-        return price <= entry - dist if side == "SHORT" else price >= entry + dist
-
-    def should_take_tp2(self, symbol: str, side: str,
-                         price: float, entry: float, atr: float) -> bool:
-        dist = config.TP2_ATR_MULT * atr
-        return price <= entry - dist if side == "SHORT" else price >= entry + dist
-
-    def should_move_breakeven(self, symbol: str, side: str,
-                               price: float, entry: float, atr: float) -> bool:
-        if state.is_be_moved(symbol, side):
-            return False
-        dist = config.BREAKEVEN_ATR_MULT * atr
-        return price <= entry - dist if side == "SHORT" else price >= entry + dist
-
-    def mark_tp1_hit(self, symbol: str, side: str):
-        state.set_tp1_hit(symbol, side, True)
-        log.info(f"TP1 hit {symbol} {side} → trail → {config.TRAIL_DISTANCE_ATR_POST_TP1}×ATR")
-
-    def mark_be_moved(self, symbol: str, side: str):
-        state.set_be_moved(symbol, side, True)
-
-    # ── TP/SL placement ────────────────────────────────────────
-
-    def place_tp_sl(self, symbol: str, side: str,
-                    entry_price: float, qty: float, atr: float):
-        """
-        FIX: cancel ALL orders BEFORE placing → eliminates accumulation bug.
-        Places: 1 SL stop-market + 1 TP1 limit order.
-
-        FIX 7: sl_price/tp1_price y el lado de la orden TP1 son ahora
-        side-aware. Antes estaban hardcodeados para SHORT, así que un
-        LONG habría recibido SL por encima de entrada y TP1 como BUY.
-        """
-        try:
-            self.client.cancel_all_open_orders(symbol)
-        except Exception as e:
-            log.warning(f"cancel_all {symbol}: {e}")
-
-        if side == "SHORT":
-            sl_price       = entry_price + atr * config.SL_ATR_MULT   # SL above entry
-            tp1_price      = entry_price - atr * config.TP1_ATR_MULT  # TP1 below entry
-            tp1_order_side = "BUY"                                    # cierra SHORT
-        else:  # LONG
-            sl_price       = entry_price - atr * config.SL_ATR_MULT   # SL below entry
-            tp1_price      = entry_price + atr * config.TP1_ATR_MULT  # TP1 above entry
-            tp1_order_side = "SELL"                                   # cierra LONG
-
-        tp_qty = self._round_qty(symbol, qty * 0.5)
-
-        # DEBUG temporal: margen disponible justo antes del intento de SL,
-        # para contrastar contra el "available amount" que reporta BingX
-        # en el error 110424 — confirmar si es agotamiento real de margen
-        # o algo distinto, antes de tocar la lógica de apertura.
-        try:
-            avail = self.client.get_available_margin()
-            log.info(f"place_tp_sl {symbol}: margen disponible={avail:.2f} USDT antes de SL")
-        except Exception as e:
-            log.warning(f"get_available_margin {symbol}: {e}")
-
-        try:
-            self.client.place_stop_market(symbol, side, sl_price, qty)
-        except Exception as e:
-            log.error(f"place_sl {symbol}: {e}")
-
-        if tp_qty >= self._min_qty(symbol):
-            try:
-                self.client.place_limit_order(symbol, tp1_order_side, side,
-                                              tp1_price, tp_qty)   # reduce_only ya no se usa
-            except Exception as e:
-                log.error(f"place_tp1 {symbol}: {e}")
-
-    def move_sl_to_breakeven(self, symbol: str, side: str,
-                              entry_price: float, qty: float):
-        try:
-            self.client.cancel_all_open_orders(symbol)
-            self.client.place_stop_market(symbol, side, entry_price, qty)
-            self.mark_be_moved(symbol, side)
-            log.info(f"BE moved {symbol} {side} @ {entry_price:.6g}")
-        except Exception as e:
-            log.error(f"move_be {symbol}: {e}")
+        self.recently_closed[symbol] = int(time.time() * 1000)
+        self.journal.record({
+            "symbol": symbol, "event": "position_closed", "side": meta.get("side"),
+            "pnl": pnl, "is_win": is_win, "setup_key": meta["setup_key"],
+        })
+        log.info("[%s] Posición cerrada | PnL=%.4f | %s | setup=%s",
+                  symbol, pnl, "WIN" if is_win else "LOSS", meta["setup_key"])
