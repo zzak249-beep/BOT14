@@ -31,6 +31,7 @@ from cvd_filter import confirms_direction as cvd_confirms
 from rsi_filter import confirms_direction as rsi_confirms
 from vwap_filter import confirms_direction as vwap_confirms
 from regime_filter import is_trending_regime
+from jump_detector import confirms_direction as jump_confirms
 
 log = logging.getLogger("combined_engine")
 
@@ -74,6 +75,21 @@ def _check_vwap(symbol, direction, candles_entry, config):
     return bool(vwap_info["confirms"]), vwap_info
 
 
+def _check_jump(symbol, direction, candles_entry, config):
+    """Mismo patrón que _check_cvd. En modo 'log' (default) NUNCA bloquea:
+    solo anota jump_recent/chase en la señal para que el journal acumule
+    evidencia antes de activar 'block' (mismo rollout que ⚠struct)."""
+    mode = str(getattr(config, "JUMP_GUARD_MODE", "log")).lower()
+    if mode == "off":
+        return True, {"skipped": True}
+    jump_info = jump_confirms(candles_entry, direction, config)
+    if jump_info["confirms"] is None:
+        return True, jump_info  # modo log o sin datos -> no bloquea
+    if not jump_info["confirms"]:
+        log.info("[%s] %s descartado por JUMP: %s", symbol, direction, jump_info["reason"])
+    return bool(jump_info["confirms"]), jump_info
+
+
 def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                      config, candles_15m=None, candles_30m=None, candles_ob=None):
     """
@@ -87,7 +103,7 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
     out = {
         "symbol": symbol, "signal": None, "reason": None,
         "supertrend": None, "unicorn": None, "order_block": None,
-        "regime": None, "engine": None, "cvd": None, "rsi": None, "vwap": None,
+        "regime": None, "engine": None, "cvd": None, "rsi": None, "vwap": None, "jump": None,
     }
 
     if getattr(config, "ENABLE_REGIME_FILTER", True):
@@ -117,7 +133,9 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
             out["rsi"] = rsi_info
             vwap_ok, vwap_info = _check_vwap(symbol, uni["signal"], candles_entry, config)
             out["vwap"] = vwap_info
-            if cvd_ok and rsi_ok and vwap_ok:
+            jump_ok, jump_info = _check_jump(symbol, uni["signal"], candles_entry, config)
+            out["jump"] = jump_info
+            if cvd_ok and rsi_ok and vwap_ok and jump_ok:
                 out["signal"] = uni["signal"]
                 out["entry_price"] = uni["entry_price"]
                 out["sl_price"] = uni["sl_price"]
@@ -135,8 +153,8 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                     uni["tp_price"], uni["has_fvg"], uni["htf"],
                 )
                 return out
-            rejected_by = "cvd" if not cvd_ok else "rsi" if not rsi_ok else "vwap"
-            rejected_reason = (cvd_info if not cvd_ok else rsi_info if not rsi_ok else vwap_info).get("reason")
+            rejected_by = "cvd" if not cvd_ok else "rsi" if not rsi_ok else "vwap" if not vwap_ok else "jump" if not vwap_ok else "jump"
+            rejected_reason = (cvd_info if not cvd_ok else rsi_info if not rsi_ok else vwap_info if not vwap_ok else jump_info).get("reason")
             out["reason"] = f"{rejected_by}_rejected_unicorn: {rejected_reason}"
         else:
             out["reason"] = (
@@ -158,7 +176,9 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                 out["rsi"] = rsi_info
                 vwap_ok, vwap_info = _check_vwap(symbol, ob["signal"], candles_entry, config)
                 out["vwap"] = vwap_info
-                if cvd_ok and rsi_ok and vwap_ok:
+                jump_ok, jump_info = _check_jump(symbol, ob["signal"], candles_entry, config)
+                out["jump"] = jump_info
+                if cvd_ok and rsi_ok and vwap_ok and jump_ok:
                     out["signal"] = ob["signal"]
                     out["entry_price"] = ob["entry_price"]
                     out["sl_price"] = ob["sl_price"]
@@ -174,8 +194,8 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                         ob["tp_price"], ob["reason"],
                     )
                     return out
-                rejected_by = "cvd" if not cvd_ok else "rsi" if not rsi_ok else "vwap"
-                rejected_reason = (cvd_info if not cvd_ok else rsi_info if not rsi_ok else vwap_info).get("reason")
+                rejected_by = "cvd" if not cvd_ok else "rsi" if not rsi_ok else "vwap" if not vwap_ok else "jump"
+                rejected_reason = (cvd_info if not cvd_ok else rsi_info if not rsi_ok else vwap_info if not vwap_ok else jump_info).get("reason")
                 out["reason"] = f"{rejected_by}_rejected_order_block: {rejected_reason}"
 
     if out["reason"] is None:
