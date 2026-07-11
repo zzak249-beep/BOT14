@@ -237,6 +237,19 @@ LOSS_STREAK_PAUSE_MIN = _i("LOSS_STREAK_PAUSE_MIN", 120)
 # /data, las posiciones PROPIAS del bot se vuelven "adoptadas" tras cada
 # redeploy y quedarían excluidas — montá el Volume primero.
 ADOPTED_COUNTS_IN_RISK = _b("ADOPTED_COUNTS_IN_RISK", False)
+
+# ── Guard de saltos (Lee-Mykland / Bipower Variation) ────────────────────
+# Detecta velas de SALTO estadístico en el ENTRY_TF (mismo módulo fusionado
+# al superscript). Anti-chase: si hubo un salto a favor de la señal en las
+# últimas velas, la entrada persigue la detonación (slippage máximo, caso
+# UAI). Un salto EN CONTRA es el sweep -> no bloquea nunca.
+# Modos: "off" | "log" (default: anota en journal, NUNCA bloquea — período
+# de observación) | "block" (rechaza chases). Activar "block" recién cuando
+# el journal muestre que los trades marcados con chase pierden más.
+JUMP_GUARD_MODE = os.getenv("JUMP_GUARD_MODE", "log").strip().lower()
+JUMP_THRESH = _f("JUMP_THRESH", 4.0)
+JUMP_WIN = _i("JUMP_WIN", 50)
+JUMP_COOLDOWN_BARS = _i("JUMP_COOLDOWN_BARS", 2)
 LEVERAGE = _i("LEVERAGE", 10)
 DAILY_MAX_LOSS_PCT = _f("DAILY_MAX_LOSS_PCT", 5.0)   # circuit breaker diario
 MAX_CONCURRENT_RISK_PCT = _f("MAX_CONCURRENT_RISK_PCT", 3.0)  # riesgo total abierto
