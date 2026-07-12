@@ -51,8 +51,12 @@ SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 420)    # 45s (default viejo) era ir
                                                      # klines c/u ≈ 3470 requests/ciclo, y con el
                                                      # espaciado de exchange_client.py (~8 req/s)
                                                      # un ciclo completo tarda ~7 min de por sí
-MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 3_000_000)  # filtra símbolos ilíquidos (solo si SCAN_ALL_SYMBOLS=False)
-SCAN_ALL_SYMBOLS = _b("SCAN_ALL_SYMBOLS", True)  # True = ignora MIN_24H_VOLUME_USDT, escanea TODO BingX (menos no-cripto)
+MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 5_000_000)
+# ^ FIX 2026-07-12: piso de liquidez que ahora aplica SIEMPRE (antes
+# SCAN_ALL_SYMBOLS=True lo anulaba). 5M USDT/24h es el mínimo donde un stop
+# a mercado de ~150 USDT de notional no se come 3x el riesgo en slippage
+# (caso LAB -5.04 con riesgo previsto ~1.4). Subilo/bajalo por env var.  # filtra símbolos ilíquidos (solo si SCAN_ALL_SYMBOLS=False)
+SCAN_ALL_SYMBOLS = _b("SCAN_ALL_SYMBOLS", True)  # True = escanea todo el universo LÍQUIDO de BingX (el piso MIN_24H_VOLUME_USDT aplica SIEMPRE desde 2026-07-12)
 NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
     "XAU", "XAG", "US30", "US100", "US500", "GER40", "UK100", "JP225",
     "OIL", "WTI", "BRENT", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",

@@ -165,6 +165,8 @@ def _simulate(candles, config):
     n = len(candles)
     active_top = active_bot = active_buy_ratio = None
     active_ob_trend = 0
+    active_touches = 0      # Raschke (Holy Grail): el PRIMER pullback es el
+    was_touching = False    # de mejor calidad; cada toque consume la caja
     history = []
 
     for i in range(n):
@@ -184,6 +186,8 @@ def _simulate(candles, config):
                     active_top, active_bot = ob_top, ob_bot
                     active_buy_ratio = _pivot_volume_ratio(candles, pivot_idx, pivot_len)
                     active_ob_trend = 1
+                    active_touches = 0
+                    was_touching = False
 
             if trend_i == -1 and i in confirmed_hi:
                 pivot_idx = i - pivot_len
@@ -197,6 +201,8 @@ def _simulate(candles, config):
                     active_top, active_bot = ob_top, ob_bot
                     active_buy_ratio = _pivot_volume_ratio(candles, pivot_idx, pivot_len)
                     active_ob_trend = -1
+                    active_touches = 0
+                    was_touching = False
 
         if delete_on_break and active_top is not None:
             c = candles[i]
@@ -207,10 +213,20 @@ def _simulate(candles, config):
             if is_broken:
                 active_top = active_bot = active_buy_ratio = None
                 active_ob_trend = 0
+                active_touches = 0
+                was_touching = False
+
+        if active_top is not None:
+            c = candles[i]
+            touching_now = (c["low"] <= active_top) if active_ob_trend == 1 else (c["high"] >= active_bot)
+            if touching_now and not was_touching:
+                active_touches += 1
+            was_touching = touching_now
 
         history.append({
             "top": active_top, "bottom": active_bot,
             "buy_ratio": active_buy_ratio, "ob_trend": active_ob_trend,
+            "touches": active_touches if active_top is not None else 0,
         })
 
     return trend_arr, atr_arr, history, confirmed_lo, confirmed_hi
@@ -281,11 +297,13 @@ def get_signal(candles, config):
         out["active_ob"] = {
             "top": state["top"], "bottom": state["bottom"],
             "buy_ratio": state["buy_ratio"], "ob_trend": state["ob_trend"],
+            "touches": state.get("touches", 0),
         }
 
     buy_retest, sell_retest = _retest_at(
         idx, candles, trend_arr, history, confirmed_lo, confirmed_hi, config
     )
+    out["retest_count"] = history[idx].get("touches", 0)
 
     direction_cfg = getattr(config, "DIRECTION", "BOTH")
     rr = getattr(config, "OB_RR", 1.5)

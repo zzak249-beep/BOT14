@@ -34,7 +34,7 @@ from state_store import StateStore
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-11-jump-guard"
+CODE_VERSION = "2026-07-12-liquidity-floor"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -245,6 +245,8 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
             "supertrend": sig.get("supertrend"), "order_flow": sig.get("order_flow"),
             "funding_oi": sig.get("funding_oi"), "regime": sig.get("regime"),
             "order_block": sig.get("order_block"), "cvd": sig.get("cvd"), "obi": obi_info,
+            "jump": sig.get("jump"), "retest_count": sig.get("retest_count"),
+            "rsi": sig.get("rsi"), "vwap": sig.get("vwap"),
             "correlation_btc": corr, "result": result,
             "sl_placed": result.get("sl_placed"), "tp_placed": result.get("tp_placed"),
         })
@@ -399,6 +401,14 @@ async def main():
             len(config.BINGX_API_KEY), len(config.BINGX_API_SECRET),
         )
 
+        for _rr_name in ("UNICORN_RR", "OB_RR"):
+            _rr_val = getattr(config, _rr_name, 2.0)
+            if _rr_val < 2.0:
+                log.warning(
+                    "⚠️ %s=%.2f (< 2.0) — probablemente una env var vieja en Railway "
+                    "está pisando el default. A 1.5R el breakeven sube de 33%% a 40%% "
+                    "de win rate. Borrá la variable en Railway o ponela en 2.0.",
+                    _rr_name, _rr_val)
         log.info(
             "Bot iniciado | CODE_VERSION=%s | DRY_RUN=%s | BINGX_BASE_URL=%s (demo_mode=%s) | ENTRY_TF=%s | BIAS_TF=%s | OB_TF=%s | "
             "regime=%s corr=%s order_flow=%s funding_oi=%s setup_memory=%s "

@@ -108,10 +108,21 @@ class PositionMonitor:
         pnl = sum(i["income"] for i in income_this_trade) if income_this_trade else 0.0
         is_win = pnl > 0
 
-        self.risk_mgr.register_realized_pnl(pnl, balance)
+        # Posiciones ADOPTADAS (manuales/preexistentes): su PnL se journalea
+        # pero no alimenta breaker/racha ni la memoria de setups — un error
+        # manual no debe frenar al bot (caso LDO -17.42, 2026-07-10).
+        is_adopted = str(meta.get("setup_key", "")).startswith("adopted")
+        counts_in_risk = (not is_adopted) or getattr(
+            self.risk_mgr.config, "ADOPTED_COUNTS_IN_RISK", False)
+        if counts_in_risk:
+            self.risk_mgr.register_realized_pnl(pnl, balance)
+        else:
+            log.info("[%s] Cierre ADOPTADO (PnL=%.4f) — excluido del circuit breaker y la racha",
+                      symbol, pnl)
         self.risk_mgr.release_open_risk(meta["risk_pct"])
         self.corr_mgr.register_close(symbol)
-        self.setup_memory.record_outcome(meta["setup_key"], is_win)
+        if not is_adopted:
+            self.setup_memory.record_outcome(meta["setup_key"], is_win)
 
         self.recently_closed[symbol] = int(time.time() * 1000)
         self.journal.record({

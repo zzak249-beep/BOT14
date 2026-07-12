@@ -185,6 +185,7 @@ def evaluate_symbol(symbol, candles_entry, candles_bias, candles_1h,
                     out["tp_price"] = ob["tp_price"]
                     out["risk"] = ob["risk"]
                     out["active_ob"] = ob["active_ob"]
+                    out["retest_count"] = ob.get("retest_count")
                     out["setup_key"] = f"OB_ENGINE|{getattr(config, 'OB_TF', '15m')}|{ob['signal']}"
                     out["engine"] = "order_block"
                     out["reason"] = "confirmed: supertrend + order_block retest aligned"

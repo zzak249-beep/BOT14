@@ -35,7 +35,11 @@ async def get_symbol_universe(client, config):
     all_symbols = await client.get_all_symbols_with_volume()
     scan_all = getattr(config, "SCAN_ALL_SYMBOLS", True)
     require_usdt_quote = getattr(config, "REQUIRE_USDT_QUOTE", True)
-    min_vol = 0 if scan_all else config.MIN_24H_VOLUME_USDT
+    # FIX 2026-07-12: SCAN_ALL_SYMBOLS anulaba el piso de volumen (min_vol=0)
+    # y dejaba entrar pares ilíquidos donde el stop a mercado ejecuta con
+    # slippage brutal (LAB: SL al 1% ejecutó a -7.3% = 3.5x el riesgo).
+    # SCAN_ALL ahora significa "todo el universo LÍQUIDO", no "sin filtro".
+    min_vol = config.MIN_24H_VOLUME_USDT
     filtered = [
         s["symbol"] for s in all_symbols
         if s["volume_24h_usdt"] >= min_vol
