@@ -34,7 +34,7 @@ from state_store import StateStore
 # Fingerprint de versión — subilo cada vez que cambies algo importante.
 # Sirve para confirmar en el log de arranque que un redeploy realmente
 # trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
-CODE_VERSION = "2026-07-12-liquidity-floor"
+CODE_VERSION = "2026-07-18-paper-observer"
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -265,6 +265,7 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
             return {"symbol": symbol, "setup_key": setup_key, "risk_pct": risk_pct,
                     "opened_at_ms": int(time.time() * 1000), "side": side,
                     "sl_price": sl, "tp_price": tp,
+                    "entry": entry, "qty": qty, "engine": sig.get("engine"),
                     "sl_placed": result.get("sl_placed") is not False,
                     "tp_placed": result.get("tp_placed") is not False}
 
@@ -276,8 +277,19 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
                      recently_opened, recently_closed, state, tag="slow"):
     balance = await client.get_balance_usdt()
     if balance <= 0:
-        log.warning("[%s] Balance no disponible o cero, se omite ciclo", tag)
-        return
+        if config.DRY_RUN:
+            # Observacion sin fondos: balance simulado para sizing y journal.
+            if not getattr(run_cycle, "_warned_balance", False):
+                log.warning("[%s] Balance real invalido (%s) — DRY_RUN activo: "
+                            "sigo con balance simulado de %.2f USDT "
+                            "(DRY_RUN_BALANCE). Con fondos + DRY_RUN=False "
+                            "vuelve a real.", tag, balance,
+                            config.DRY_RUN_BALANCE)
+                run_cycle._warned_balance = True
+            balance = config.DRY_RUN_BALANCE
+        else:
+            log.warning("[%s] Balance no disponible o cero, se omite ciclo", tag)
+            return
 
     async with exec_lock:
         tracked_before = len(pos_monitor.tracked)
@@ -306,7 +318,10 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
                                           opened["risk_pct"], opened["opened_at_ms"], opened["side"],
                                           sl_price=opened.get("sl_price"), tp_price=opened.get("tp_price"),
                                           sl_placed=opened.get("sl_placed", True),
-                                          tp_placed=opened.get("tp_placed", True))
+                                          tp_placed=opened.get("tp_placed", True),
+                                          entry=opened.get("entry"),
+                                          qty=opened.get("qty"),
+                                          engine=opened.get("engine"))
                 _save_state(state, recently_opened, recently_closed, pos_monitor, risk_mgr, corr_mgr)
 
 

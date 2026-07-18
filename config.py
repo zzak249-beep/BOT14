@@ -39,6 +39,9 @@ BINGX_DEMO_MODE = _b("BINGX_DEMO_MODE", False)  # True = usa el dominio Demo/VST
 _DEFAULT_BASE_URL = "https://open-api-vst.bingx.com" if BINGX_DEMO_MODE else "https://open-api.bingx.com"
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", _DEFAULT_BASE_URL)
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
+DRY_RUN_BALANCE = _f("DRY_RUN_BALANCE", 125.0)  # balance simulado en DRY_RUN
+# cuando la cuenta real esta vacia: el bot observa, dimensiona y paper-tradea
+# igual. Al fondear y pasar DRY_RUN=False, esto queda inerte.
 
 # ── Scanner ────────────────────────────────────────────────────────────
 SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 5)        # bajado de 8: el rate limit 100410 seguía en
