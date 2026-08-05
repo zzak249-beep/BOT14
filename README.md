@@ -94,6 +94,36 @@ qty/precio) son correctos para tu cuenta es viéndolo funcionar:
   por el leverage directamente — la causa de un bug real que infló
   valores 10-36x en un bot anterior.
 
+## v1.1.2 — POST en body (no en URL) + diagnóstico de saldo por cuenta
+
+Dos cosas, encontradas en `github.com/BingX-API/api-ai-skills` — el
+repo de referencia oficial de BingX para agentes de IA:
+
+**1. Bug latente, no disparado todavía.** Para `POST` (usado por
+`place_order` y `set_leverage`), BingX espera la query firmada en el
+**body** (`application/x-www-form-urlencoded`), no en la URL. Mi código
+mandaba todo por la URL, igual que en `GET`. Como `MODE=SIGNAL` nunca
+llega a llamar `place_order`, no se había manifestado — habría fallado
+en el primer intento de `MODE=LIVE`. `GET`/`DELETE` sí van en la URL,
+confirmado por la misma referencia y por `get_balance()` funcionando
+en v1.1.1.
+
+**2. Diagnóstico nuevo: saldo por tipo de cuenta.** Si el balance de
+Futuros USDT-M sale en 0 pero crees que hay fondos, `check_connectivity()`
+ahora también llama a `/openApi/account/v1/allAccountBalance` (saldo
+consolidado por `accountType`) y lo loguea al arrancar. Si aparece
+saldo bajo `sopt` (spot/fondos) u otro tipo que no sea el de futuros,
+el dinero está ahí — hay que transferirlo dentro de la app de BingX
+(Activos → Transferir), no tocar el bot.
+
+**Aparte, algo que solo tú puedes comprobar:** BingX tiene un entorno
+de trading simulado (VST) completamente separado, con su propio
+dominio (`open-api-vst.bingx.com`, no `open-api.bingx.com`). El bot
+solo habla con el dominio real. Si en algún momento activaste o
+depositaste en el modo demo/VST de la app, ese saldo no existe para
+la API real — no es que el bot no lo vea, es que están en sistemas
+distintos.
+
 ## v1.1.1 — bug crítico de firma: todo endpoint firmado fallaba, siempre
 
 Primer log real con `bingx-ict-scanner v1.1.0` corriendo confirmó tres

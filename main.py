@@ -31,12 +31,25 @@ async def check_connectivity(client: BingXClient) -> None:
     if cfg.BINGX_API_KEY and cfg.BINGX_API_SECRET:
         try:
             bal = await client.get_balance()
-            log.info("Autenticacion OK. Respuesta de balance: %s", str(bal)[:200])
+            log.info("Autenticacion OK. Balance USDT-M Perp: %s", str(bal)[:200])
         except Exception as e:
             log.error("Las credenciales BingX no funcionan: %s", e)
             if cfg.MODE == "LIVE":
                 log.error("MODE=LIVE sin autenticacion valida. Abortando.")
                 sys.exit(1)
+
+        # DIAGNOSTICO: saldo por tipo de cuenta. Si el USDT-M Perp de arriba
+        # da 0 pero aqui aparece saldo en "sopt" (spot/fund) u otro
+        # accountType, el dinero esta ahi -- hace falta transferirlo, no
+        # tocar nada del bot.
+        try:
+            overview = await client.get_all_account_balance()
+            resumen = ", ".join(
+                f"{a.get('accountType')}={a.get('usdtBalance')}" for a in overview
+            ) if overview else "(vacio)"
+            log.info("Saldo por tipo de cuenta: %s", resumen)
+        except Exception as e:
+            log.warning("No se pudo consultar el resumen de cuentas: %s", e)
 
         detected = await client.get_position_mode()
         if detected and detected != cfg.POSITION_MODE:

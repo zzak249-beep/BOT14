@@ -129,26 +129,33 @@ class BingXClient:
         return query_string
 
     async def _request(self, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
-        # FIX CRITICO: la query string se construye UNA vez (_build_query) y
-        # esa misma string es la que se firma y la que se envia. Antes se
-        # firmaba con urlencode(sorted(params)) pero se enviaba el dict via
-        # `params=` de aiohttp, que lo reserializa en orden de insercion --
-        # una string distinta a la firmada. BingX rechaza la firma en TODO
-        # endpoint firmado, sin importar si las credenciales son correctas.
-        # Confirmado reproduciendo ambas strings fuera de linea: no coincidian.
+        # La query string se construye UNA vez (_build_query) y esa misma
+        # string es la que se firma y la que se envia -- ya no hay un
+        # segundo punto de serializacion que pueda desincronizarse.
         query_string = self._build_query(params, signed)
 
+        # FIX v1.1.2: confirmado contra la referencia oficial de BingX para
+        # agentes de IA (github.com/BingX-API/api-ai-skills) -- en POST la
+        # query firmada va en el BODY (application/x-www-form-urlencoded),
+        # no en la URL. GET y DELETE si van en la URL, como ya estaba y
+        # como se confirmo funcionando en get_balance(). Este era un bug
+        # latente: no habia reventado porque set_leverage/place_order (los
+        # unicos POST firmados) no se habian probado todavia en MODE=LIVE.
         url = f"{self.base_url}{path}"
-        if query_string:
-            url = f"{url}?{query_string}"
+        body = None
         headers = {"X-BX-APIKEY": self.api_key} if self.api_key else {}
+        if method == "POST":
+            body = query_string
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif query_string:
+            url = f"{url}?{query_string}"
 
         async with self._sema:
             last_exc = None
             for attempt in range(3):
                 try:
                     async with self._session.request(
-                        method, url, headers=headers,
+                        method, url, data=body, headers=headers,
                         timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp:
                         raw = await resp.text()
@@ -222,6 +229,17 @@ class BingXClient:
     # ── Cuenta (firmado) ──
     async def get_balance(self) -> dict:
         return await self._request("GET", "/openApi/swap/v2/user/balance", signed=True)
+
+    async def get_all_account_balance(self) -> list:
+        """Saldo por tipo de cuenta (spot/fund, futuros USDT-M, standard
+        futures, etc.) en una sola llamada. Confirmado contra la
+        referencia oficial de BingX para agentes de IA:
+        github.com/BingX-API/api-ai-skills -- /openApi/account/v1/allAccountBalance.
+        Pensado como diagnostico: si get_balance() (solo USDT-M Perp)
+        da 0 pero aqui aparece saldo en otro accountType, el dinero
+        esta ahi, no en el monedero de futuros."""
+        data = await self._request("GET", "/openApi/account/v1/allAccountBalance", signed=True)
+        return data if isinstance(data, list) else []
 
     async def get_positions(self, symbol: Optional[str] = None) -> list:
         data = await self._request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol}, signed=True)
