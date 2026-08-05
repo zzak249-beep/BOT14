@@ -103,18 +103,44 @@ class BingXClient:
         if self._session:
             await self._session.close()
 
-    def _sign(self, params: dict) -> str:
-        qs = urlencode(sorted(params.items()))
-        return hmac.new(self.api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    def _sign(self, query_string: str) -> str:
+        return hmac.new(self.api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _param_str(v: Any) -> str:
+        # Evita notacion cientifica en floats pequeños (1e-05) que BingX
+        # podria no aceptar en qty/price de tokens de precio muy bajo.
+        if isinstance(v, float):
+            s = f"{v:.10f}".rstrip("0").rstrip(".")
+            return s if s else "0"
+        return str(v)
+
+    def _build_query(self, params: Optional[dict], signed: bool) -> str:
+        """Devuelve la query string EXACTA que se firma y se envia -- la
+        misma variable, sin reserializar en otro punto del codigo."""
+        clean = {k: self._param_str(v) for k, v in (params or {}).items() if v is not None}
+        if signed:
+            clean["timestamp"] = str(int(time.time() * 1000))
+            clean["recvWindow"] = str(RECV_WINDOW)
+        query_string = urlencode(sorted(clean.items()))
+        if signed:
+            signature = self._sign(query_string)
+            query_string = f"{query_string}&signature={signature}" if query_string else f"signature={signature}"
+        return query_string
 
     async def _request(self, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
-        params = {k: v for k, v in (params or {}).items() if v is not None}
-        if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            params["recvWindow"] = RECV_WINDOW
-            params["signature"] = self._sign(params)
+        # FIX CRITICO: la query string se construye UNA vez (_build_query) y
+        # esa misma string es la que se firma y la que se envia. Antes se
+        # firmaba con urlencode(sorted(params)) pero se enviaba el dict via
+        # `params=` de aiohttp, que lo reserializa en orden de insercion --
+        # una string distinta a la firmada. BingX rechaza la firma en TODO
+        # endpoint firmado, sin importar si las credenciales son correctas.
+        # Confirmado reproduciendo ambas strings fuera de linea: no coincidian.
+        query_string = self._build_query(params, signed)
 
         url = f"{self.base_url}{path}"
+        if query_string:
+            url = f"{url}?{query_string}"
         headers = {"X-BX-APIKEY": self.api_key} if self.api_key else {}
 
         async with self._sema:
@@ -122,7 +148,7 @@ class BingXClient:
             for attempt in range(3):
                 try:
                     async with self._session.request(
-                        method, url, params=params, headers=headers,
+                        method, url, headers=headers,
                         timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp:
                         raw = await resp.text()

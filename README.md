@@ -94,6 +94,36 @@ qty/precio) son correctos para tu cuenta es viéndolo funcionar:
   por el leverage directamente — la causa de un bug real que infló
   valores 10-36x en un bot anterior.
 
+## v1.1.1 — bug crítico de firma: todo endpoint firmado fallaba, siempre
+
+Primer log real con `bingx-ict-scanner v1.1.0` corriendo confirmó tres
+cosas a la vez:
+
+**1. Firma HMAC rota (bug real, no de credenciales).** `_sign()` firmaba
+`urlencode(sorted(params))`, pero `_request()` enviaba el dict crudo vía
+`params=` de `aiohttp`, que lo reserializa en **orden de inserción** —
+una string distinta a la firmada. Confirmado reproduciendo ambas
+strings fuera de línea: no coincidían nunca, con cualquier credencial.
+`get_balance()`, `get_position_mode()`, y cualquier futura orden en
+`MODE=LIVE` fallaban con `error 100001: Signature verification failed`
+por esto, no por las API keys. Arreglado: la query string se construye
+una sola vez (`_build_query`) y esa misma variable es la que se firma
+y la que se envía — ya no hay un segundo punto de serialización que
+pueda desincronizarse. Verificado con test que reconstruye la firma
+del lado "servidor" y confirma que coincide.
+
+**2. `/openApi/swap/v2/user/positionSide/dual` no existe** (BingX
+respondió `error 100400: this api is not exist`). Ese endpoint era mi
+mejor suposición para detectar Hedge vs One-Way automáticamente — está
+mal, y no tengo un reemplazo verificado. **No bloquea nada**: ya caía
+en gracia al valor de `POSITION_MODE` en tus variables, que sigues
+teniendo que fijar tú mismo según tu cuenta real.
+
+**3. `TELEGRAM_TOKEN` ≠ `TELEGRAM_BOT_TOKEN`.** El bot esperaba esta
+segunda; si tienes la variable puesta con el primer nombre (típico
+resto de otro bot), Telegram queda deshabilitado en silencio — no es
+un bug, es la variable con el nombre equivocado. Revísala en Railway.
+
 ## v1.1.0 — Funding rate y Open Interest como filtros
 
 Dos filtros nuevos, **apagados por defecto**:
