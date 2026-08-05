@@ -1,164 +1,167 @@
 """
-Persistent bot state — survives Railway restarts.
-Stores: entry_time, tp1_hit, trail_stop per symbol/side.
-Root cause fix: entry_time stored in RAM was wiped on every Railway
-redeploy → MAX_HOLD_MINUTES never triggered → positions open 20-26h.
-
-FIX (this version): get_tracked_positions() exposes which symbol/side
-pairs THIS bot has a recorded entry for — independent of the exchange's
-account-wide position list. scanner.py uses this so MAX_OPEN_TRADES and
-_manage_open_positions only count/touch positions this bot itself
-opened, not positions opened by other bots sharing the same BingX
-account.
+State v2 — persistencia JSON atómica, historial de trades, stats diarias.
 """
+from __future__ import annotations
 import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-log = logging.getLogger("state")
-
-_STATE_FILE = os.getenv("STATE_FILE", "/app/bot_state.json")
-
-
-# ── Internal I/O ──────────────────────────────────────────────
-
-def _load() -> dict:
-    try:
-        with open(_STATE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+logger = logging.getLogger(__name__)
+_STATE_FILE = os.getenv("STATE_FILE", "state.json")
+_TMP_FILE   = _STATE_FILE + ".tmp"
+_MAX_HISTORY = 200   # trades guardados en historial
 
 
-def _save(data: dict):
-    try:
-        os.makedirs(os.path.dirname(_STATE_FILE) or ".", exist_ok=True)
-        with open(_STATE_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        log.error(f"state write error: {e}")
+class BotState:
+    def __init__(self):
+        self._d: Dict[str, Any] = {}
+        self._load()
+
+    # ── IO atómica ────────────────────────────────────────────
+    def _load(self):
+        for path in (_STATE_FILE, _TMP_FILE):
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        self._d = json.load(f)
+                    logger.info(f"State loaded from {path} ({len(self._d)} keys)")
+                    return
+                except Exception as e:
+                    logger.warning(f"State load {path}: {e}")
+        self._d = {}
+
+    def save(self):
+        try:
+            with open(_TMP_FILE, "w") as f:
+                json.dump(self._d, f, separators=(",", ":"))
+            os.replace(_TMP_FILE, _STATE_FILE)
+        except Exception as e:
+            logger.error(f"State save: {e}")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._d.get(key, default)
+
+    def set(self, key: str, value: Any):
+        self._d[key] = value
+        self.save()
+
+    # ── Candle tracking ───────────────────────────────────────
+    def get_last_candle_ts(self, symbol: str) -> int:
+        return int(self._d.get(f"ct_{symbol}", 0))
+
+    def set_last_candle_ts(self, symbol: str, ts: int):
+        self._d[f"ct_{symbol}"] = ts
+        self.save()
+
+    def is_new_candle(self, symbol: str, ts: int) -> bool:
+        return ts > self.get_last_candle_ts(symbol)
+
+    # ── Signal tracking ───────────────────────────────────────
+    def get_last_signal_ts(self, symbol: str) -> int:
+        return int(self._d.get(f"sig_ts_{symbol}", 0))
+
+    def get_last_signal_action(self, symbol: str) -> Optional[str]:
+        return self._d.get(f"sig_action_{symbol}")
+
+    def set_last_signal(self, symbol: str, action: str, ts: int, price: float):
+        self._d[f"sig_ts_{symbol}"]     = ts
+        self._d[f"sig_action_{symbol}"] = action
+        self._d[f"sig_price_{symbol}"]  = price
+        self.save()
+
+    # ── Active position tracking ──────────────────────────────
+    def get_active_positions(self) -> Dict[str, dict]:
+        return dict(self._d.get("active_positions", {}))
+
+    def add_active_position(self, symbol: str, data: dict):
+        ap = self._d.setdefault("active_positions", {})
+        ap[symbol] = {**data, "open_ts": int(time.time())}
+        self.save()
+
+    def remove_active_position(self, symbol: str) -> Optional[dict]:
+        ap   = self._d.get("active_positions", {})
+        data = ap.pop(symbol, None)
+        self._d["active_positions"] = ap
+        self.save()
+        return data
+
+    def get_active_position(self, symbol: str) -> Optional[dict]:
+        return self._d.get("active_positions", {}).get(symbol)
+
+    # ── Trade history ─────────────────────────────────────────
+    def add_trade(self, trade: dict):
+        """Agrega un trade al historial circular (max _MAX_HISTORY)."""
+        hist = self._d.setdefault("trade_history", [])
+        hist.append({**trade, "ts": int(time.time())})
+        if len(hist) > _MAX_HISTORY:
+            hist[:] = hist[-_MAX_HISTORY:]
+        self.save()
+
+    def get_trade_history(self) -> List[dict]:
+        return list(self._d.get("trade_history", []))
+
+    def get_recent_trades(self, n: int = 10) -> List[dict]:
+        return self.get_trade_history()[-n:]
+
+    # ── Daily stats ───────────────────────────────────────────
+    def _today(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def get_daily_stats(self) -> dict:
+        return dict(self._d.get(f"daily_{self._today()}", {
+            "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0,
+            "start_balance": 0.0,
+        }))
+
+    def update_daily_result(self, pnl: float, won: bool, start_balance: float = 0.0):
+        key   = f"daily_{self._today()}"
+        stats = self._d.setdefault(key, {
+            "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0,
+            "start_balance": start_balance,
+        })
+        stats["trades"] += 1
+        stats["pnl"]    += pnl
+        if won: stats["wins"]   += 1
+        else:   stats["losses"] += 1
+        self.save()
+
+    def get_daily_pnl(self) -> float:
+        return float(self.get_daily_stats().get("pnl", 0.0))
+
+    def get_last_summary_date(self) -> str:
+        return str(self._d.get("last_summary_date", ""))
+
+    def set_last_summary_date(self, date: str):
+        self.set("last_summary_date", date)
+
+    # ── Paper positions (dry run) ─────────────────────────────
+    def get_paper_positions(self) -> Dict[str, dict]:
+        return dict(self._d.get("paper_positions", {}))
+
+    def add_paper_position(self, symbol: str, data: dict):
+        pp = self._d.setdefault("paper_positions", {})
+        pp[symbol] = {**data, "open_ts": int(time.time())}
+        self.save()
+
+    def remove_paper_position(self, symbol: str) -> Optional[dict]:
+        pp   = self._d.get("paper_positions", {})
+        data = pp.pop(symbol, None)
+        self._d["paper_positions"] = pp
+        self.save()
+        return data
+
+    def get_paper_position(self, symbol: str) -> Optional[dict]:
+        return self._d.get("paper_positions", {}).get(symbol)
+
+    # ── Re-entry cooldown ─────────────────────────────────────
+    def get_last_exit_ts(self, symbol: str) -> int:
+        return int(self._d.get(f"exit_ts_{symbol}", 0))
+
+    def set_last_exit(self, symbol: str):
+        self.set(f"exit_ts_{symbol}", int(time.time()))
 
 
-def _key(symbol: str, side: str, field: str) -> str:
-    return f"{symbol}_{side}_{field}"
-
-
-# ── Entry time ────────────────────────────────────────────────
-
-def save_entry(symbol: str, side: str, ts: float = None):
-    d = _load()
-    d[_key(symbol, side, "entry_ts")] = ts or time.time()
-    _save(d)
-    log.debug(f"state.save_entry {symbol} {side}")
-
-
-def get_entry_ts(symbol: str, side: str) -> float | None:
-    v = _load().get(_key(symbol, side, "entry_ts"))
-    return float(v) if v is not None else None
-
-
-def is_max_hold_expired(symbol: str, side: str, max_minutes: int) -> bool:
-    ts = get_entry_ts(symbol, side)
-    if ts is None:
-        return False
-    elapsed = (time.time() - ts) / 60.0
-    if elapsed >= max_minutes:
-        log.info(f"MAX_HOLD expired {symbol} {side} | elapsed={elapsed:.0f}m limit={max_minutes}m")
-        return True
-    return False
-
-
-# ── Tracked positions (this bot's own) ──────────────────────────
-
-def get_tracked_positions() -> list:
-    """
-    FIX: returns [(symbol, side), ...] for every position with a
-    recorded entry_ts — i.e. positions THIS bot opened and is tracking.
-
-    Used instead of client.get_positions(), which returns every open
-    position on the whole BingX account, including other bots'
-    positions if the account is shared.
-    """
-    d = _load()
-    out = []
-    for k in d:
-        if k.endswith("_entry_ts"):
-            base = k[: -len("_entry_ts")]
-            if "_" not in base:
-                continue
-            symbol, side = base.rsplit("_", 1)
-            out.append((symbol, side))
-    return out
-
-
-# ── TP1 hit flag ──────────────────────────────────────────────
-
-def set_tp1_hit(symbol: str, side: str, hit: bool = True):
-    d = _load()
-    d[_key(symbol, side, "tp1_hit")] = hit
-    _save(d)
-
-
-def is_tp1_hit(symbol: str, side: str) -> bool:
-    return bool(_load().get(_key(symbol, side, "tp1_hit"), False))
-
-
-# ── Trail stop ────────────────────────────────────────────────
-
-def save_trail(symbol: str, side: str, stop: float):
-    d = _load()
-    d[_key(symbol, side, "trail")] = stop
-    _save(d)
-
-
-def get_trail(symbol: str, side: str) -> float | None:
-    v = _load().get(_key(symbol, side, "trail"))
-    return float(v) if v is not None else None
-
-
-# ── Breakeven flag ────────────────────────────────────────────
-
-def set_be_moved(symbol: str, side: str, moved: bool = True):
-    d = _load()
-    d[_key(symbol, side, "be_moved")] = moved
-    _save(d)
-
-
-def is_be_moved(symbol: str, side: str) -> bool:
-    return bool(_load().get(_key(symbol, side, "be_moved"), False))
-
-
-# ── Clear all state for a position ───────────────────────────
-
-def clear(symbol: str, side: str):
-    d = _load()
-    prefix = f"{symbol}_{side}_"
-    keys_to_del = [k for k in d if k.startswith(prefix)]
-    for k in keys_to_del:
-        del d[k]
-    _save(d)
-    log.debug(f"state.clear {symbol} {side} ({len(keys_to_del)} keys removed)")
-
-
-# ── Debug dump ────────────────────────────────────────────────
-
-def dump() -> dict:
-    return _load()
-
-
-# ── Daily PnL/trades state (bot-wide, no por symbol/side) ───────
-
-def save_day_state(day_pnl: float, day_trades: int, day_start_eq: float, day: str):
-    d = _load()
-    d["_day_pnl"]      = day_pnl
-    d["_day_trades"]   = day_trades
-    d["_day_start_eq"] = day_start_eq
-    d["_day"]          = day
-    _save(d)
-
-
-def get_day_state() -> tuple:
-    """Returns (day_pnl, day_trades, day_start_eq, day_iso) — cualquiera puede ser None."""
-    d = _load()
-    return d.get("_day_pnl"), d.get("_day_trades"), d.get("_day_start_eq"), d.get("_day")
+state = BotState()

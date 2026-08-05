@@ -1,126 +1,127 @@
 """
-Risk Manager — sizing por riesgo fijo, circuit breaker diario,
-límite de riesgo concurrente total.
+Risk Manager v2 — SL/TP + sizing + validación R:R + precisión por contrato.
 """
-import datetime
+from __future__ import annotations
 import logging
-import time
+from typing import Optional, Tuple
+from strategy import Signal
+from utils import floor_qty
+import config as cfg
 
-log = logging.getLogger("risk_manager")
+logger = logging.getLogger(__name__)
 
 
-class RiskManager:
-    def __init__(self, config):
-        self.config = config
-        self.daily_pnl = 0.0
-        self.daily_start_balance = None
-        self.current_day = datetime.date.today()
-        self.open_risk_pct = 0.0  # suma del % de riesgo de posiciones abiertas
-        self.consecutive_losses = 0
-        self.paused_until = 0.0  # epoch: freno por racha de pérdidas
+def calculate_sl_tp(
+    signal:      Signal,
+    entry:       float,
+    contract:    dict,
+) -> Tuple[float, float]:
+    """
+    Calcula SL y TP para una señal.
+    Prioridad TP: nivel fib válido → ATR fallback.
+    Prioridad SL: estructura (swing) → ATR fallback.
+    """
+    atr     = signal.atr
+    is_long = signal.action == "BUY"
 
-    def _reset_if_new_day(self, balance):
-        today = datetime.date.today()
-        if today != self.current_day:
-            log.info("Nuevo día de trading — reseteando PnL diario")
-            self.current_day = today
-            self.daily_pnl = 0.0
-            self.daily_start_balance = balance
+    # ── STOP LOSS ────────────────────────────────────────────
+    if cfg.SL_METHOD == "STRUCTURE":
+        if is_long:
+            sl = (signal.sw_low1 - atr * 0.1
+                  if signal.sw_low1 and signal.sw_low1 < entry
+                  else entry - atr * cfg.SL_ATR_MULT)
+        else:
+            sl = (signal.sw_high1 + atr * 0.1
+                  if signal.sw_high1 and signal.sw_high1 > entry
+                  else entry + atr * cfg.SL_ATR_MULT)
+    else:
+        sl = (entry - atr * cfg.SL_ATR_MULT if is_long
+              else entry + atr * cfg.SL_ATR_MULT)
 
-    def register_realized_pnl(self, pnl_usdt, balance):
-        self._reset_if_new_day(balance)
-        self.daily_pnl += pnl_usdt
-        # Racha de pérdidas: N seguidas -> pausa temporal de entradas nuevas
-        if pnl_usdt < 0:
-            self.consecutive_losses += 1
-            max_losses = getattr(self.config, "MAX_CONSECUTIVE_LOSSES", 0)
-            if max_losses > 0 and self.consecutive_losses >= max_losses:
-                pause_min = getattr(self.config, "LOSS_STREAK_PAUSE_MIN", 120)
-                self.paused_until = time.time() + pause_min * 60
-                log.warning(
-                    "Racha de %d pérdidas consecutivas — pausa de entradas nuevas por %d min",
-                    self.consecutive_losses, pause_min)
-                self.consecutive_losses = 0
-        elif pnl_usdt > 0:
-            self.consecutive_losses = 0
+    # Seguridad dirección
+    if is_long  and sl >= entry: sl = entry - atr * cfg.SL_ATR_MULT
+    if not is_long and sl <= entry: sl = entry + atr * cfg.SL_ATR_MULT
 
-    def daily_loss_breached(self, balance):
-        self._reset_if_new_day(balance)
-        if self.daily_start_balance is None:
-            self.daily_start_balance = balance
-            return False
-        if self.daily_start_balance <= 0:
-            return False
-        loss_pct = -self.daily_pnl / self.daily_start_balance * 100
-        breached = loss_pct >= self.config.DAILY_MAX_LOSS_PCT
-        if breached:
-            log.warning(
-                "Circuit breaker diario activado: pérdida %.2f%% >= límite %.2f%%",
-                loss_pct, self.config.DAILY_MAX_LOSS_PCT,
-            )
-        return breached
+    # ── TAKE PROFIT ──────────────────────────────────────────
+    raw_tp: Optional[float] = None
+    if cfg.TP_METHOD == "FIB_TARGET":
+        raw_tp = signal.fib_target
+    elif cfg.TP_METHOD == "FIB_HALF":
+        raw_tp = signal.fib_tgt50
 
-    def calc_position_size(self, balance, entry_price, sl_price):
-        """
-        Tamaño de posición (en unidades del activo) según riesgo fijo % del balance.
-        """
-        risk_usdt = balance * (self.config.RISK_PCT_PER_TRADE / 100)
-        risk_per_unit = abs(entry_price - sl_price)
-        if risk_per_unit <= 0:
-            return 0.0
-        qty = risk_usdt / risk_per_unit
-        return qty
+    if raw_tp and is_long  and raw_tp > entry + atr * 0.5:
+        tp = raw_tp
+    elif raw_tp and not is_long and raw_tp < entry - atr * 0.5:
+        tp = raw_tp
+    else:
+        tp = (entry + atr * cfg.TP_ATR_MULT if is_long
+              else entry - atr * cfg.TP_ATR_MULT)
 
-    def can_open_new_position(self, balance, open_positions_count, new_risk_pct):
-        if self.daily_loss_breached(balance):
-            return False, "daily_loss_breached"
-        if time.time() < self.paused_until:
-            remaining = int((self.paused_until - time.time()) / 60)
-            return False, f"loss_streak_pause ({remaining} min restantes)"
-        if open_positions_count >= self.config.MAX_ACTIVE_POSITIONS:
-            return False, "max_active_positions_reached"
-        if self.open_risk_pct + new_risk_pct > self.config.MAX_CONCURRENT_RISK_PCT:
-            return False, "max_concurrent_risk_reached"
-        return True, "ok"
+    # Seguridad dirección
+    if is_long  and tp <= entry: tp = entry + atr * cfg.TP_ATR_MULT
+    if not is_long and tp >= entry: tp = entry - atr * cfg.TP_ATR_MULT
 
-    def snapshot(self):
-        """Estado serializable para state_store — contraparte de restore()."""
-        return {
-            "daily_pnl": self.daily_pnl,
-            "daily_start_balance": self.daily_start_balance,
-            "current_day": self.current_day.isoformat(),
-            "open_risk_pct": self.open_risk_pct,
-            "consecutive_losses": self.consecutive_losses,
-            "paused_until": self.paused_until,
-        }
+    return round(sl, 8), round(tp, 8)
 
-    def restore(self, snap):
-        """Restaura estado tras un redeploy. open_risk_pct se restaura
-        SIEMPRE (las posiciones abiertas sobreviven al redeploy); los
-        contadores diarios solo si el snapshot es de HOY — un snapshot de
-        ayer no debe revivir el circuit breaker de ayer."""
-        if not snap:
-            return
-        self.open_risk_pct = float(snap.get("open_risk_pct", 0.0))
-        self.consecutive_losses = int(snap.get("consecutive_losses", 0))
-        self.paused_until = float(snap.get("paused_until", 0.0))
-        try:
-            day = datetime.date.fromisoformat(snap.get("current_day", ""))
-        except (ValueError, TypeError):
-            return
-        if day != datetime.date.today():
-            log.info("Snapshot de riesgo de otro día (%s) — solo se restaura open_risk_pct=%.2f%%",
-                      day, self.open_risk_pct)
-            return
-        self.current_day = day
-        self.daily_pnl = float(snap.get("daily_pnl", 0.0))
-        dsb = snap.get("daily_start_balance")
-        self.daily_start_balance = float(dsb) if dsb is not None else None
-        log.info("Estado de riesgo restaurado: daily_pnl=%.4f open_risk=%.2f%%",
-                  self.daily_pnl, self.open_risk_pct)
 
-    def register_open_risk(self, risk_pct):
-        self.open_risk_pct += risk_pct
+def rr_ratio(entry: float, sl: float, tp: float) -> float:
+    risk   = abs(entry - sl)
+    reward = abs(entry - tp)
+    return round(reward / risk, 2) if risk > 0 else 0.0
 
-    def release_open_risk(self, risk_pct):
-        self.open_risk_pct = max(0.0, self.open_risk_pct - risk_pct)
+
+def is_rr_valid(entry: float, sl: float, tp: float) -> bool:
+    return rr_ratio(entry, sl, tp) >= cfg.MIN_RR
+
+
+def calculate_quantity(
+    balance:  float,
+    entry:    float,
+    sl:       float,
+    contract: dict,
+) -> float:
+    """
+    Sizing por riesgo fijo:
+        qty = (balance × RISK_PCT% × LEVERAGE) / |entry − SL|
+
+    Aplica:
+      - Máximo posición = balance × MAX_POSITION_PCT%
+      - Mínimo del contrato (tradeMinQuantity)
+      - Mínimo notional (tradeMinUSDT)
+      - Redondeo al step size del contrato
+    """
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0 or entry <= 0:
+        return 0.0
+
+    # Qty por riesgo
+    risk_usdt = balance * cfg.RISK_PCT / 100
+    qty       = (risk_usdt * cfg.LEVERAGE) / sl_dist
+
+    # Cap por posición máxima
+    max_usdt = balance * cfg.MAX_POSITION_PCT / 100
+    max_qty  = (max_usdt * cfg.LEVERAGE) / entry
+    qty      = min(qty, max_qty)
+
+    # Precisión del contrato
+    step = float(contract.get("tradeMinQuantity", 0.001))
+    qty  = floor_qty(qty, step)
+
+    # Validaciones mínimas
+    min_qty      = float(contract.get("tradeMinQuantity", 0))
+    min_notional = float(contract.get("tradeMinUSDT", 5))
+
+    if min_qty > 0 and qty < min_qty:
+        logger.debug(f"qty {qty:.6f} < min {min_qty:.6f}")
+        return 0.0
+    if qty * entry < min_notional:
+        logger.debug(f"notional {qty*entry:.2f} < min {min_notional:.2f}")
+        return 0.0
+
+    return qty
+
+
+def breakeven_price(entry: float, sl: float) -> float:
+    """Precio de SL de breakeven (entrada más pequeño buffer)."""
+    buf = abs(entry - sl) * 0.05  # 5% del risk como buffer
+    return entry + buf if entry > sl else entry - buf
