@@ -1,351 +1,406 @@
 """
-FibStruct Strategy v2 — Python port fiel de Pine Script v1.5.2
-Mejoras:
-  - initial_bars_since_signal: cooldown persiste entre reinicios
-  - volume_confirm: señal requiere volumen > EMA20 del volumen
-  - Signal incluye volume y closest_fib para el notifier
-  - Pivot strict: igual que Pine (>= max del rango)
+Motor de senales -- puerto Python de ict_killzone_v2.pine.
+
+Trabaja siempre sobre velas YA CERRADAS (nunca sobre la vela en curso,
+igual que barstate.isconfirmed en Pine). evaluate_symbol() es una
+funcion de (estado_previo, velas_nuevas) -> (estado_nuevo, señal?),
+para que scanner.py solo tenga que guardar y pasar el estado por
+simbolo entre ciclos.
 """
-from __future__ import annotations
-import numpy as np
-import pandas as pd
+import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
+
 import config as cfg
+from bingx_client import Candle
+
+log = logging.getLogger("strategy")
+
+NY_TZ = ZoneInfo("America/New_York")
+
+TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+         "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "1d": 86_400_000}
+
+
+def tf_to_ms(tf: str) -> int:
+    return TF_MS.get(tf, 300_000)
+
+
+@dataclass
+class FVG:
+    top: float
+    bot: float
+    ce: float
+    bull: bool
+    touched: bool = False
+    done: bool = False
+
+    def to_dict(self) -> dict:
+        return {"top": self.top, "bot": self.bot, "ce": self.ce, "bull": self.bull,
+                "touched": self.touched, "done": self.done}
+
+    @staticmethod
+    def from_dict(d: Optional[dict]) -> Optional["FVG"]:
+        if not d:
+            return None
+        return FVG(d["top"], d["bot"], d["ce"], d["bull"], d.get("touched", False), d.get("done", False))
 
 
 @dataclass
 class Signal:
-    action:           str            # "BUY" | "SELL"
-    trigger:          str            # "choch", "sweep+engulf", etc.
-    confluence_score: float
-    fib_618:          Optional[float]
-    fib_target:       Optional[float]
-    fib_tgt50:        Optional[float]
-    fib_direction:    int
-    structure_bias:   int
-    atr:              float
-    close:            float
-    sw_high1:         Optional[float]
-    sw_low1:          Optional[float]
-    volume:           float = 0.0
-    near_fib:         Optional[str]  = None   # nombre del nivel más cercano
-    in_premium:       bool = False
-    in_discount:      bool = False
+    symbol: str
+    direction: str  # "LONG" | "SHORT"
+    entry: float
+    sl: float
+    tp1: float
+    tp2: float
+    rr: float
+    kill_zone: str
+    reason: str
+    funding_rate: Optional[float] = None
+    oi_change_pct: Optional[float] = None
 
 
-# ── Indicadores ───────────────────────────────────────────────
-def _rma(s: pd.Series, p: int) -> pd.Series:
-    """Wilder's MA — ta.atr de Pine."""
-    return s.ewm(alpha=1/p, min_periods=p, adjust=False).mean()
+@dataclass
+class SymbolState:
+    last_open_time: int = 0
+    setup_side: Optional[str] = None       # "bull" | "bear" | None
+    setup_open_time: int = 0
+    fvg: Optional[FVG] = None
+    fvg_open_time: int = 0
+    oi_at_setup: Optional[float] = None    # OI en el momento del barrido, para comparar en la confirmacion
 
-def _ema(s: pd.Series, p: int) -> pd.Series:
-    return s.ewm(span=p, adjust=False).mean()
+    def to_dict(self) -> dict:
+        return {
+            "last_open_time": self.last_open_time,
+            "setup_side": self.setup_side,
+            "setup_open_time": self.setup_open_time,
+            "fvg": self.fvg.to_dict() if self.fvg else None,
+            "fvg_open_time": self.fvg_open_time,
+            "oi_at_setup": self.oi_at_setup,
+        }
 
-def compute_atr(df: pd.DataFrame, p: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"].shift(1)
-    tr = pd.concat([df["high"]-df["low"], (df["high"]-c).abs(), (df["low"]-c).abs()], axis=1).max(axis=1)
-    return _rma(tr, p)
+    @staticmethod
+    def from_dict(d: dict) -> "SymbolState":
+        return SymbolState(
+            last_open_time=d.get("last_open_time", 0),
+            setup_side=d.get("setup_side"),
+            setup_open_time=d.get("setup_open_time", 0),
+            fvg=FVG.from_dict(d.get("fvg")),
+            fvg_open_time=d.get("fvg_open_time", 0),
+            oi_at_setup=d.get("oi_at_setup"),
+        )
 
 
-# ── Estrategia ────────────────────────────────────────────────
-class FibStructStrategy:
-    def __init__(
-        self,
-        swing_len:      int   = cfg.SWING_LEN,
-        atr_filter:     bool  = cfg.ATR_FILTER,
-        atr_mult:       float = cfg.ATR_MULT,
-        cooldown:       int   = cfg.COOLDOWN_BARS,
-        eq_tol:         float = cfg.EQ_TOL,
-        conf_tol:       float = cfg.CONFLUENCE_TOL,
-        sweep_conf:     bool  = True,
-        strict_engulf:  bool  = cfg.STRICT_ENGULF,
-        min_confluence: float = cfg.MIN_CONFLUENCE,
-        volume_confirm: bool  = cfg.VOLUME_CONFIRM,
-    ):
-        self.SL          = swing_len
-        self.atr_filter  = atr_filter
-        self.atr_mult    = atr_mult
-        self.cooldown    = cooldown
-        self.eq_tol      = eq_tol
-        self.conf_tol    = conf_tol
-        self.sweep_conf  = sweep_conf
-        self.strict      = strict_engulf
-        self.min_conf    = min_confluence
-        self.vol_confirm = volume_confirm
+# ══════════════════════════════════════════════════════
+# Indicadores base
+# ══════════════════════════════════════════════════════
+def atr(candles: list, period: int = 14) -> float:
+    if len(candles) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        c, p = candles[i], candles[i - 1]
+        trs.append(max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close)))
+    recent = trs[-period:]
+    return sum(recent) / len(recent) if recent else 0.0
 
-    def analyze(
-        self,
-        df: pd.DataFrame,
-        initial_bars_since_signal: int = 999,
-    ) -> Optional[Signal]:
-        """
-        Procesa el DataFrame barra a barra (máquina de estados).
-        Devuelve Signal SOLO si la señal ocurrió en la última barra.
 
-        Args:
-            df:                         DataFrame OHLCV ordenado ascendente.
-            initial_bars_since_signal:  Barras transcurridas desde la última
-                                        señal (calculadas por el bot desde state.json).
-                                        Permite preservar el cooldown tras reinicios.
-        """
-        SL     = self.SL
-        WARMUP = max(SL * 3, 50)
-        n      = len(df)
-        if n < WARMUP + SL + 5:
-            return None
+def ema(values: list, length: int) -> float:
+    if not values:
+        return 0.0
+    k = 2.0 / (length + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
-        df = df.copy().reset_index(drop=True)
-        df["atr"]      = compute_atr(df, 14)
-        df["body"]     = (df["close"] - df["open"]).abs()
-        df["body_ema"] = _ema(df["body"], 14)
-        df["vol_ema"]  = _ema(df["volume"], 20)
 
-        # ── Variables de estado ──────────────────────────────────
-        sw_h1 = sw_h2 = None;  sh1i = sh2i = -1
-        sw_l1 = sw_l2 = None;  sl1i = sl2i = -1
+# ══════════════════════════════════════════════════════
+# Kill zones -- DST-aware via zoneinfo (mejora sobre el Pine,
+# que dependia de offsets fijos y de la sesion del exchange)
+# ══════════════════════════════════════════════════════
+def active_kill_zone(ts_ms: int) -> Optional[str]:
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(NY_TZ)
+    hm = dt.hour * 100 + dt.minute
+    if cfg.KZ_LONDON and 200 <= hm < 500:
+        return "LON"
+    if cfg.KZ_NY_AM and 830 <= hm < 1100:
+        return "NYam"
+    if cfg.KZ_NY_PM and 1330 <= hm < 1600:
+        return "NYpm"
+    if cfg.KZ_ASIA and hm >= 2000:
+        return "ASIA"
+    return None
 
-        eqh_on = eql_on = False
-        eqhp   = eqlp   = None
-        eqh_s2i = eql_s2i = -1
 
-        swept_hi = swept_li = -1
-        bias = 0;  brk_hi = brk_li = -1;  choch_dir = 0
+def _parse_session(session_str: str) -> tuple:
+    a, b = session_str.split("-")
+    return int(a), int(b)
 
-        fsh = fsl = None;  fshi = fsli = -1
-        fh_live = fl_live = False;  fdir = 0
 
-        bars_cd   = initial_bars_since_signal
-        last_sig  = -1
-        final_sig: Optional[Signal] = None
+def range_from_session(candles: list, sess_start_hm: int, sess_end_hm: int) -> tuple:
+    """Maximo/minimo de la ventana horaria (hora NY) mas reciente YA CERRADA.
+    Devuelve (None, None) mientras la ventana de hoy sigue abierta -- igual
+    que el Pine, que solo sella sRngH/sRngL cuando termina la sesion."""
+    if not candles:
+        return None, None
+    last_dt = datetime.fromtimestamp(candles[-1].open_time / 1000, tz=timezone.utc).astimezone(NY_TZ)
+    last_hm = last_dt.hour * 100 + last_dt.minute
 
-        for i in range(n):
-            r   = df.iloc[i]
-            atr = r["atr"] if not np.isnan(r["atr"]) else 0.0
-            ok  = i >= WARMUP
-            bars_cd += 1
+    if sess_start_hm <= last_hm < sess_end_hm:
+        return None, None  # ventana de hoy aun en curso, no ha sellado
 
-            # ── PIVOTS ──────────────────────────────────────────
-            pi     = i - SL
-            new_sh = new_sl = False
+    target_day = last_dt.date()
+    if last_hm < sess_start_hm:
+        target_day = target_day - timedelta(days=1)
 
-            if ok and pi >= SL and pi + SL < n:
-                ws  = pi - SL;  we = pi + SL + 1
-                ph  = df["high"].iloc[pi]
-                pl  = df["low"].iloc[pi]
-                amin = atr * self.atr_mult if self.atr_filter else 0.0
+    highs, lows = [], []
+    for c in candles:
+        dt = datetime.fromtimestamp(c.open_time / 1000, tz=timezone.utc).astimezone(NY_TZ)
+        hm = dt.hour * 100 + dt.minute
+        if dt.date() == target_day and sess_start_hm <= hm < sess_end_hm:
+            highs.append(c.high)
+            lows.append(c.low)
+    if not highs:
+        return None, None
+    return max(highs), min(lows)
 
-                if ph >= df["high"].iloc[ws:we].max():
-                    if sw_l1 is None or (ph - sw_l1) >= amin:
-                        sw_h2,sh2i = sw_h1,sh1i
-                        sw_h1,sh1i = ph, pi
-                        new_sh = True
 
-                if pl <= df["low"].iloc[ws:we].min():
-                    if sw_h1 is None or (sw_h1 - pl) >= amin:
-                        sw_l2,sl2i = sw_l1,sl1i
-                        sw_l1,sl1i = pl, pi
-                        new_sl = True
+# ══════════════════════════════════════════════════════
+# Liquidez
+# ══════════════════════════════════════════════════════
+def prev_day_high_low(daily: list) -> tuple:
+    if len(daily) < 2:
+        return None, None
+    d = daily[-2]  # ultimo dia YA CERRADO
+    return d.high, d.low
 
-            # ── EQH / EQL ───────────────────────────────────────
-            eq_tol = atr * self.eq_tol if atr > 0 else 0.0
 
-            if new_sh and sw_h2 is not None and abs(sw_h1 - sw_h2) <= eq_tol:
-                eqh_on = True;  eqhp = (sw_h1+sw_h2)/2;  eqh_s2i = sh2i
-            if new_sl and sw_l2 is not None and abs(sw_l1 - sw_l2) <= eq_tol:
-                eql_on = True;  eqlp = (sw_l1+sw_l2)/2;  eql_s2i = sl2i
+def pivots(candles: list, length: int) -> tuple:
+    """(pivot_highs, pivot_lows) confirmados con `length` velas a cada lado."""
+    highs, lows = [], []
+    n = len(candles)
+    for i in range(length, n - length):
+        window = candles[i - length: i + length + 1]
+        c = candles[i]
+        if c.high == max(w.high for w in window):
+            highs.append(c.high)
+        if c.low == min(w.low for w in window):
+            lows.append(c.low)
+    return highs, lows
 
-            # ── SWEEPS ──────────────────────────────────────────
-            sph = spl = False
 
-            if ok:
-                rh = eqhp if eqh_on else sw_h1;  rhi = eqh_s2i if eqh_on else sh1i
-                rl = eqlp if eql_on else sw_l1;  rli = eql_s2i if eql_on else sl1i
+def detect_eq_levels(candles: list, atr_val: float) -> tuple:
+    highs, lows = pivots(candles, cfg.EQ_PIVOT_LEN)
+    tol = atr_val * cfg.EQ_TOL_ATR
+    eqh = eql = None
+    if len(highs) >= 2 and abs(highs[-1] - highs[-2]) <= tol:
+        eqh = (highs[-1] + highs[-2]) / 2
+    if len(lows) >= 2 and abs(lows[-1] - lows[-2]) <= tol:
+        eql = (lows[-1] + lows[-2]) / 2
+    return eqh, eql
 
-                if rh and rhi != swept_hi and r["high"] > rh and r["close"] < rh and r["open"] < rh:
-                    sph = True;  swept_hi = rhi
-                    if eqh_on: eqh_on = False
 
-                if rl and rli != swept_li and r["low"] < rl and r["close"] > rl and r["open"] > rl:
-                    spl = True;  swept_li = rli
-                    if eql_on: eql_on = False
+def detect_sweep(last: Candle, levels_high: list, levels_low: list) -> tuple:
+    """Evalua SOLO la ultima vela cerrada. Devuelve (swp_high, swp_low, ref_high, ref_low)."""
+    swp_h, ref_h = False, None
+    for lvl in levels_high:
+        if lvl is not None and last.high > lvl and last.close < lvl and last.open < lvl:
+            swp_h, ref_h = True, lvl
+            break
+    swp_l, ref_l = False, None
+    for lvl in levels_low:
+        if lvl is not None and last.low < lvl and last.close > lvl and last.open > lvl:
+            swp_l, ref_l = True, lvl
+            break
+    return swp_h, swp_l, ref_h, ref_l
 
-            # ── BOS / CHoCH ─────────────────────────────────────
-            is_bos = is_choch = bull = bear = False
 
-            if ok:
-                b_bull = sw_h1 and r["close"] > sw_h1 and sh1i != brk_hi
-                b_bear = sw_l1 and r["close"] < sw_l1 and sl1i != brk_li
+# ══════════════════════════════════════════════════════
+# FVG
+# ══════════════════════════════════════════════════════
+def find_fvg(candles: list, atr_val: float, want_bull: bool, want_bear: bool) -> Optional[FVG]:
+    """Busca un gap de 3 velas usando las 3 ultimas velas cerradas.
+    c1 (la del medio) debe ser una vela de displacement real."""
+    if len(candles) < 3:
+        return None
+    c0, c1, c2 = candles[-3], candles[-2], candles[-1]
 
-                if b_bull and b_bear:
-                    (b_bear := False) if bias <= 0 else (b_bull := False)
+    disp_body = abs(c1.close - c1.open)
+    if cfg.DISPLACEMENT_ATR > 0 and not (atr_val > 0 and disp_body >= atr_val * cfg.DISPLACEMENT_ATR):
+        return None
 
-                if b_bull:
-                    if bias <= 0:
-                        is_choch = True;  choch_dir = 1
-                        swept_hi = swept_li = -1
-                    else:
-                        is_bos = True
-                    bias = 1;  bull = True;  brk_hi = sh1i
+    if want_bear:
+        gap = c0.low - c2.high
+        gap_ok = gap > 0 and (cfg.MIN_GAP_ATR <= 0 or (atr_val > 0 and gap >= atr_val * cfg.MIN_GAP_ATR))
+        if gap_ok:
+            top, bot = c0.low, c2.high
+            return FVG(top=top, bot=bot, ce=(top + bot) / 2, bull=False)
 
-                if b_bear:
-                    if bias >= 0:
-                        is_choch = True;  choch_dir = -1
-                        swept_hi = swept_li = -1
-                    else:
-                        is_bos = True
-                    bias = -1;  bear = True;  brk_li = sl1i
+    if want_bull:
+        gap = c2.low - c0.high
+        gap_ok = gap > 0 and (cfg.MIN_GAP_ATR <= 0 or (atr_val > 0 and gap >= atr_val * cfg.MIN_GAP_ATR))
+        if gap_ok:
+            top, bot = c2.low, c0.high
+            return FVG(top=top, bot=bot, ce=(top + bot) / 2, bull=True)
 
-            # ── FIBONACCI ENGINE ─────────────────────────────────
-            def _anchor_bull():
-                nonlocal fsh,fshi,fsl,fsli,fh_live,fl_live,fdir
-                fdir=1; fsh=r["high"]; fshi=i
-                fsl=sw_l1; fsli=sl1i if sl1i>=0 else max(0,i-10)
-                fh_live=True; fl_live=False
+    return None
 
-            def _anchor_bear():
-                nonlocal fsh,fshi,fsl,fsli,fh_live,fl_live,fdir
-                fdir=-1; fsl=r["low"]; fsli=i
-                fsh=sw_h1; fshi=sh1i if sh1i>=0 else max(0,i-10)
-                fl_live=True; fh_live=False
 
-            if is_choch and bull:  _anchor_bull()
-            if is_choch and bear:  _anchor_bear()
-            if is_bos   and bull:  _anchor_bull()
-            if is_bos   and bear:  _anchor_bear()
+# ══════════════════════════════════════════════════════
+# Evaluacion completa de un simbolo
+# ══════════════════════════════════════════════════════
+def evaluate_symbol(
+    symbol: str, ltf: list, htf: list, daily: list, state: SymbolState,
+    funding_rate: Optional[float] = None, current_oi: Optional[float] = None,
+) -> tuple:
+    """Devuelve (nuevo_estado, Signal o None). No lanza excepciones por
+    datos insuficientes: simplemente no genera señal."""
+    if len(ltf) < max(60, cfg.EQ_PIVOT_LEN * 3):
+        return state, None
 
-            if not bull and not bear:
-                if fh_live and fsh and r["high"] > fsh: fsh=r["high"]; fshi=i
-                if fl_live and fsl and r["low"]  < fsl: fsl=r["low"];  fsli=i
+    last = ltf[-1]
+    if last.open_time == state.last_open_time:
+        return state, None  # ya se evaluo esta vela en un ciclo anterior
+    state.last_open_time = last.open_time
 
-            if new_sh and fh_live and sw_h1: fsh=sw_h1; fshi=sh1i; fh_live=False
-            if new_sl and fl_live and sw_l1: fsl=sw_l1; fsli=sl1i; fl_live=False
-            if new_sh and not fh_live and sw_h1 and fsh and sw_h1!=fsh: fsh=sw_h1; fshi=sh1i
-            if new_sl and not fl_live and sw_l1 and fsl and sw_l1!=fsl: fsl=sw_l1; fsli=sl1i
+    tf_ms = tf_to_ms(cfg.TIMEFRAME)
+    atr_val = atr(ltf, 14)
+    if atr_val <= 0:
+        return state, None
 
-            # ── FIB LEVELS ──────────────────────────────────────
-            fv = fsh and fsl and fsh > fsl and fdir != 0
-            f236=f382=f500=f618=f786=ftgt=ftgt50=None
+    kz = active_kill_zone(last.open_time)
+    kz_ok = (not cfg.USE_KILL_ZONES) or (kz is not None)
 
-            if fv:
-                rng = fsh - fsl
-                if fdir == 1:
-                    f236=fsh-rng*0.236; f382=fsh-rng*0.382; f500=fsh-rng*0.500
-                    f618=fsh-rng*0.618; f786=fsh-rng*0.786
-                    ftgt50=fsh+rng*0.5; ftgt=fsh+rng*0.618
-                else:
-                    f236=fsl+rng*0.236; f382=fsl+rng*0.382; f500=fsl+rng*0.500
-                    f618=fsl+rng*0.618; f786=fsl+rng*0.786
-                    ftgt50=fsl-rng*0.5; ftgt=fsl-rng*0.618
+    pdh, pdl = prev_day_high_low(daily)
+    s_start, s_end = _parse_session(cfg.REFERENCE_RANGE)
+    rng_h, rng_l = range_from_session(ltf, s_start, s_end)
+    eqh, eql = detect_eq_levels(ltf, atr_val) if cfg.USE_EQ else (None, None)
 
-            # ── PREMIUM / DISCOUNT ──────────────────────────────
-            prem = disc = False
-            if f500 and fv:
-                if fdir==1: prem=r["close"]>f500; disc=not prem
-                else:       prem=r["close"]<f500; disc=not prem
+    # ── Expirar el setup activo si se paso de ventana ──
+    if state.setup_side and (last.open_time - state.setup_open_time) // tf_ms > cfg.SWEEP_EXPIRY_BARS:
+        state.setup_side = None
+        state.fvg = None
 
-            # ── CONFLUENCE ──────────────────────────────────────
-            ct = atr * self.conf_tol if atr > 0 else 0.001
+    # ── Sweep (solo cuenta si estamos en kill zone, cuando esta activo el filtro) ──
+    if kz_ok:
+        swp_h, swp_l, ref_h, ref_l = detect_sweep(last, [pdh, rng_h, eqh], [pdl, rng_l, eql])
+        if swp_h:
+            state.setup_side = "bear"
+            state.setup_open_time = last.open_time
+            state.fvg = None
+            state.oi_at_setup = current_oi
+        elif swp_l:
+            state.setup_side = "bull"
+            state.setup_open_time = last.open_time
+            state.fvg = None
+            state.oi_at_setup = current_oi
 
-            def near(lvl):
-                if lvl is None: return False
-                return abs(r["close"]-lvl)<=ct or (r["low"]<=lvl+ct and r["high"]>=lvl-ct)
+    # ── Buscar FVG para el setup activo ──
+    if state.setup_side and state.fvg is None:
+        fvg = find_fvg(ltf, atr_val, want_bull=(state.setup_side == "bull"), want_bear=(state.setup_side == "bear"))
+        if fvg:
+            state.fvg = fvg
+            state.fvg_open_time = last.open_time
 
-            cw = 0.0
-            if near(f236): cw+=1.0
-            if near(f382): cw+=1.5
-            if near(f500): cw+=2.0
-            if near(f618): cw+=2.5
-            if near(f786): cw+=1.5
-            if sw_h1 and near(sw_h1): cw+=1.0
-            if sw_l1 and near(sw_l1): cw+=1.0
-            if self.sweep_conf and (sph or spl): cw+=2.0
-            score = min(cw*10.0, 100.0)
+    signal = None
+    if state.fvg and not state.fvg.done:
+        max_bars = cfg.CE_EXPIRY_BARS if cfg.ENTRY_MODE == "CE" else cfg.FVG_EXPIRY_BARS
+        if (last.open_time - state.fvg_open_time) // tf_ms > max_bars:
+            state.fvg = None
+        else:
+            f = state.fvg
+            use_ce = cfg.ENTRY_MODE == "CE"
 
-            # Nearest fib label
-            fib_map = {"0.236":f236,"0.382":f382,"0.500":f500,
-                       "0.618":f618,"0.786":f786,"-0.5":ftgt50,"-0.618":ftgt}
-            near_fib = min(
-                ((k,abs(r["close"]-v)) for k,v in fib_map.items() if v is not None),
-                key=lambda x: x[1], default=(None, None)
-            )[0]
+            if f.bull:
+                if last.low <= f.top:
+                    f.touched = True
+                triggered = (last.low <= f.ce) if use_ce else (f.touched and last.close > f.top)
+                if triggered:
+                    f.done = True
+                    entry = f.ce if use_ce else last.close
+                    sl = f.bot - cfg.SL_BUFFER_ATR * atr_val
+                    r = entry - sl
+                    if r > 0:
+                        tgt = entry + cfg.RR_FIXED_FALLBACK * r
+                        if cfg.USE_RANGE_TP:
+                            candidates = [x for x in (rng_h, pdh) if x is not None and x > entry]
+                            if candidates:
+                                tgt = max(candidates)
+                        rr = (tgt - entry) / r
+                        signal = Signal(symbol, "LONG", entry, sl, entry + cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg")
+            else:
+                if last.high >= f.bot:
+                    f.touched = True
+                triggered = (last.high >= f.ce) if use_ce else (f.touched and last.close < f.bot)
+                if triggered:
+                    f.done = True
+                    entry = f.ce if use_ce else last.close
+                    sl = f.top + cfg.SL_BUFFER_ATR * atr_val
+                    r = sl - entry
+                    if r > 0:
+                        tgt = entry - cfg.RR_FIXED_FALLBACK * r
+                        if cfg.USE_RANGE_TP:
+                            candidates = [x for x in (rng_l, pdl) if x is not None and x < entry]
+                            if candidates:
+                                tgt = min(candidates)
+                        rr = (entry - tgt) / r
+                        signal = Signal(symbol, "SHORT", entry, sl, entry - cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg")
 
-            # ── ENGULFING ────────────────────────────────────────
-            bec = uec = False
-            if i > 0 and ok:
-                pv    = df.iloc[i-1]
-                body  = abs(r["close"]-r["open"])
-                bavg  = r["body_ema"]
-                pbody = abs(pv["close"]-pv["open"])
-                pbavg = pv["body_ema"]
-                lb    = body > bavg
-                sp    = pbody < pbavg
-                bg    = body > pbody
+    if signal is None:
+        return state, None
 
-                if self.strict:
-                    be = r["close"]<r["open"] and lb and bg and pv["close"]>pv["open"] and sp and r["open"]>pv["close"] and r["close"]<pv["open"]
-                    ue = r["close"]>r["open"] and lb and bg and pv["close"]<pv["open"] and sp and r["open"]<pv["close"] and r["close"]>pv["open"]
-                else:
-                    be = r["close"]<r["open"] and lb and bg and pv["close"]>pv["open"] and sp and r["close"]<=pv["open"] and r["open"]>=pv["close"] and (r["close"]<pv["open"] or r["open"]>pv["close"])
-                    ue = r["close"]>r["open"] and lb and bg and pv["close"]<pv["open"] and sp and r["close"]>=pv["open"] and r["open"]<=pv["close"] and (r["close"]>pv["open"] or r["open"]<pv["close"])
+    # ── Filtros sobre la señal ya formada ──
+    if signal.rr < cfg.MIN_RR:
+        return state, None
 
-                bec = be and (prem or cw>=1.5)
-                uec = ue and (disc or cw>=1.5)
+    if cfg.DIRECTION == "LONG" and signal.direction == "SHORT":
+        return state, None
+    if cfg.DIRECTION == "SHORT" and signal.direction == "LONG":
+        return state, None
 
-            # ── VOLUME CONFIRM ───────────────────────────────────
-            vol_ok = True
-            if self.vol_confirm:
-                vol_ok = r["volume"] >= r["vol_ema"] if not np.isnan(r["vol_ema"]) else True
+    if cfg.KZ_ONLY_ENTRY and not kz_ok:
+        return state, None
 
-            # ── SIGNALS ──────────────────────────────────────────
-            sw_buy  = spl and ok and (disc or cw>=2.0)
-            sw_sell = sph and ok and (prem or cw>=2.0)
+    if cfg.USE_HTF_BIAS and len(htf) >= cfg.HTF_EMA_LEN + 5:
+        closes = [c.close for c in htf[-(cfg.HTF_EMA_LEN * 3):]]
+        htf_ema = ema(closes, cfg.HTF_EMA_LEN)
+        htf_close = htf[-1].close
+        if signal.direction == "LONG" and htf_close <= htf_ema:
+            return state, None
+        if signal.direction == "SHORT" and htf_close >= htf_ema:
+            return state, None
 
-            b_eng = uec and bias==1  and cw>=1.5
-            b_cho = is_choch and bull
-            b_swp = sw_buy
-            s_eng = bec and bias==-1 and cw>=1.5
-            s_cho = is_choch and bear
-            s_swp = sw_sell
+    if cfg.USE_PREMIUM_DISCOUNT:
+        levels = [x for x in (rng_h, rng_l, pdh, pdl) if x is not None]
+        if len(levels) >= 2:
+            mid = (max(levels) + min(levels)) / 2
+            if signal.direction == "LONG" and signal.entry >= mid:
+                return state, None
+            if signal.direction == "SHORT" and signal.entry <= mid:
+                return state, None
 
-            buy_r  = (b_eng or b_cho or b_swp) and cw>=self.min_conf
-            sell_r = (s_eng or s_cho or s_swp) and cw>=self.min_conf
+    if cfg.USE_FUNDING_FILTER:
+        if funding_rate is None:
+            return state, None  # sin dato -> no se arriesga, se descarta
+        if signal.direction == "LONG" and funding_rate > -cfg.FUNDING_MIN_ABS:
+            return state, None
+        if signal.direction == "SHORT" and funding_rate < cfg.FUNDING_MIN_ABS:
+            return state, None
+    signal.funding_rate = funding_rate
 
-            if buy_r and sell_r: buy_r = sell_r = False
+    oi_change_pct = None
+    if state.oi_at_setup is not None and current_oi is not None and state.oi_at_setup > 0:
+        oi_change_pct = (current_oi - state.oi_at_setup) / state.oi_at_setup * 100.0
+    signal.oi_change_pct = oi_change_pct
 
-            cbuy  = buy_r  and bars_cd>=self.cooldown and ok and vol_ok
-            csell = sell_r and bars_cd>=self.cooldown and ok and vol_ok
+    if cfg.USE_OI_FILTER:
+        if oi_change_pct is None:
+            return state, None  # sin dato -> no se arriesga, se descarta
+        if oi_change_pct > cfg.OI_MAX_INCREASE_PCT:
+            return state, None  # OI subiendo = posicion nueva contra la reversion, no flush
 
-            if cbuy or csell:
-                bars_cd = 0;  last_sig = i
-                parts = []
-                if cbuy:
-                    if b_cho: parts.append("choch")
-                    if b_swp: parts.append("sweep")
-                    if b_eng: parts.append("engulf")
-                    final_sig = Signal(
-                        action="BUY", trigger="+".join(parts),
-                        confluence_score=score, fib_618=f618,
-                        fib_target=ftgt, fib_tgt50=ftgt50,
-                        fib_direction=fdir, structure_bias=bias,
-                        atr=atr, close=float(r["close"]),
-                        sw_high1=sw_h1, sw_low1=sw_l1,
-                        volume=float(r["volume"]), near_fib=near_fib,
-                        in_premium=prem, in_discount=disc,
-                    )
-                else:
-                    if s_cho: parts.append("choch")
-                    if s_swp: parts.append("sweep")
-                    if s_eng: parts.append("engulf")
-                    final_sig = Signal(
-                        action="SELL", trigger="+".join(parts),
-                        confluence_score=score, fib_618=f618,
-                        fib_target=ftgt, fib_tgt50=ftgt50,
-                        fib_direction=fdir, structure_bias=bias,
-                        atr=atr, close=float(r["close"]),
-                        sw_high1=sw_h1, sw_low1=sw_l1,
-                        volume=float(r["volume"]), near_fib=near_fib,
-                        in_premium=prem, in_discount=disc,
-                    )
-        # end loop
-        return final_sig if last_sig == n - 1 else None
+    return state, signal

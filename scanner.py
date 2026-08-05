@@ -1,125 +1,156 @@
 """
-Scanner v2 — fetch paralelo con ThreadPoolExecutor + blacklist + caché.
+Orquesta el escaneo de todo el universo de simbolos BingX USDT-M en
+cada ciclo: trae klines en paralelo (limitado por semaforo dentro de
+BingXClient), evalua la estrategia por simbolo y despacha las señales.
 """
-from __future__ import annotations
+import asyncio
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
-import pandas as pd
-from bingx_api import BingXAPI, BingXError
-from utils import is_blacklisted, interval_to_ms
+from typing import Optional
+
 import config as cfg
+import executor
+from bingx_client import BingXClient, BingXError, normalize_symbol
+from state import StateManager
+from strategy import evaluate_symbol
+from telegram_notifier import TelegramNotifier
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger("scanner")
+
+_symbol_cache: list = []
+_symbol_cache_at: float = 0.0
 
 
-def get_active_symbols(api: BingXAPI) -> List[dict]:
-    """
-    Devuelve top MAX_SYMBOLS contratos USDT-perp activos, ordenados por volumen 24h.
-    Excluye tokens apalancados, estables y la BLACKLIST de config.
-    """
+def _is_tradable(contract: dict) -> bool:
+    for key in ("status", "apiStateOpen", "state"):
+        if key in contract:
+            v = contract[key]
+            if isinstance(v, bool):
+                return v
+            sv = str(v).upper()
+            if sv in ("1", "TRADING", "ONLINE", "TRUE"):
+                return True
+            if sv in ("0", "OFFLINE", "FALSE", "DELISTED", "PAUSED"):
+                return False
+    return True  # campo desconocido -> no filtramos por si acaso
+
+
+async def get_symbol_universe(client: BingXClient, force: bool = False) -> list:
+    global _symbol_cache, _symbol_cache_at
+    now = time.time()
+    if not force and _symbol_cache and (now - _symbol_cache_at) < cfg.SYMBOL_REFRESH_MIN * 60:
+        return _symbol_cache
+
     try:
-        contracts = api.get_contracts()
-    except Exception as e:
-        logger.error(f"get_contracts: {e}")
-        return []
+        contracts = await client.get_contracts()
+    except BingXError as e:
+        log.error("No se pudo obtener la lista de contratos: %s", e)
+        return _symbol_cache  # lo que hubiera en cache, aunque este viejo
 
-    usdt = [
-        c for c in contracts
-        if str(c.get("currency", "")).upper() == "USDT"
-        and int(c.get("status", 0)) == 1
-        and c.get("apiStateBuy", True)
-        and c.get("apiStateSell", True)
-        and not is_blacklisted(c["symbol"])
-        and c["symbol"].upper() not in [b.upper() for b in cfg.BLACKLIST]
-    ]
+    total = len(contracts)
+    out = []
+    for c in contracts:
+        sym = c.get("symbol")
+        if not sym:
+            continue
+        norm = normalize_symbol(sym, cfg.QUOTE_ASSET)
+        if not norm.endswith("-" + cfg.QUOTE_ASSET):
+            continue
+        if not _is_tradable(c):
+            continue
+        if cfg.SYMBOL_WHITELIST and norm not in cfg.SYMBOL_WHITELIST:
+            continue
+        if norm in cfg.SYMBOL_BLACKLIST:
+            continue
+        if cfg.MIN_24H_VOLUME_USDT > 0:
+            vol = float(c.get("quoteVolume24h", c.get("volume24h", 0)) or 0)
+            if vol < cfg.MIN_24H_VOLUME_USDT:
+                continue
+        out.append(sym)  # se usa el symbol tal cual lo devuelve BingX para las llamadas a la API
 
-    if not usdt:
-        logger.warning("No USDT contracts found after filter")
-        return []
+    log.info("Universo de simbolos: %d contratos -> %d tras filtros (blacklist=%d whitelist=%d).",
+              total, len(out), len(cfg.SYMBOL_BLACKLIST), len(cfg.SYMBOL_WHITELIST))
+    if total > 0 and len(out) < total * 0.1:
+        log.warning("Se filtro mas del 90%% del universo. Revisa MIN_24H_VOLUME_USDT / el campo de estado del contrato.")
 
-    # Volumen 24h
-    time.sleep(0.3)
+    _symbol_cache = out
+    _symbol_cache_at = now
+    return out
+
+
+async def _fetch_and_evaluate(client: BingXClient, state: StateManager, symbol: str):
     try:
-        tickers = {t["symbol"]: t for t in api.get_tickers()}
-    except Exception as e:
-        logger.error(f"get_tickers: {e}")
-        tickers = {}
-
-    enriched = []
-    for c in usdt:
-        sym  = c["symbol"]
-        tick = tickers.get(sym, {})
-        vol  = float(tick.get("quoteVolume", tick.get("volume", 0)))
-        if vol >= cfg.MIN_VOLUME_USDT:
-            c["volume24h"] = vol
-            c["lastPrice"] = float(tick.get("lastPrice", 0))
-            enriched.append(c)
-
-    enriched.sort(key=lambda x: x["volume24h"], reverse=True)
-    top = enriched[: cfg.MAX_SYMBOLS]
-    logger.info(f"Symbols: {len(contracts)} total → {len(usdt)} USDT active → {len(enriched)} vol≥{cfg.MIN_VOLUME_USDT/1e6:.0f}M → top {len(top)}")
-    return top
-
-
-def fetch_candles(api: BingXAPI, symbol: str) -> Optional[pd.DataFrame]:
-    """
-    Fetch + parse velas. Descarta la vela en formación.
-    Retorna None si datos insuficientes.
-    """
-    try:
-        raw = api.get_klines(symbol, cfg.TIMEFRAME, cfg.CANDLES_LIMIT)
-    except Exception as e:
-        logger.debug(f"klines {symbol}: {e}")
+        ltf = await client.get_klines(symbol, cfg.TIMEFRAME, cfg.KLINES_LOOKBACK)
+        if len(ltf) < 60:
+            return None
+        htf = await client.get_klines(symbol, cfg.HTF_TIMEFRAME, cfg.HTF_EMA_LEN + 20) if cfg.USE_HTF_BIAS else []
+        daily = await client.get_klines(symbol, "1d", 5)
+        funding_rate = await client.get_funding_rate(symbol) if cfg.USE_FUNDING_FILTER else None
+        current_oi = await client.get_open_interest(symbol) if cfg.USE_OI_FILTER else None
+    except BingXError as e:
+        log.debug("%s: fallo al traer klines (%s)", symbol, e)
+        return None
+    except Exception as e:  # defensivo: un simbolo raro no debe tumbar el ciclo entero
+        log.warning("%s: error inesperado trayendo datos: %s", symbol, e)
         return None
 
-    if not raw or len(raw) < 60:
+    sym_state = state.get_symbol_state(symbol)
+    try:
+        new_state, signal = evaluate_symbol(symbol, ltf, htf, daily, sym_state, funding_rate, current_oi)
+    except Exception as e:
+        log.warning("%s: error inesperado evaluando la estrategia: %s", symbol, e)
         return None
-
-    df = pd.DataFrame(raw)[["time","open","high","low","close","volume"]].copy()
-    df = df.astype({"time":"int64","open":"float64","high":"float64",
-                    "low":"float64","close":"float64","volume":"float64"})
-    df.sort_values("time", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    # Descartar vela abierta (aún no cerrada)
-    bar_ms  = interval_to_ms(cfg.TIMEFRAME)
-    now_ms  = int(time.time() * 1000)
-    if now_ms < df["time"].iloc[-1] + bar_ms:
-        df = df.iloc[:-1].reset_index(drop=True)
-
-    return df if len(df) >= 60 else None
+    state.symbol_states[symbol] = new_state
+    return signal
 
 
-def fetch_all_candles_parallel(
-    api: BingXAPI,
-    symbols: List[dict],
-) -> Dict[str, pd.DataFrame]:
-    """
-    Fetch paralelo de velas para todos los símbolos.
-    Usa ThreadPoolExecutor con FETCH_WORKERS threads.
-    Retorna dict {symbol: df}.
-    """
-    results: Dict[str, pd.DataFrame] = {}
+async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: TelegramNotifier) -> int:
+    t0 = time.time()
+    symbols = await get_symbol_universe(client)
+    if not symbols:
+        log.warning("Universo de simbolos vacio, se omite el ciclo.")
+        return 0
 
-    with ThreadPoolExecutor(max_workers=cfg.FETCH_WORKERS) as ex:
-        futures = {
-            ex.submit(fetch_candles, api, c["symbol"]): c["symbol"]
-            for c in symbols
-        }
-        for future in as_completed(futures):
-            sym = futures[future]
-            try:
-                df = future.result(timeout=20)
-                if df is not None:
-                    results[sym] = df
-            except Exception as e:
-                logger.debug(f"parallel fetch {sym}: {e}")
+    tasks = [_fetch_and_evaluate(client, state, s) for s in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    signals = [r for r in results if r is not None]
 
-    logger.info(f"Fetched {len(results)}/{len(symbols)} symbol candles")
-    return results
+    for sig in signals:
+        try:
+            await executor.handle_signal(sig, client, state, notifier)
+        except Exception as e:
+            log.error("%s: error despachando señal: %s", sig.symbol, e)
+
+    try:
+        await executor.manage_open_positions(client, state, notifier)
+    except Exception as e:
+        log.error("Error gestionando posiciones abiertas: %s", e)
+
+    state.save()
+
+    elapsed = time.time() - t0
+    log.info(
+        "Ciclo completo: %d simbolos, %d señales, %d posiciones abiertas, %.1fs",
+        len(symbols), len(signals), state.open_position_count(), elapsed,
+    )
+    if elapsed > cfg.SCAN_INTERVAL_SEC:
+        log.warning(
+            "El ciclo tardo %.1fs, mas que SCAN_INTERVAL_SEC=%ds. Sube MAX_CONCURRENT_REQUESTS "
+            "o SCAN_INTERVAL_SEC, o reduce el universo con SYMBOL_WHITELIST/MIN_24H_VOLUME_USDT.",
+            elapsed, cfg.SCAN_INTERVAL_SEC,
+        )
+    return len(signals)
 
 
-def build_contract_map(contracts: List[dict]) -> Dict[str, dict]:
-    return {c["symbol"]: c for c in contracts}
+async def main_loop(client: BingXClient, state: StateManager, notifier: TelegramNotifier, on_cycle=None) -> None:
+    log.info("Escaneo iniciado. Intervalo=%ds  Simbolos=refrescados cada %dmin", cfg.SCAN_INTERVAL_SEC, cfg.SYMBOL_REFRESH_MIN)
+    while True:
+        cycle_start = time.time()
+        try:
+            await run_scan_cycle(client, state, notifier)
+            if on_cycle:
+                on_cycle()
+        except Exception as e:
+            log.error("Ciclo de escaneo fallo por completo (se reintenta en el siguiente): %s", e, exc_info=True)
+        elapsed = time.time() - cycle_start
+        await asyncio.sleep(max(1.0, cfg.SCAN_INTERVAL_SEC - elapsed))
