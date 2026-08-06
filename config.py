@@ -11,7 +11,7 @@ import sys
 import logging
 from typing import Optional
 
-CODE_VERSION = "bingx-ict-scanner v1.1.2"
+CODE_VERSION = "bingx-ict-scanner v1.2.0"
 
 
 def _clean(v: Optional[str]) -> Optional[str]:

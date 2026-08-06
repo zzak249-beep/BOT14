@@ -20,6 +20,27 @@ log = logging.getLogger("strategy")
 
 NY_TZ = ZoneInfo("America/New_York")
 
+# ══════════════════════════════════════════════════════
+# Diagnostico del embudo -- cuenta en que etapa se cae cada intento,
+# para poder ver en el log POR QUE un ciclo da 0 señales en vez de
+# adivinarlo. Se resetea una vez por ciclo desde scanner.py.
+# ══════════════════════════════════════════════════════
+_stats = {
+    "sweeps": 0, "fvgs_formed": 0, "confirmations": 0,
+    "rejected_rr": 0, "rejected_direction": 0, "rejected_kz_only": 0,
+    "rejected_htf": 0, "rejected_premium_discount": 0,
+    "rejected_funding": 0, "rejected_oi": 0, "signals": 0,
+}
+
+
+def reset_cycle_stats() -> None:
+    for k in _stats:
+        _stats[k] = 0
+
+
+def get_cycle_stats() -> dict:
+    return dict(_stats)
+
 TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
          "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "1d": 86_400_000}
 
@@ -193,6 +214,15 @@ def pivots(candles: list, length: int) -> tuple:
     return highs, lows
 
 
+def latest_swing_levels(highs: list, lows: list) -> tuple:
+    """Swing high/low confirmado mas reciente -- referencia de liquidez
+    mucho mas frecuente que PDH/PDL (1/dia) o EQH/EQL (necesita dos
+    pivotes casi iguales). FALTABA de detect_sweep(): con 900 simbolos,
+    la mayoria del tiempo pdh/rng_h/eqh estan los tres vacios a la vez
+    para un simbolo dado, y el sweep nunca llega a evaluarse siquiera."""
+    return (highs[-1] if highs else None), (lows[-1] if lows else None)
+
+
 def detect_eq_levels(candles: list, atr_val: float) -> tuple:
     highs, lows = pivots(candles, cfg.EQ_PIVOT_LEN)
     tol = atr_val * cfg.EQ_TOL_ATR
@@ -278,7 +308,15 @@ def evaluate_symbol(
     pdh, pdl = prev_day_high_low(daily)
     s_start, s_end = _parse_session(cfg.REFERENCE_RANGE)
     rng_h, rng_l = range_from_session(ltf, s_start, s_end)
-    eqh, eql = detect_eq_levels(ltf, atr_val) if cfg.USE_EQ else (None, None)
+    piv_highs, piv_lows = pivots(ltf, cfg.EQ_PIVOT_LEN)
+    sw_h, sw_l = latest_swing_levels(piv_highs, piv_lows)
+    eqh = eql = None
+    if cfg.USE_EQ:
+        tol = atr_val * cfg.EQ_TOL_ATR
+        if len(piv_highs) >= 2 and abs(piv_highs[-1] - piv_highs[-2]) <= tol:
+            eqh = (piv_highs[-1] + piv_highs[-2]) / 2
+        if len(piv_lows) >= 2 and abs(piv_lows[-1] - piv_lows[-2]) <= tol:
+            eql = (piv_lows[-1] + piv_lows[-2]) / 2
 
     # ── Expirar el setup activo si se paso de ventana ──
     if state.setup_side and (last.open_time - state.setup_open_time) // tf_ms > cfg.SWEEP_EXPIRY_BARS:
@@ -287,13 +325,15 @@ def evaluate_symbol(
 
     # ── Sweep (solo cuenta si estamos en kill zone, cuando esta activo el filtro) ──
     if kz_ok:
-        swp_h, swp_l, ref_h, ref_l = detect_sweep(last, [pdh, rng_h, eqh], [pdl, rng_l, eql])
+        swp_h, swp_l, ref_h, ref_l = detect_sweep(last, [sw_h, pdh, rng_h, eqh], [sw_l, pdl, rng_l, eql])
         if swp_h:
+            _stats["sweeps"] += 1
             state.setup_side = "bear"
             state.setup_open_time = last.open_time
             state.fvg = None
             state.oi_at_setup = current_oi
         elif swp_l:
+            _stats["sweeps"] += 1
             state.setup_side = "bull"
             state.setup_open_time = last.open_time
             state.fvg = None
@@ -305,6 +345,7 @@ def evaluate_symbol(
         if fvg:
             state.fvg = fvg
             state.fvg_open_time = last.open_time
+            _stats["fvgs_formed"] += 1
 
     signal = None
     if state.fvg and not state.fvg.done:
@@ -331,6 +372,7 @@ def evaluate_symbol(
                             if candidates:
                                 tgt = max(candidates)
                         rr = (tgt - entry) / r
+                        _stats["confirmations"] += 1
                         signal = Signal(symbol, "LONG", entry, sl, entry + cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg")
             else:
                 if last.high >= f.bot:
@@ -348,6 +390,7 @@ def evaluate_symbol(
                             if candidates:
                                 tgt = min(candidates)
                         rr = (entry - tgt) / r
+                        _stats["confirmations"] += 1
                         signal = Signal(symbol, "SHORT", entry, sl, entry - cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg")
 
     if signal is None:
@@ -355,14 +398,18 @@ def evaluate_symbol(
 
     # ── Filtros sobre la señal ya formada ──
     if signal.rr < cfg.MIN_RR:
+        _stats["rejected_rr"] += 1
         return state, None
 
     if cfg.DIRECTION == "LONG" and signal.direction == "SHORT":
+        _stats["rejected_direction"] += 1
         return state, None
     if cfg.DIRECTION == "SHORT" and signal.direction == "LONG":
+        _stats["rejected_direction"] += 1
         return state, None
 
     if cfg.KZ_ONLY_ENTRY and not kz_ok:
+        _stats["rejected_kz_only"] += 1
         return state, None
 
     if cfg.USE_HTF_BIAS and len(htf) >= cfg.HTF_EMA_LEN + 5:
@@ -370,8 +417,10 @@ def evaluate_symbol(
         htf_ema = ema(closes, cfg.HTF_EMA_LEN)
         htf_close = htf[-1].close
         if signal.direction == "LONG" and htf_close <= htf_ema:
+            _stats["rejected_htf"] += 1
             return state, None
         if signal.direction == "SHORT" and htf_close >= htf_ema:
+            _stats["rejected_htf"] += 1
             return state, None
 
     if cfg.USE_PREMIUM_DISCOUNT:
@@ -379,16 +428,21 @@ def evaluate_symbol(
         if len(levels) >= 2:
             mid = (max(levels) + min(levels)) / 2
             if signal.direction == "LONG" and signal.entry >= mid:
+                _stats["rejected_premium_discount"] += 1
                 return state, None
             if signal.direction == "SHORT" and signal.entry <= mid:
+                _stats["rejected_premium_discount"] += 1
                 return state, None
 
     if cfg.USE_FUNDING_FILTER:
         if funding_rate is None:
+            _stats["rejected_funding"] += 1
             return state, None  # sin dato -> no se arriesga, se descarta
         if signal.direction == "LONG" and funding_rate > -cfg.FUNDING_MIN_ABS:
+            _stats["rejected_funding"] += 1
             return state, None
         if signal.direction == "SHORT" and funding_rate < cfg.FUNDING_MIN_ABS:
+            _stats["rejected_funding"] += 1
             return state, None
     signal.funding_rate = funding_rate
 
@@ -399,8 +453,11 @@ def evaluate_symbol(
 
     if cfg.USE_OI_FILTER:
         if oi_change_pct is None:
+            _stats["rejected_oi"] += 1
             return state, None  # sin dato -> no se arriesga, se descarta
         if oi_change_pct > cfg.OI_MAX_INCREASE_PCT:
+            _stats["rejected_oi"] += 1
             return state, None  # OI subiendo = posicion nueva contra la reversion, no flush
 
+    _stats["signals"] += 1
     return state, signal

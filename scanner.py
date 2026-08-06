@@ -12,7 +12,7 @@ import config as cfg
 import executor
 from bingx_client import BingXClient, BingXError, normalize_symbol
 from state import StateManager
-from strategy import evaluate_symbol
+from strategy import evaluate_symbol, reset_cycle_stats, get_cycle_stats
 from telegram_notifier import TelegramNotifier
 
 log = logging.getLogger("scanner")
@@ -106,6 +106,7 @@ async def _fetch_and_evaluate(client: BingXClient, state: StateManager, symbol: 
 
 async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: TelegramNotifier) -> int:
     t0 = time.time()
+    reset_cycle_stats()
     symbols = await get_symbol_universe(client)
     if not symbols:
         log.warning("Universo de simbolos vacio, se omite el ciclo.")
@@ -132,6 +133,15 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
     log.info(
         "Ciclo completo: %d simbolos, %d señales, %d posiciones abiertas, %.1fs",
         len(symbols), len(signals), state.open_position_count(), elapsed,
+    )
+    st = get_cycle_stats()
+    log.info(
+        "Embudo: sweeps=%d fvgs=%d confirmaciones=%d | rechazadas por RR=%d direccion=%d "
+        "kz_only=%d htf=%d premium/discount=%d funding=%d oi=%d | señales=%d",
+        st["sweeps"], st["fvgs_formed"], st["confirmations"],
+        st["rejected_rr"], st["rejected_direction"], st["rejected_kz_only"],
+        st["rejected_htf"], st["rejected_premium_discount"],
+        st["rejected_funding"], st["rejected_oi"], st["signals"],
     )
     if elapsed > cfg.SCAN_INTERVAL_SEC:
         log.warning(

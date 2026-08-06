@@ -94,6 +94,39 @@ qty/precio) son correctos para tu cuenta es viéndolo funcionar:
   por el leverage directamente — la causa de un bug real que infló
   valores 10-36x en un bot anterior.
 
+## v1.2.0 — el sweep nunca comprobaba el swing más reciente
+
+Reportado como "900 símbolos, 0 señales" durante varios ciclos seguidos.
+Verificado con cálculo exacto (no a ojo) que la kill zone SÍ estaba
+activa en ese horario — no era eso.
+
+**Causa real, en `detect_sweep()`:** los niveles de referencia eran
+`[pdh, rango_sesión, EQH/EQL]` — el swing high/low más reciente
+(`swHigh1`/`swLow1`) nunca estaba en la lista, pese a que mi propia
+explicación anterior de "cómo funciona" decía que sí. Con PDH/PDL
+actualizando una vez al día, el rango de sesión solo disponible tras
+sellar (ventana limitada) y EQH/EQL exigiendo dos pivotes casi iguales
+(poco frecuente), en la práctica los tres podían estar vacíos a la vez
+para un símbolo dado durante la mayor parte del día — el swing corriente
+era, con diferencia, la referencia de liquidez más frecuente, y era
+justo la que faltaba. Añadido: se reutilizan los mismos pivotes ya
+calculados para EQH/EQL, se toma el más reciente de cada lado, y se
+suma a la lista de niveles que puede barrer una vela.
+
+Verificado con un escenario sintético donde antes daba 0 sweeps y ahora
+detecta 1, llega a FVG, y confirma correctamente.
+
+**Además, diagnóstico nuevo para no tener que adivinar la próxima vez:**
+cada ciclo ahora loguea el embudo completo:
+```
+Embudo: sweeps=N fvgs=N confirmaciones=N | rechazadas por RR=N direccion=N
+kz_only=N htf=N premium/discount=N funding=N oi=N | señales=N
+```
+Si vuelve a haber una sequía de señales, esta línea dice exactamente en
+qué etapa se están cayendo — sweeps que nunca llegan a FVG, FVGs que no
+confirman, o confirmaciones que mueren en el filtro de R:R o de sesgo
+HTF — en vez de tener que especular.
+
 ## v1.1.2 — POST en body (no en URL) + diagnóstico de saldo por cuenta
 
 Dos cosas, encontradas en `github.com/BingX-API/api-ai-skills` — el
