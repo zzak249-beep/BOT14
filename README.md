@@ -94,6 +94,36 @@ qty/precio) son correctos para tu cuenta es viéndolo funcionar:
   por el leverage directamente — la causa de un bug real que infló
   valores 10-36x en un bot anterior.
 
+## v1.3.0 — MODE=SIGNAL no cerraba nunca sus propias posiciones de papel
+
+Reportado como "revisa rentabilidad" — no había nada que revisar, y el
+motivo era peor que "falta un panel": **no existía ningún mecanismo
+para saber si una señal de papel habría ganado o perdido.**
+
+`manage_open_positions()` se sale en la primera línea si `MODE=SIGNAL`
+("sin posiciones reales que reconciliar contra el exchange" — cierto,
+pero la consecuencia no estaba cubierta). Una posición de papel se
+queda en `state.positions` para siempre. Dos efectos, confirmados en
+producción con una captura real: **5 posiciones de papel atascadas**,
+exactamente en `MAX_CONCURRENT_POSITIONS`, durante varios ciclos:
+
+1. Cero tracking de resultado — nunca se sabe si el SL o el TP se
+   habrían tocado.
+2. En cuanto se acumulan `MAX_CONCURRENT_POSITIONS` de estas, el bot
+   deja de poder registrar señales nuevas — no porque el mercado no
+   dé setups, sino porque el hueco nunca se libera.
+
+Añadida `manage_paper_positions()`: compara el precio actual contra el
+SL/TP guardado de cada posición de papel y la cierra cuando corresponde,
+alimentando el mismo `kz_stats` (W/L por kill zone) que ya usa el panel
+para posiciones reales. Si SL y TP se tocan en el mismo hueco de vela,
+se cuenta como perdedor (conservador). Cada posición de papel guarda
+ahora también `opened_at`, así el aviso de cierre dice cuánto tardó.
+
+Verificado con test: TP cierra como ganador, SL como perdedor, una
+posición que sigue dentro de rango no se toca, y el límite de 5 deja de
+ser un tope permanente.
+
 ## v1.2.0 — el sweep nunca comprobaba el swing más reciente
 
 Reportado como "900 símbolos, 0 señales" durante varios ciclos seguidos.

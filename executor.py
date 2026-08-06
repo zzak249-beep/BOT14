@@ -18,6 +18,7 @@ Lecciones de bots anteriores aplicadas aqui a proposito:
     para cerrar/reducir.
 """
 import logging
+import time
 from typing import Optional
 
 import config as cfg
@@ -81,6 +82,7 @@ async def handle_signal(sig: Signal, client: BingXClient, state: StateManager, n
             "direction": sig.direction, "entry": sig.entry, "sl": sig.sl,
             "tp1": sig.tp1, "tp2": sig.tp2, "qty": 0.0, "paper": True,
             "partial_done": False, "kill_zone": sig.kill_zone,
+            "opened_at": int(time.time() * 1000),
         })
         return
 
@@ -217,6 +219,47 @@ async def manage_open_positions(client: BingXClient, state: StateManager, notifi
                     await notifier.send(f"🔒 {symbol}: TP1 tocado, SL movido a break-even.")
                 except BingXError as e:
                     log.error("%s: fallo moviendo SL a BE: %s", symbol, e)
+
+
+async def manage_paper_positions(client: BingXClient, state: StateManager, notifier: TelegramNotifier) -> None:
+    """Equivalente a manage_open_positions() pero para MODE=SIGNAL, donde
+    no hay posicion real en BingX que consultar. Sin esto, una señal de
+    papel se queda en state.positions PARA SIEMPRE: nunca se sabe si
+    hubiera ganado o perdido (cero tracking de rentabilidad), y en cuanto
+    se acumulan MAX_CONCURRENT_POSITIONS de estas, el bot deja de poder
+    registrar señales nuevas -- confirmado en produccion: 5 posiciones
+    de papel atascadas durante varios ciclos seguidos, justo en el limite."""
+    if cfg.MODE != "SIGNAL" or not state.positions:
+        return
+
+    for symbol in list(state.positions.keys()):
+        pos = state.positions[symbol]
+        if not pos.get("paper"):
+            continue
+        try:
+            candles = await client.get_klines(symbol, cfg.TIMEFRAME, 2)
+        except BingXError as e:
+            log.debug("%s: fallo trayendo precio para posicion de papel (%s)", symbol, e)
+            continue
+        if not candles:
+            continue
+        price = candles[-1].close
+        direction = pos.get("direction")
+        sl, tp2 = pos.get("sl"), pos.get("tp2")
+        if sl is None or tp2 is None:
+            continue
+
+        hit_tp = price >= tp2 if direction == "LONG" else price <= tp2
+        hit_sl = price <= sl if direction == "LONG" else price >= sl
+        if not (hit_tp or hit_sl):
+            continue
+
+        win = hit_tp and not hit_sl  # si ambos se tocaron en el mismo hueco de vela, se cuenta como perdedor (conservador)
+        state.close_position(symbol, win=win, kill_zone=pos.get("kill_zone"))
+        elapsed_min = (int(time.time() * 1000) - pos.get("opened_at", 0)) / 60000 if pos.get("opened_at") else None
+        extra = f" ({elapsed_min:.0f} min)" if elapsed_min is not None else ""
+        icon = "✅" if win else "❌"
+        await notifier.send(f"{icon} <b>[Papel] Cierre {'TP' if win else 'SL'}</b> — {symbol}{extra}")
 
 
 async def reconcile_on_startup(client: BingXClient, state: StateManager, notifier: TelegramNotifier) -> None:

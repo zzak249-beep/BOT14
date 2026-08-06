@@ -124,6 +124,7 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
 
     try:
         await executor.manage_open_positions(client, state, notifier)
+        await executor.manage_paper_positions(client, state, notifier)
     except Exception as e:
         log.error("Error gestionando posiciones abiertas: %s", e)
 
