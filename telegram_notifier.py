@@ -79,7 +79,7 @@ def format_signal(sig, mode: str) -> str:
         extra += f"  OI: <code>{sig.oi_change_pct:+.2f}%</code>"
     return (
         f"{emoji} <b>{tag} {sig.direction}</b> — {sig.symbol}\n"
-        f"KZ: {sig.kill_zone}  ·  R:R {sig.rr:.2f}\n"
+        f"Ruta: {sig.path}  ·  KZ: {sig.kill_zone}  ·  R:R {sig.rr:.2f}\n"
         f"Entrada: <code>{sig.entry:g}</code>\n"
         f"SL: <code>{sig.sl:g}</code>\n"
         f"TP1: <code>{sig.tp1:g}</code>  TP2: <code>{sig.tp2:g}</code>"

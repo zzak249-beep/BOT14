@@ -141,6 +141,9 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
         wr = (total_w * 100.0 / (total_w + total_l)) if (total_w + total_l) else 0.0
         log.info("Papel: %d abiertas | %dW/%dL (%.0f%% de %d cerradas)",
                   state.open_position_count(), total_w, total_l, wr, total_w + total_l)
+        rev = state.path_stats.get("REV", {"w": 0, "l": 0})
+        cont = state.path_stats.get("CONT", {"w": 0, "l": 0})
+        log.info("Por ruta: REV %dW/%dL | CONT %dW/%dL", rev["w"], rev["l"], cont["w"], cont["l"])
     st = get_cycle_stats()
     log.info(
         "Embudo: sweeps=%d fvgs=%d confirmaciones=%d | rechazadas por RR=%d direccion=%d "

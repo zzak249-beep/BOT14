@@ -31,6 +31,7 @@ class StateManager:
         self.trades_today_date: str = ""
         self.trades_today_count: int = 0
         self.kz_stats: dict = {}               # "LON" -> {"w": int, "l": int}, etc.
+        self.path_stats: dict = {}             # "REV"/"CONT" -> {"w": int, "l": int}
         self.equity_peak: float = 0.0
         self.contract_meta_synced_at: float = 0.0
         self._load()
@@ -54,6 +55,7 @@ class StateManager:
         self.trades_today_date = raw.get("trades_today_date", "")
         self.trades_today_count = raw.get("trades_today_count", 0)
         self.kz_stats = raw.get("kz_stats", {})
+        self.path_stats = raw.get("path_stats", {})
         self.equity_peak = raw.get("equity_peak", 0.0)
         log.info(
             "Estado cargado: %d simbolos rastreados, %d posiciones abiertas, %d trades hoy.",
@@ -68,6 +70,7 @@ class StateManager:
                 "trades_today_date": self.trades_today_date,
                 "trades_today_count": self.trades_today_count,
                 "kz_stats": self.kz_stats,
+                "path_stats": self.path_stats,
                 "equity_peak": self.equity_peak,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -105,10 +108,13 @@ class StateManager:
     def open_position(self, symbol: str, pos: dict) -> None:
         self.positions[symbol] = pos
 
-    def close_position(self, symbol: str, win: Optional[bool] = None, kill_zone: Optional[str] = None) -> None:
+    def close_position(self, symbol: str, win: Optional[bool] = None, kill_zone: Optional[str] = None, path: Optional[str] = None) -> None:
         self.positions.pop(symbol, None)
         if win is not None and kill_zone:
             bucket = self.kz_stats.setdefault(kill_zone, {"w": 0, "l": 0})
+            bucket["w" if win else "l"] += 1
+        if win is not None and path:
+            bucket = self.path_stats.setdefault(path, {"w": 0, "l": 0})
             bucket["w" if win else "l"] += 1
 
     def open_position_count(self) -> int:

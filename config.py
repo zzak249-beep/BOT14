@@ -11,7 +11,7 @@ import sys
 import logging
 from typing import Optional
 
-CODE_VERSION = "bingx-ict-scanner v1.3.1"
+CODE_VERSION = "bingx-ict-scanner v1.4.0"
 
 
 def _clean(v: Optional[str]) -> Optional[str]:
@@ -107,6 +107,20 @@ EQ_PIVOT_LEN = _int("EQ_PIVOT_LEN", 15)
 EQ_TOL_ATR = _float("EQ_TOL_ATR", 0.10)
 USE_PREMIUM_DISCOUNT = _bool("USE_PREMIUM_DISCOUNT", False)
 DIRECTION = (_clean(os.getenv("DIRECTION")) or "BOTH").upper()  # BOTH | LONG | SHORT
+
+# ── Ruta A: Reversion (sweep + FVG) -- la que ya existia, ahora toggleable ──
+USE_PATH_A = _bool("USE_PATH_A", True)
+
+# ── Ruta B: Continuacion (CHoCH + retroceso a golden zone) ──
+# Complementa la Ruta A (sweep+FVG, ya existente) igual que en
+# fibstruct_ict_confluence.pine: dos rutas separadas y etiquetadas,
+# no fusionadas. Si ambas disparan direcciones contrarias en el mismo
+# ciclo, se anulan las dos (mismo criterio que el resto del embudo).
+USE_PATH_B = _bool("USE_PATH_B", True)
+SWING_LEN = _int("SWING_LEN", 10)
+GZ_LOW = _float("GZ_LOW", 0.5)     # borde cercano de la golden zone (fraccion fib)
+GZ_HIGH = _float("GZ_HIGH", 0.618)  # borde lejano
+CONT_CONFIRM = (_clean(os.getenv("CONT_CONFIRM")) or "ENGULF").upper()  # ENGULF | TOUCH
 
 # ── Funding rate / Open Interest (opcionales, apagados por defecto) ──
 # Filtros nuevos sin validar en vivo todavia -- pruebalos en SIGNAL

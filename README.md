@@ -94,6 +94,41 @@ qty/precio) son correctos para tu cuenta es viéndolo funcionar:
   por el leverage directamente — la causa de un bug real que infló
   valores 10-36x en un bot anterior.
 
+## v1.4.0 — Ruta B: Continuación (CHoCH + golden zone)
+
+Pedido: llevar `fibstruct_ict_confluence.pine` (el combinado de dos rutas)
+a este bot. La Ruta A (sweep+FVG) ya existía desde v1.0 — le faltaba la
+Ruta B (estructura + retroceso a fib), así que se añadió aquí en vez de
+crear un tercer bot con infraestructura duplicada.
+
+- `USE_PATH_A` (nuevo, faltaba): apaga/enciende la Ruta A por separado.
+  El Pine original ya lo tenía, el puerto no.
+- `USE_PATH_B`: BOS/CHoCH sobre pivotes propios (`SWING_LEN`, separado
+  de `EQ_PIVOT_LEN`), ancla golden zone (`GZ_LOW`-`GZ_HIGH`) al CHoCH,
+  confirma con envolvente (`CONT_CONFIRM=ENGULF`) o solo toque de zona.
+- Si las dos rutas disparan direcciones contrarias en el mismo ciclo,
+  se anulan ambas — mismo criterio que el resto del embudo.
+- `Signal.path` ("REV"/"CONT") viaja hasta Telegram y hasta el desglose
+  W/L por ruta en el resumen de cada ciclo (`state.path_stats`, mismo
+  patrón que `kz_stats`).
+
+**Bug real encontrado construyendo esto, no solo en el test:** el
+ancla del fib se fijaba una vez en el CHoCH y ahí se quedaba. Si el
+precio seguía el impulso más allá de esa primera vela (algo normal,
+no una rareza), la golden zone quedaba calculada sobre un rango
+demasiado corto — zona equivocada. Arreglado con seguimiento en vivo:
+el ancla se extiende con cada nuevo máximo/mínimo hasta que se
+consume la Ruta B o llega un nuevo CHoCH. Verificado con test: mismo
+escenario que antes no generaba señal, ahora sí, con la zona en el
+rango correcto.
+
+## v1.3.1 — log visible en Railway al cerrar posiciones de papel
+
+`manage_paper_positions()` y el resumen de ciclo solo notificaban por
+Telegram al cerrar una posición de papel — invisible en los logs de
+Railway que se revisan todo el rato. Añadido `log.info()` en el cierre
+y una línea de resumen W/L acumulado en cada ciclo.
+
 ## v1.3.0 — MODE=SIGNAL no cerraba nunca sus propias posiciones de papel
 
 Reportado como "revisa rentabilidad" — no había nada que revisar, y el

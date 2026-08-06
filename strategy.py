@@ -82,6 +82,7 @@ class Signal:
     reason: str
     funding_rate: Optional[float] = None
     oi_change_pct: Optional[float] = None
+    path: str = "REV"  # "REV" (Ruta A: sweep+FVG) | "CONT" (Ruta B: CHoCH+golden zone)
 
 
 @dataclass
@@ -92,6 +93,16 @@ class SymbolState:
     fvg: Optional[FVG] = None
     fvg_open_time: int = 0
     oi_at_setup: Optional[float] = None    # OI en el momento del barrido, para comparar en la confirmacion
+    # ── Ruta B (Continuacion): estructura + fib golden zone ──
+    structure_bias: int = 0                # +1 alcista, -1 bajista, 0 sin definir
+    last_broken_high: Optional[float] = None  # precio del ultimo swing high roto -- evita recontar el mismo
+    last_broken_low: Optional[float] = None
+    fib_swing_high: Optional[float] = None
+    fib_swing_low: Optional[float] = None
+    fib_direction: int = 0                 # +1 continuacion alcista, -1 bajista
+    fib_high_is_live: bool = False         # el ancla alta sigue extendiendose con nuevos maximos
+    fib_low_is_live: bool = False          # el ancla baja sigue extendiendose con nuevos minimos
+    cont_consumed: bool = False            # ya se disparo una entrada Ruta B para este anclaje
 
     def to_dict(self) -> dict:
         return {
@@ -101,6 +112,15 @@ class SymbolState:
             "fvg": self.fvg.to_dict() if self.fvg else None,
             "fvg_open_time": self.fvg_open_time,
             "oi_at_setup": self.oi_at_setup,
+            "structure_bias": self.structure_bias,
+            "last_broken_high": self.last_broken_high,
+            "last_broken_low": self.last_broken_low,
+            "fib_swing_high": self.fib_swing_high,
+            "fib_swing_low": self.fib_swing_low,
+            "fib_direction": self.fib_direction,
+            "fib_high_is_live": self.fib_high_is_live,
+            "fib_low_is_live": self.fib_low_is_live,
+            "cont_consumed": self.cont_consumed,
         }
 
     @staticmethod
@@ -112,6 +132,15 @@ class SymbolState:
             fvg=FVG.from_dict(d.get("fvg")),
             fvg_open_time=d.get("fvg_open_time", 0),
             oi_at_setup=d.get("oi_at_setup"),
+            structure_bias=d.get("structure_bias", 0),
+            last_broken_high=d.get("last_broken_high"),
+            last_broken_low=d.get("last_broken_low"),
+            fib_swing_high=d.get("fib_swing_high"),
+            fib_swing_low=d.get("fib_swing_low"),
+            fib_direction=d.get("fib_direction", 0),
+            fib_high_is_live=d.get("fib_high_is_live", False),
+            fib_low_is_live=d.get("fib_low_is_live", False),
+            cont_consumed=d.get("cont_consumed", False),
         )
 
 
@@ -280,6 +309,19 @@ def find_fvg(candles: list, atr_val: float, want_bull: bool, want_bear: bool) ->
     return None
 
 
+def is_bullish_engulf(c0: Candle, c1: Candle) -> bool:
+    """c0 = vela anterior, c1 = vela actual. Envolvente alcista clasica:
+    cuerpo actual mayor que el anterior, cierra por encima de la apertura
+    anterior y abre por debajo del cierre anterior."""
+    return (c1.close > c1.open and c0.close < c0.open
+            and c1.close > c0.open and c1.open < c0.close)
+
+
+def is_bearish_engulf(c0: Candle, c1: Candle) -> bool:
+    return (c1.close < c1.open and c0.close > c0.open
+            and c1.close < c0.open and c1.open > c0.close)
+
+
 # ══════════════════════════════════════════════════════
 # Evaluacion completa de un simbolo
 # ══════════════════════════════════════════════════════
@@ -324,7 +366,7 @@ def evaluate_symbol(
         state.fvg = None
 
     # ── Sweep (solo cuenta si estamos en kill zone, cuando esta activo el filtro) ──
-    if kz_ok:
+    if cfg.USE_PATH_A and kz_ok:
         swp_h, swp_l, ref_h, ref_l = detect_sweep(last, [sw_h, pdh, rng_h, eqh], [sw_l, pdl, rng_l, eql])
         if swp_h:
             _stats["sweeps"] += 1
@@ -347,7 +389,7 @@ def evaluate_symbol(
             state.fvg_open_time = last.open_time
             _stats["fvgs_formed"] += 1
 
-    signal = None
+    signal_a = None
     if state.fvg and not state.fvg.done:
         max_bars = cfg.CE_EXPIRY_BARS if cfg.ENTRY_MODE == "CE" else cfg.FVG_EXPIRY_BARS
         if (last.open_time - state.fvg_open_time) // tf_ms > max_bars:
@@ -373,7 +415,7 @@ def evaluate_symbol(
                                 tgt = max(candidates)
                         rr = (tgt - entry) / r
                         _stats["confirmations"] += 1
-                        signal = Signal(symbol, "LONG", entry, sl, entry + cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg")
+                        signal_a = Signal(symbol, "LONG", entry, sl, entry + cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg", path="REV")
             else:
                 if last.high >= f.bot:
                     f.touched = True
@@ -391,7 +433,124 @@ def evaluate_symbol(
                                 tgt = min(candidates)
                         rr = (entry - tgt) / r
                         _stats["confirmations"] += 1
-                        signal = Signal(symbol, "SHORT", entry, sl, entry - cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg")
+                        signal_a = Signal(symbol, "SHORT", entry, sl, entry - cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "sweep+fvg", path="REV")
+
+    # ══════════════════════════════════════════════════════
+    # RUTA B: Continuacion (CHoCH + retroceso a golden zone)
+    # Independiente de la Ruta A -- comparte pivotes de estructura
+    # con SWING_LEN propio (no el EQ_PIVOT_LEN de arriba).
+    # ══════════════════════════════════════════════════════
+    signal_b = None
+    if cfg.USE_PATH_B and len(ltf) >= cfg.SWING_LEN * 3:
+        struct_highs, struct_lows = pivots(ltf, cfg.SWING_LEN)
+        struct_sw_h = struct_highs[-1] if struct_highs else None
+        struct_sw_l = struct_lows[-1] if struct_lows else None
+
+        is_choch = False
+        is_bull_break = False
+        is_bear_break = False
+
+        bull_break = (struct_sw_h is not None and last.close > struct_sw_h
+                      and struct_sw_h != state.last_broken_high)
+        bear_break = (struct_sw_l is not None and last.close < struct_sw_l
+                      and struct_sw_l != state.last_broken_low)
+
+        if bull_break and bear_break:
+            # mismo criterio que el Pine: prioriza CHoCH sobre BOS
+            if state.structure_bias <= 0:
+                bear_break = False
+            else:
+                bull_break = False
+
+        if bull_break:
+            is_choch = state.structure_bias <= 0
+            state.structure_bias = 1
+            is_bull_break = True
+            state.last_broken_high = struct_sw_h
+        if bear_break:
+            is_choch = state.structure_bias >= 0
+            state.structure_bias = -1
+            is_bear_break = True
+            state.last_broken_low = struct_sw_l
+
+        if is_choch and is_bull_break:
+            state.fib_direction = 1
+            state.fib_swing_high = last.high
+            state.fib_high_is_live = True
+            state.fib_swing_low = struct_sw_l
+            state.fib_low_is_live = False
+            state.cont_consumed = False
+        if is_choch and is_bear_break:
+            state.fib_direction = -1
+            state.fib_swing_low = last.low
+            state.fib_low_is_live = True
+            state.fib_swing_high = struct_sw_h
+            state.fib_high_is_live = False
+            state.cont_consumed = False
+
+        # ── Seguimiento en vivo del ancla: sigue el impulso mientras el
+        # precio hace nuevos extremos, hasta que se consuma la Ruta B o
+        # llegue un nuevo CHoCH. GAP REAL encontrado probando: sin esto,
+        # la golden zone se quedaba fija en el primer maximo/minimo del
+        # CHoCH aunque el precio siguiera corriendo mucho mas lejos --
+        # zona equivocada, no solo en pruebas, tambien en produccion.
+        if not is_bull_break and not is_bear_break and state.fib_direction != 0 and not state.cont_consumed:
+            if state.fib_high_is_live and state.fib_swing_high is not None and last.high > state.fib_swing_high:
+                state.fib_swing_high = last.high
+            if state.fib_low_is_live and state.fib_swing_low is not None and last.low < state.fib_swing_low:
+                state.fib_swing_low = last.low
+
+        fib_ok = (state.fib_swing_high is not None and state.fib_swing_low is not None
+                  and state.fib_swing_high > state.fib_swing_low and state.fib_direction != 0)
+
+        if fib_ok and not state.cont_consumed:
+            rng = state.fib_swing_high - state.fib_swing_low
+            if state.fib_direction == 1:
+                gz_top_raw = state.fib_swing_high - rng * cfg.GZ_LOW
+                gz_bot_raw = state.fib_swing_high - rng * cfg.GZ_HIGH
+                fib_target = state.fib_swing_high + rng * 0.618
+            else:
+                gz_top_raw = state.fib_swing_low + rng * cfg.GZ_HIGH
+                gz_bot_raw = state.fib_swing_low + rng * cfg.GZ_LOW
+                fib_target = state.fib_swing_low - rng * 0.618
+            gz_top, gz_bot = max(gz_top_raw, gz_bot_raw), min(gz_top_raw, gz_bot_raw)
+
+            in_gz = last.low <= gz_top and last.high >= gz_bot
+            if in_gz and len(ltf) >= 2:
+                confirm = True
+                if cfg.CONT_CONFIRM == "ENGULF":
+                    confirm = (is_bullish_engulf(ltf[-2], last) if state.fib_direction == 1
+                               else is_bearish_engulf(ltf[-2], last))
+                if confirm:
+                    entry = last.close
+                    if state.fib_direction == 1:
+                        sl = state.fib_swing_low - cfg.SL_BUFFER_ATR * atr_val
+                        r = entry - sl
+                        if r > 0:
+                            tgt = entry + cfg.RR_FIXED_FALLBACK * r
+                            if fib_target > entry + r * 0.5:
+                                tgt = fib_target
+                            rr = (tgt - entry) / r
+                            state.cont_consumed = True
+                            _stats["confirmations"] += 1
+                            signal_b = Signal(symbol, "LONG", entry, sl, entry + cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "choch+goldenzone", path="CONT")
+                    else:
+                        sl = state.fib_swing_high + cfg.SL_BUFFER_ATR * atr_val
+                        r = sl - entry
+                        if r > 0:
+                            tgt = entry - cfg.RR_FIXED_FALLBACK * r
+                            if fib_target < entry - r * 0.5:
+                                tgt = fib_target
+                            rr = (entry - tgt) / r
+                            state.cont_consumed = True
+                            _stats["confirmations"] += 1
+                            signal_b = Signal(symbol, "SHORT", entry, sl, entry - cfg.PARTIAL_TP_R * r, tgt, rr, kz or "off", "choch+goldenzone", path="CONT")
+
+    # ── Combinar rutas: si disparan direcciones contrarias, se anulan las dos ──
+    if signal_a and signal_b and signal_a.direction != signal_b.direction:
+        signal_a = None
+        signal_b = None
+    signal = signal_a or signal_b
 
     if signal is None:
         return state, None
