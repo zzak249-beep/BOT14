@@ -258,6 +258,7 @@ async def manage_paper_positions(client: BingXClient, state: StateManager, notif
         state.close_position(symbol, win=win, kill_zone=pos.get("kill_zone"))
         elapsed_min = (int(time.time() * 1000) - pos.get("opened_at", 0)) / 60000 if pos.get("opened_at") else None
         extra = f" ({elapsed_min:.0f} min)" if elapsed_min is not None else ""
+        log.info("%s: posicion de papel cerrada por %s%s", symbol, "TP" if win else "SL", extra)
         icon = "✅" if win else "❌"
         await notifier.send(f"{icon} <b>[Papel] Cierre {'TP' if win else 'SL'}</b> — {symbol}{extra}")
 

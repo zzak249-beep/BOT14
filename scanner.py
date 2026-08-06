@@ -135,6 +135,12 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
         "Ciclo completo: %d simbolos, %d señales, %d posiciones abiertas, %.1fs",
         len(symbols), len(signals), state.open_position_count(), elapsed,
     )
+    if cfg.MODE == "SIGNAL":
+        total_w = sum(v.get("w", 0) for v in state.kz_stats.values())
+        total_l = sum(v.get("l", 0) for v in state.kz_stats.values())
+        wr = (total_w * 100.0 / (total_w + total_l)) if (total_w + total_l) else 0.0
+        log.info("Papel: %d abiertas | %dW/%dL (%.0f%% de %d cerradas)",
+                  state.open_position_count(), total_w, total_l, wr, total_w + total_l)
     st = get_cycle_stats()
     log.info(
         "Embudo: sweeps=%d fvgs=%d confirmaciones=%d | rechazadas por RR=%d direccion=%d "
