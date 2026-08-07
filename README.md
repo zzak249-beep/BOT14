@@ -94,6 +94,62 @@ qty/precio) son correctos para tu cuenta es viéndolo funcionar:
   por el leverage directamente — la causa de un bug real que infló
   valores 10-36x en un bot anterior.
 
+## v1.5.0 — sweep intra-vela + lead-lag entre símbolos
+
+Pregunta: cómo anticipan los bots de verdad. Respuesta honesta primero:
+ningún bot predice precio — reacciona más rápido a información que ya
+existe. Dos formas reales de recortar esa distancia, no cosméticas:
+
+**1. `INTRA_CANDLE_SWEEP`** (off por defecto). Antes, el sweep solo se
+evaluaba al cerrar la vela — hasta `TIMEFRAME` completo de retraso desde
+que ocurre hasta que el bot se entera. Verificado primero contra la
+referencia oficial de BingX que cada vela trae su propio `closeTime`, en
+vez de asumir si el endpoint incluye la vela en formación o no. Con esto
+activo, el sweep se detecta contra la vela aún formándose y se marca
+`provisional` — en cuanto cierra de verdad, se revalida: si el cierre
+final ya no lo sostiene, se invalida en vez de quedar con un dato
+obsoleto. Solo afecta al sweep — la geometría de la FVG y la confirmación
+de entrada siguen exigiendo vela cerrada, no tiene sentido evaluarlas a
+medio formar.
+
+**2. `USE_LEAD_LAG`** (off por defecto). BTC suele barrer un nivel
+primero; los alts correlacionados le siguen segundos-minutos después.
+Cuando `LEAD_SYMBOL` (BTC-USDT por defecto) barre, queda registrado en
+un estado compartido entre todos los símbolos del escaneo. Cualquier
+señal en otro símbolo que coincida en dirección dentro de
+`LEAD_LAG_WINDOW_MIN` se etiqueta `lead_confirmed` — puramente
+informativo, no filtra nada, viaja hasta Telegram.
+
+Verificado con tests: el modo intra-vela ignora la vela en formación
+cuando está apagado, la detecta como provisional cuando está encendido,
+y la invalida correctamente si el cierre real ya no la sostiene. El
+lead-lag confirma cuando coincide en dirección y ventana, no confirma
+fuera de ventana ni en símbolos que no son el líder, y la etiqueta llega
+intacta hasta la señal real generada por el pipeline completo.
+
+## v1.4.1 — filtro de profundidad de mecha (idea de Liquidity Reaper [JOAT])
+
+El usuario compartió dos indicadores de terceros para evaluar si servían
+a la estrategia. La mayoría de cada uno duplicaba o iba por debajo de lo
+que ya existía (confirmación sin FVG, TP1/2/3 fijo) — pero uno tenía una
+idea genuinamente nueva: exigir que la mecha del sweep sea al menos un
+% del rango total de la vela, no solo "atravesó y volvió".
+
+`SWEEP_MIN_WICK_PCT` (0 = sin filtro, comportamiento idéntico al
+anterior). Verificado con test: una mecha del 40% del rango sigue
+pasando con el filtro en 25%, una del 5% se rechaza. No crea señales
+nuevas — solo descarta sweeps con rechazo débil, lo cual se puede medir
+directamente contra el desglose del embudo ya existente (`sweeps=N` en
+el log de cada ciclo) antes/después de subir el umbral.
+
+Descartadas del mismo par de indicadores por ahora: pool de varios
+niveles sin barrer (amplía el universo de sweeps antes de haber
+confirmado que la calidad actual es suficiente) y confluencia de
+volumen vía z-score (los dos indicadores tienen filosofías opuestas de
+volumen — uno premia expansión, el otro premia escasez — y no hay
+todavía una base para decidir cuál aporta sin antes tener el filtro de
+mecha como referencia).
+
 ## v1.4.0 — Ruta B: Continuación (CHoCH + golden zone)
 
 Pedido: llevar `fibstruct_ict_confluence.pine` (el combinado de dos rutas)

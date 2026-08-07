@@ -8,6 +8,7 @@ para que scanner.py solo tenga que guardar y pasar el estado por
 simbolo entre ciclos.
 """
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -40,6 +41,33 @@ def reset_cycle_stats() -> None:
 
 def get_cycle_stats() -> dict:
     return dict(_stats)
+
+
+# ══════════════════════════════════════════════════════
+# Lead-lag: estado del simbolo lider (BTC), compartido entre TODOS los
+# simbolos -- no es por-simbolo como SymbolState. En memoria, se
+# resetea al reiniciar (aceptable: se repuebla con el siguiente sweep
+# de BTC, no hace falta persistirlo en disco).
+# ══════════════════════════════════════════════════════
+_lead_state = {"direction": None, "at_ms": 0}
+
+
+def _update_lead_state(symbol: str, direction: str, at_ms: int) -> None:
+    if symbol.upper() == cfg.LEAD_SYMBOL.upper():
+        _lead_state["direction"] = direction
+        _lead_state["at_ms"] = at_ms
+
+
+def _lead_confirms(direction: str, now_ms: int) -> Optional[bool]:
+    """None = LEAD_LAG apagado o sin dato reciente del lider (no se
+    etiqueta). True/False = hay un lead reciente y coincide o no."""
+    if not cfg.USE_LEAD_LAG or _lead_state["direction"] is None:
+        return None
+    age_min = (now_ms - _lead_state["at_ms"]) / 60000.0
+    if age_min > cfg.LEAD_LAG_WINDOW_MIN or age_min < 0:
+        return None
+    lead_bull = _lead_state["direction"] == "bull"
+    return lead_bull == (direction == "LONG")
 
 TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
          "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "1d": 86_400_000}
@@ -83,6 +111,7 @@ class Signal:
     funding_rate: Optional[float] = None
     oi_change_pct: Optional[float] = None
     path: str = "REV"  # "REV" (Ruta A: sweep+FVG) | "CONT" (Ruta B: CHoCH+golden zone)
+    lead_confirmed: Optional[bool] = None  # None=sin dato/apagado, True=el simbolo lider se movio igual reciente, False=en contra
 
 
 @dataclass
@@ -90,6 +119,7 @@ class SymbolState:
     last_open_time: int = 0
     setup_side: Optional[str] = None       # "bull" | "bear" | None
     setup_open_time: int = 0
+    setup_provisional: bool = False        # el sweep vino de una vela AUN en formacion, pendiente de revalidar al cierre real
     fvg: Optional[FVG] = None
     fvg_open_time: int = 0
     oi_at_setup: Optional[float] = None    # OI en el momento del barrido, para comparar en la confirmacion
@@ -108,6 +138,7 @@ class SymbolState:
         return {
             "last_open_time": self.last_open_time,
             "setup_side": self.setup_side,
+            "setup_provisional": self.setup_provisional,
             "setup_open_time": self.setup_open_time,
             "fvg": self.fvg.to_dict() if self.fvg else None,
             "fvg_open_time": self.fvg_open_time,
@@ -128,6 +159,7 @@ class SymbolState:
         return SymbolState(
             last_open_time=d.get("last_open_time", 0),
             setup_side=d.get("setup_side"),
+            setup_provisional=d.get("setup_provisional", False),
             setup_open_time=d.get("setup_open_time", 0),
             fvg=FVG.from_dict(d.get("fvg")),
             fvg_open_time=d.get("fvg_open_time", 0),
@@ -265,16 +297,22 @@ def detect_eq_levels(candles: list, atr_val: float) -> tuple:
 
 def detect_sweep(last: Candle, levels_high: list, levels_low: list) -> tuple:
     """Evalua SOLO la ultima vela cerrada. Devuelve (swp_high, swp_low, ref_high, ref_low)."""
+    rng = max(last.high - last.low, 1e-12)  # evita division por cero en velas doji perfectas
+
     swp_h, ref_h = False, None
     for lvl in levels_high:
         if lvl is not None and last.high > lvl and last.close < lvl and last.open < lvl:
-            swp_h, ref_h = True, lvl
-            break
+            wick_pct = (last.high - lvl) / rng * 100
+            if wick_pct >= cfg.SWEEP_MIN_WICK_PCT:
+                swp_h, ref_h = True, lvl
+                break
     swp_l, ref_l = False, None
     for lvl in levels_low:
         if lvl is not None and last.low < lvl and last.close > lvl and last.open > lvl:
-            swp_l, ref_l = True, lvl
-            break
+            wick_pct = (lvl - last.low) / rng * 100
+            if wick_pct >= cfg.SWEEP_MIN_WICK_PCT:
+                swp_l, ref_l = True, lvl
+                break
     return swp_h, swp_l, ref_h, ref_l
 
 
@@ -335,11 +373,29 @@ def evaluate_symbol(
         return state, None
 
     last = ltf[-1]
-    if last.open_time == state.last_open_time:
-        return state, None  # ya se evaluo esta vela en un ciclo anterior
-    state.last_open_time = last.open_time
-
+    now_ms = int(time.time() * 1000)
     tf_ms = tf_to_ms(cfg.TIMEFRAME)
+    est_close = last.close_time if last.close_time is not None else last.open_time + tf_ms - 1
+    is_closed = now_ms >= est_close
+
+    if not is_closed:
+        if not cfg.INTRA_CANDLE_SWEEP:
+            return state, None  # vela sin cerrar, modo intra-vela apagado -- comportamiento por defecto: esperar al cierre
+        # Intra-vela activo: NO se marca last_open_time todavia -- se
+        # sigue revisando esta misma vela en formacion cada ciclo, y se
+        # revalida contra los valores finales en cuanto cierre de verdad.
+    else:
+        if last.open_time == state.last_open_time:
+            return state, None  # esta vela cerrada ya se proceso del todo
+        if state.setup_provisional and state.setup_open_time == last.open_time:
+            # El setup activo vino de un sweep visto a medio formar en
+            # ESTA vela -- se descarta y se re-evalua desde cero contra
+            # el cierre real, mas abajo. Un sweep provisional que ya no
+            # se sostiene con el cierre definitivo no debe quedar vivo.
+            state.setup_side = None
+            state.setup_provisional = False
+        state.last_open_time = last.open_time
+
     atr_val = atr(ltf, 14)
     if atr_val <= 0:
         return state, None
@@ -372,17 +428,23 @@ def evaluate_symbol(
             _stats["sweeps"] += 1
             state.setup_side = "bear"
             state.setup_open_time = last.open_time
+            state.setup_provisional = not is_closed
             state.fvg = None
             state.oi_at_setup = current_oi
+            _update_lead_state(symbol, "bear", last.open_time)
         elif swp_l:
             _stats["sweeps"] += 1
             state.setup_side = "bull"
             state.setup_open_time = last.open_time
+            state.setup_provisional = not is_closed
             state.fvg = None
             state.oi_at_setup = current_oi
+            _update_lead_state(symbol, "bull", last.open_time)
 
-    # ── Buscar FVG para el setup activo ──
-    if state.setup_side and state.fvg is None:
+    # ── Buscar FVG para el setup activo (exige vela cerrada -- la
+    # geometria del gap depende de c2=ultima vela, que no puede ser la
+    # que aun se esta formando aunque el sweep si sea provisional) ──
+    if state.setup_side and state.fvg is None and is_closed:
         fvg = find_fvg(ltf, atr_val, want_bull=(state.setup_side == "bull"), want_bear=(state.setup_side == "bear"))
         if fvg:
             state.fvg = fvg
@@ -401,7 +463,7 @@ def evaluate_symbol(
             if f.bull:
                 if last.low <= f.top:
                     f.touched = True
-                triggered = (last.low <= f.ce) if use_ce else (f.touched and last.close > f.top)
+                triggered = is_closed and ((last.low <= f.ce) if use_ce else (f.touched and last.close > f.top))
                 if triggered:
                     f.done = True
                     entry = f.ce if use_ce else last.close
@@ -419,7 +481,7 @@ def evaluate_symbol(
             else:
                 if last.high >= f.bot:
                     f.touched = True
-                triggered = (last.high >= f.ce) if use_ce else (f.touched and last.close < f.bot)
+                triggered = is_closed and ((last.high >= f.ce) if use_ce else (f.touched and last.close < f.bot))
                 if triggered:
                     f.done = True
                     entry = f.ce if use_ce else last.close
@@ -609,6 +671,7 @@ def evaluate_symbol(
     if state.oi_at_setup is not None and current_oi is not None and state.oi_at_setup > 0:
         oi_change_pct = (current_oi - state.oi_at_setup) / state.oi_at_setup * 100.0
     signal.oi_change_pct = oi_change_pct
+    signal.lead_confirmed = _lead_confirms(signal.direction, last.open_time)
 
     if cfg.USE_OI_FILTER:
         if oi_change_pct is None:

@@ -11,7 +11,7 @@ import sys
 import logging
 from typing import Optional
 
-CODE_VERSION = "bingx-ict-scanner v1.4.0"
+CODE_VERSION = "bingx-ict-scanner v1.5.0"
 
 
 def _clean(v: Optional[str]) -> Optional[str]:
@@ -103,6 +103,36 @@ CE_EXPIRY_BARS = _int("CE_EXPIRY_BARS", 12)
 FVG_EXPIRY_BARS = _int("FVG_EXPIRY_BARS", 30)
 SWEEP_EXPIRY_BARS = _int("SWEEP_EXPIRY_BARS", 20)
 USE_EQ = _bool("USE_EQ", True)
+
+# ── Calidad del sweep: profundidad de mecha ──
+# Idea de Liquidity Reaper [JOAT]: exige que la mecha mas alla del nivel
+# barrido sea al menos este % del rango total de la vela -- distingue
+# un rechazo fuerte de un toque debil. 0 = sin filtro (comportamiento
+# anterior). No crea señales nuevas, solo descarta sweeps mecha-debiles.
+SWEEP_MIN_WICK_PCT = _float("SWEEP_MIN_WICK_PCT", 0.0)
+
+# ── Deteccion de sweep intra-vela ──
+# Por defecto, el sweep solo se evalua una vez que la vela cierra (hasta
+# 1 TIMEFRAME completo de retraso desde que ocurre hasta que el bot se
+# entera). Con esto activo, el sweep tambien se comprueba contra la vela
+# AUN EN FORMACION -- se entera en el siguiente ciclo de escaneo
+# (SCAN_INTERVAL_SEC) en vez de esperar a que cierre la vela entera.
+# Riesgo real, no cosmetico: un sweep visto a mitad de vela es
+# provisional -- el precio puede seguir moviendose y invalidarlo antes
+# del cierre real. Por eso se re-valida en cuanto la vela cierra de
+# verdad (ver evaluate_symbol) y se invalida si ya no se sostiene.
+# Solo afecta al SWEEP -- la geometria de la FVG sigue exigiendo velas
+# cerradas, no tiene sentido evaluarla a medio formar.
+INTRA_CANDLE_SWEEP = _bool("INTRA_CANDLE_SWEEP", False)
+
+# ── Lead-lag entre simbolos ──
+# BTC suele barrer un nivel primero; los alts correlacionados lo siguen
+# segundos-minutos despues. Puramente informativo (Signal.lead_confirmed):
+# no filtra nada, solo etiqueta si el simbolo lider se movio en la misma
+# direccion recientemente. Off por defecto.
+USE_LEAD_LAG = _bool("USE_LEAD_LAG", False)
+LEAD_SYMBOL = _clean(os.getenv("LEAD_SYMBOL")) or "BTC-USDT"
+LEAD_LAG_WINDOW_MIN = _int("LEAD_LAG_WINDOW_MIN", 15)
 EQ_PIVOT_LEN = _int("EQ_PIVOT_LEN", 15)
 EQ_TOL_ATR = _float("EQ_TOL_ATR", 0.10)
 USE_PREMIUM_DISCOUNT = _bool("USE_PREMIUM_DISCOUNT", False)

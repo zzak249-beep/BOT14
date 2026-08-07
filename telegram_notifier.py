@@ -12,6 +12,8 @@ from typing import Optional
 
 import aiohttp
 
+import config as cfg
+
 log = logging.getLogger("telegram")
 
 MIN_INTERVAL_SEC = 1.2
@@ -77,6 +79,8 @@ def format_signal(sig, mode: str) -> str:
         extra += f"\nFunding: <code>{sig.funding_rate * 100:.4f}%</code>"
     if sig.oi_change_pct is not None:
         extra += f"  OI: <code>{sig.oi_change_pct:+.2f}%</code>"
+    if sig.lead_confirmed is not None:
+        extra += f"\n{'✅' if sig.lead_confirmed else '⚠️'} Lead {cfg.LEAD_SYMBOL}: {'a favor' if sig.lead_confirmed else 'en contra'}"
     return (
         f"{emoji} <b>{tag} {sig.direction}</b> — {sig.symbol}\n"
         f"Ruta: {sig.path}  ·  KZ: {sig.kill_zone}  ·  R:R {sig.rr:.2f}\n"

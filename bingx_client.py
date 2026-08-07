@@ -48,6 +48,7 @@ class Candle:
     low: float
     close: float
     volume: float
+    close_time: Optional[int] = None  # None si el endpoint no lo trajo -- se estima en el punto de uso
 
 
 def parse_klines(raw: list) -> list:
@@ -66,9 +67,11 @@ def parse_klines(raw: list) -> list:
                 l = k.get("low") if k.get("low") is not None else k.get("l")
                 c = k.get("close") if k.get("close") is not None else k.get("c")
                 v = k.get("volume") if k.get("volume") is not None else k.get("v")
-                out.append(Candle(int(ot), float(o), float(h), float(l), float(c), float(v or 0)))
+                ct = k.get("closeTime") or k.get("close_time") or k.get("ct")
+                out.append(Candle(int(ot), float(o), float(h), float(l), float(c), float(v or 0), int(ct) if ct is not None else None))
             elif isinstance(k, (list, tuple)) and len(k) >= 6:
-                out.append(Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])))
+                ct = int(k[6]) if len(k) >= 7 and k[6] is not None else None
+                out.append(Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), ct))
         except (TypeError, ValueError):
             continue
     out.sort(key=lambda c: c.open_time)
