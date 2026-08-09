@@ -144,6 +144,9 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
         rev = state.path_stats.get("REV", {"w": 0, "l": 0})
         cont = state.path_stats.get("CONT", {"w": 0, "l": 0})
         log.info("Por ruta: REV %dW/%dL | CONT %dW/%dL", rev["w"], rev["l"], cont["w"], cont["l"])
+        n_days = len(state.active_days)
+        avg_per_day = (total_w + total_l) / n_days if n_days else 0.0
+        log.info("Muestra: %d cerradas en %d dias distintos, ~%.0f/dia", total_w + total_l, n_days, avg_per_day)
     st = get_cycle_stats()
     log.info(
         "Embudo: sweeps=%d fvgs=%d confirmaciones=%d | rechazadas por RR=%d direccion=%d "

@@ -32,6 +32,8 @@ class StateManager:
         self.trades_today_count: int = 0
         self.kz_stats: dict = {}               # "LON" -> {"w": int, "l": int}, etc.
         self.path_stats: dict = {}             # "REV"/"CONT" -> {"w": int, "l": int}
+        self.active_days: set = set()          # "YYYY-MM-DD" (UTC) con al menos una apertura -- ver si el
+                                                # numero de trades crece con dias reales o con pocos dias replicados
         self.equity_peak: float = 0.0
         self.contract_meta_synced_at: float = 0.0
         self._load()
@@ -56,6 +58,7 @@ class StateManager:
         self.trades_today_count = raw.get("trades_today_count", 0)
         self.kz_stats = raw.get("kz_stats", {})
         self.path_stats = raw.get("path_stats", {})
+        self.active_days = set(raw.get("active_days", []))
         self.equity_peak = raw.get("equity_peak", 0.0)
         log.info(
             "Estado cargado: %d simbolos rastreados, %d posiciones abiertas, %d trades hoy.",
@@ -71,6 +74,7 @@ class StateManager:
                 "trades_today_count": self.trades_today_count,
                 "kz_stats": self.kz_stats,
                 "path_stats": self.path_stats,
+                "active_days": sorted(self.active_days),
                 "equity_peak": self.equity_peak,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -107,6 +111,7 @@ class StateManager:
     # ── Posiciones que gestiona el bot ──
     def open_position(self, symbol: str, pos: dict) -> None:
         self.positions[symbol] = pos
+        self.active_days.add(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
 
     def close_position(self, symbol: str, win: Optional[bool] = None, kill_zone: Optional[str] = None, path: Optional[str] = None) -> None:
         self.positions.pop(symbol, None)
