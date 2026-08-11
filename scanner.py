@@ -143,7 +143,10 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
                   state.open_position_count(), total_w, total_l, wr, total_w + total_l)
         rev = state.path_stats.get("REV", {"w": 0, "l": 0})
         cont = state.path_stats.get("CONT", {"w": 0, "l": 0})
-        log.info("Por ruta: REV %dW/%dL | CONT %dW/%dL", rev["w"], rev["l"], cont["w"], cont["l"])
+        path_total = rev["w"] + rev["l"] + cont["w"] + cont["l"]
+        unclassified = (total_w + total_l) - path_total
+        log.info("Por ruta: REV %dW/%dL | CONT %dW/%dL%s", rev["w"], rev["l"], cont["w"], cont["l"],
+                  f" | sin clasificar: {unclassified} (posiciones abiertas antes de que se guardara 'path')" if unclassified > 0 else "")
         n_days = len(state.active_days)
         avg_per_day = (total_w + total_l) / n_days if n_days else 0.0
         log.info("Muestra: %d cerradas en %d dias distintos, ~%.0f/dia", total_w + total_l, n_days, avg_per_day)
