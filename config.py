@@ -11,7 +11,7 @@ import sys
 import logging
 from typing import Optional
 
-CODE_VERSION = "bingx-ict-scanner v1.5.2"
+CODE_VERSION = "bingx-ict-scanner v1.6.0"
 
 
 def _clean(v: Optional[str]) -> Optional[str]:
@@ -78,6 +78,19 @@ SYMBOL_BLACKLIST = _set("SYMBOL_BLACKLIST", "")
 SYMBOL_WHITELIST = _set("SYMBOL_WHITELIST", "")
 MIN_24H_VOLUME_USDT = _float("MIN_24H_VOLUME_USDT", 0.0)
 SYMBOL_REFRESH_MIN = _int("SYMBOL_REFRESH_MIN", 60)
+
+# ── Majors vs altcoins -- hipotesis sin confirmar todavia, en backtest de
+# Pine se probo UN major (XRP: 0 operaciones en 3.5 semanas) mientras que
+# 9 altcoins de menor capitalizacion si generaron señales, algunas rentables
+# y otras no. La teoria: sweeps de liquidez son mechas de caza de stops,
+# mas frecuentes donde hay mas retail apalancado y menos profundidad --
+# eso describe altcoins de menor capitalizacion, no majors de alta liquidez.
+# Sin confirmar en BTC/ETH todavia. Por eso: EXCLUDE_MAJORS empieza en
+# false (no se excluye nada por defecto), pero el tracking por categoria
+# (tier_stats) esta SIEMPRE activo -- para validar o descartar la hipotesis
+# con datos reales del bot, no solo con el backtest de Pine.
+MAJOR_SYMBOLS = _set("MAJOR_SYMBOLS", "BTC-USDT,ETH-USDT,XRP-USDT,BNB-USDT,SOL-USDT")
+EXCLUDE_MAJORS = _bool("EXCLUDE_MAJORS", False)
 
 # ── Timeframes ──
 TIMEFRAME = _clean(os.getenv("TIMEFRAME")) or "5m"

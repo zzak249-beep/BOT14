@@ -22,12 +22,20 @@ import time
 from typing import Optional
 
 import config as cfg
-from bingx_client import BingXClient, BingXError
+from bingx_client import BingXClient, BingXError, normalize_symbol
 from state import StateManager
 from strategy import Signal
 from telegram_notifier import TelegramNotifier, format_signal, format_position_closed
 
 log = logging.getLogger("executor")
+
+
+def _tier_of(symbol: str) -> str:
+    """major/altcoin -- valida (o descarta) con datos reales del bot la
+    hipotesis del backtest de Pine: sweeps de liquidez parecen funcionar
+    en altcoins de menor capitalizacion y no en majors de alta liquidez."""
+    norm = normalize_symbol(symbol, cfg.QUOTE_ASSET)
+    return "major" if norm in cfg.MAJOR_SYMBOLS else "altcoin"
 
 
 def _entry_side(direction: str) -> tuple:
@@ -81,7 +89,7 @@ async def handle_signal(sig: Signal, client: BingXClient, state: StateManager, n
         state.open_position(sig.symbol, {
             "direction": sig.direction, "entry": sig.entry, "sl": sig.sl,
             "tp1": sig.tp1, "tp2": sig.tp2, "qty": 0.0, "paper": True,
-            "partial_done": False, "kill_zone": sig.kill_zone, "path": sig.path,
+            "partial_done": False, "kill_zone": sig.kill_zone, "path": sig.path, "tier": _tier_of(sig.symbol),
             "opened_at": int(time.time() * 1000),
         })
         return
@@ -155,7 +163,7 @@ async def handle_signal(sig: Signal, client: BingXClient, state: StateManager, n
     state.open_position(sig.symbol, {
         "direction": sig.direction, "entry": real_entry, "sl": sig.sl,
         "tp1": sig.tp1, "tp2": sig.tp2, "qty": real_qty, "paper": False,
-        "partial_done": False, "kill_zone": sig.kill_zone, "path": sig.path,
+        "partial_done": False, "kill_zone": sig.kill_zone, "path": sig.path, "tier": _tier_of(sig.symbol),
         "equity_at_entry": equity,
     })
 
@@ -193,7 +201,7 @@ async def manage_open_positions(client: BingXClient, state: StateManager, notifi
             # ordenes; usamos el SL/TP mas probable solo para el signo del resultado.
             approx_exit = pos.get("tp2", entry)
             win = (approx_exit - entry) * sign > 0
-            state.close_position(symbol, win=win, kill_zone=pos.get("kill_zone"), path=pos.get("path"))
+            state.close_position(symbol, win=win, kill_zone=pos.get("kill_zone"), path=pos.get("path"), tier=pos.get("tier"))
             await notifier.send(format_position_closed(symbol, "SL/TP", None))
             continue
 
@@ -256,7 +264,7 @@ async def manage_paper_positions(client: BingXClient, state: StateManager, notif
             continue
 
         win = hit_tp and not hit_sl  # si ambos se tocaron en el mismo hueco de vela, se cuenta como perdedor (conservador)
-        state.close_position(symbol, win=win, kill_zone=pos.get("kill_zone"), path=pos.get("path"))
+        state.close_position(symbol, win=win, kill_zone=pos.get("kill_zone"), path=pos.get("path"), tier=pos.get("tier"))
         elapsed_min = (int(time.time() * 1000) - pos.get("opened_at", 0)) / 60000 if pos.get("opened_at") else None
         extra = f" ({elapsed_min:.0f} min)" if elapsed_min is not None else ""
         log.info("%s: posicion de papel cerrada por %s%s", symbol, "TP" if win else "SL", extra)

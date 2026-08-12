@@ -62,6 +62,8 @@ async def get_symbol_universe(client: BingXClient, force: bool = False) -> list:
             continue
         if norm in cfg.SYMBOL_BLACKLIST:
             continue
+        if cfg.EXCLUDE_MAJORS and norm in cfg.MAJOR_SYMBOLS:
+            continue
         if cfg.MIN_24H_VOLUME_USDT > 0:
             vol = float(c.get("quoteVolume24h", c.get("volume24h", 0)) or 0)
             if vol < cfg.MIN_24H_VOLUME_USDT:
@@ -147,6 +149,12 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
         unclassified = (total_w + total_l) - path_total
         log.info("Por ruta: REV %dW/%dL | CONT %dW/%dL%s", rev["w"], rev["l"], cont["w"], cont["l"],
                   f" | sin clasificar: {unclassified} (posiciones abiertas antes de que se guardara 'path')" if unclassified > 0 else "")
+        major = state.tier_stats.get("major", {"w": 0, "l": 0})
+        altcoin = state.tier_stats.get("altcoin", {"w": 0, "l": 0})
+        maj_t, alt_t = major["w"] + major["l"], altcoin["w"] + altcoin["l"]
+        log.info("Por tier: major %dW/%dL%s | altcoin %dW/%dL%s",
+                  major["w"], major["l"], f" ({major['w']*100.0/maj_t:.0f}%)" if maj_t else "",
+                  altcoin["w"], altcoin["l"], f" ({altcoin['w']*100.0/alt_t:.0f}%)" if alt_t else "")
         n_days = len(state.active_days)
         avg_per_day = (total_w + total_l) / n_days if n_days else 0.0
         log.info("Muestra: %d cerradas en %d dias distintos, ~%.0f/dia", total_w + total_l, n_days, avg_per_day)
