@@ -47,6 +47,64 @@ class TelegramNotifier:
             return
         await self._queue.put(text)
 
+    async def send_direct(self, text: str) -> bool:
+        """Envio directo, SIN cola -- para el respaldo diario especificamente.
+        send() normal solo encola; el worker que envia de verdad captura
+        sus propios errores y solo los registra en el log, nunca se los
+        devuelve a quien llamo a send(). Eso basta para señales/cierres
+        (perder una notificacion no es grave), pero NO para el respaldo:
+        si se marca 'enviado' sin haberse entregado de verdad, el dia
+        queda sin respaldo real y nadie se entera hasta que ya sea tarde.
+        Devuelve True solo con confirmacion real de entrega (HTTP 2xx)."""
+        if not self.enabled:
+            log.warning("Telegram deshabilitado -- no se puede confirmar el respaldo diario.")
+            return False
+        if not self._session:
+            log.error("Sesion de Telegram no iniciada -- no se puede enviar el respaldo diario.")
+            return False
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        try:
+            async with self._session.post(
+                url,
+                json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status < 300:
+                    return True
+                body = await resp.text()
+                log.error("Telegram %d en respaldo diario: %s", resp.status, body[:200])
+                return False
+        except aiohttp.ClientError as e:
+            log.error("Error de red en respaldo diario: %s", e)
+            return False
+
+    async def send_direct(self, text: str) -> bool:
+        """Envio directo, SIN cola -- devuelve si de verdad se entrego.
+        send() solo encola y vuelve al momento; un try/except alrededor
+        de eso nunca detectaria un fallo real de Telegram (encolar casi
+        nunca lanza excepcion), asi que marcar 'respaldo enviado' tras
+        un send() normal seria una falsa sensacion de seguridad. Solo
+        para el respaldo diario, donde importa la confirmacion real --
+        el resto de notificaciones (señales, cierres) siguen con send(),
+        donde el rate-limit de la cola importa mas que la certeza."""
+        if not self.enabled or not self._session:
+            return False
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        try:
+            async with self._session.post(
+                url,
+                json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                body = await resp.text()
+                log.error("Telegram %d en respaldo diario: %s", resp.status, body[:200])
+                return False
+        except aiohttp.ClientError as e:
+            log.error("Error de red enviando respaldo diario: %s", e)
+            return False
+
     async def _worker(self) -> None:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         while True:
@@ -95,3 +153,24 @@ def format_position_closed(symbol: str, reason: str, pnl_pct: Optional[float]) -
     icon = "✅" if (pnl_pct or 0) > 0 else "❌" if (pnl_pct or 0) < 0 else "⚪"
     pnl_txt = f" ({pnl_pct:+.2f}%)" if pnl_pct is not None else ""
     return f"{icon} <b>Cierre {reason}</b> — {symbol}{pnl_txt}"
+
+
+def format_backup(snapshot_json: str, total_w: int, total_l: int, win_rate: float) -> str:
+    """Respaldo diario -- si el volumen persistente de Railway se pierde
+    (como ya paso una vez: racha de miles de operaciones en Telegram vs.
+    un puñado en el estado que arranco despues), este mensaje es el unico
+    registro fuera de Railway con el que reconstruir el archivo a mano.
+    Telegram limita ~4096 caracteres por mensaje -- el snapshot agregado
+    (sin symbol_states NI positions, ver backup_snapshot_json) se queda
+    muy por debajo de eso en la practica."""
+    return (
+        f"🗄 <b>Respaldo diario</b>\n"
+        f"Total: {total_w}W/{total_l}L ({win_rate:.0f}%)\n\n"
+        f"Si el volumen persistente se pierde, copia el bloque de abajo "
+        f"y pégalo como <code>state.json</code> en /data para restaurar "
+        f"el historial hasta este punto (perderás lo cerrado después Y "
+        f"las posiciones que estuvieran abiertas en ese momento -- no "
+        f"vienen incluidas aquí a propósito, para mantener el mensaje "
+        f"dentro del límite de Telegram):\n\n"
+        f"<pre>{snapshot_json}</pre>"
+    )

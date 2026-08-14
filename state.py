@@ -38,6 +38,11 @@ class StateManager:
                                                 # numero de trades crece con dias reales o con pocos dias replicados
         self.equity_peak: float = 0.0
         self.contract_meta_synced_at: float = 0.0
+        self.last_backup_date: str = ""        # "YYYY-MM-DD" (UTC) del ultimo respaldo por Telegram enviado --
+                                                # ver backup_snapshot_json(). Si el volumen persistente se pierde
+                                                # (como paso: racha de Telegram con miles de operaciones vs.
+                                                # 27 cerradas en el estado que arranco despues), este es el
+                                                # unico registro fuera de Railway con el que reconstruir a mano.
         self._load()
 
     # ── Carga / guardado ──
@@ -63,6 +68,7 @@ class StateManager:
         self.tier_stats = raw.get("tier_stats", {})
         self.active_days = set(raw.get("active_days", []))
         self.equity_peak = raw.get("equity_peak", 0.0)
+        self.last_backup_date = raw.get("last_backup_date", "")
         log.info(
             "Estado cargado: %d simbolos rastreados, %d posiciones abiertas, %d trades hoy.",
             len(self.symbol_states), len(self.positions), self.trades_today_count,
@@ -80,6 +86,7 @@ class StateManager:
                 "tier_stats": self.tier_stats,
                 "active_days": sorted(self.active_days),
                 "equity_peak": self.equity_peak,
+                "last_backup_date": self.last_backup_date,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
             dirpath = os.path.dirname(self.path) or "."
@@ -131,3 +138,39 @@ class StateManager:
 
     def open_position_count(self) -> int:
         return len(self.positions)
+
+    # ── Respaldo por Telegram ──
+    def needs_daily_backup(self) -> bool:
+        return self.last_backup_date != self._today()
+
+    def mark_backup_sent(self) -> None:
+        self.last_backup_date = self._today()
+
+    def backup_snapshot_json(self, include_positions: bool = True) -> str:
+        """JSON del estado agregado (sin symbol_states, que es ruido de
+        trabajo interno, no historial que importe reconstruir). Pensado
+        para copiar/pegar a mano si el volumen persistente se pierde otra
+        vez -- no es solo un resumen bonito, son los numeros reales tal
+        como estan en /data ahora mismo.
+
+        include_positions=False para el mensaje de Telegram especificamente:
+        positions (posiciones abiertas) es lo MENOS critico de respaldar --
+        es transitorio, se cerrara pronto y pasara a formar parte de
+        kz_stats/path_stats/tier_stats de todos modos -- y es tambien lo
+        unico que puede crecer sin limite predecible (si se sube
+        MAX_CONCURRENT_POSITIONS). Telegram limita ~4096 caracteres por
+        mensaje; los contadores agregados solos se quedan muy por debajo,
+        positions sin tope no lo garantiza."""
+        data = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "trades_today_date": self.trades_today_date,
+            "trades_today_count": self.trades_today_count,
+            "kz_stats": self.kz_stats,
+            "path_stats": self.path_stats,
+            "tier_stats": self.tier_stats,
+            "active_days": sorted(self.active_days),
+            "equity_peak": self.equity_peak,
+        }
+        if include_positions:
+            data["positions"] = self.positions
+        return json.dumps(data, indent=2, ensure_ascii=False)

@@ -13,7 +13,7 @@ import executor
 from bingx_client import BingXClient, BingXError, normalize_symbol
 from state import StateManager
 from strategy import evaluate_symbol, reset_cycle_stats, get_cycle_stats
-from telegram_notifier import TelegramNotifier
+from telegram_notifier import TelegramNotifier, format_backup
 
 log = logging.getLogger("scanner")
 
@@ -106,6 +106,27 @@ async def _fetch_and_evaluate(client: BingXClient, state: StateManager, symbol: 
     return signal
 
 
+async def _send_daily_backup(state: StateManager, notifier: TelegramNotifier, total_w: int, total_l: int, win_rate: float) -> None:
+    """Envia el respaldo diario y marca como enviado SOLO si de verdad se
+    entrego (send_direct devuelve la confirmacion real, no solo si se
+    encolo). Si falla, no se marca -- se reintenta en el proximo ciclo.
+    Si Telegram esta deshabilitado, no hay nada que reintentar: se marca
+    igual para no repetir el intento (y el log) cada ciclo sin sentido."""
+    if not notifier.enabled:
+        state.mark_backup_sent()
+        state.save()
+        return
+    snapshot = state.backup_snapshot_json(include_positions=False)
+    msg = format_backup(snapshot, total_w, total_l, win_rate)
+    delivered = await notifier.send_direct(msg)
+    if delivered:
+        state.mark_backup_sent()
+        state.save()
+        log.info("Respaldo diario entregado por Telegram (%d caracteres).", len(snapshot))
+    else:
+        log.error("Respaldo diario NO se pudo entregar, se reintenta el proximo ciclo.")
+
+
 async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: TelegramNotifier) -> int:
     t0 = time.time()
     reset_cycle_stats()
@@ -158,6 +179,9 @@ async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: Tel
         n_days = len(state.active_days)
         avg_per_day = (total_w + total_l) / n_days if n_days else 0.0
         log.info("Muestra: %d cerradas en %d dias distintos, ~%.0f/dia", total_w + total_l, n_days, avg_per_day)
+
+        if state.needs_daily_backup():
+            await _send_daily_backup(state, notifier, total_w, total_l, wr)
     st = get_cycle_stats()
     log.info(
         "Embudo: sweeps=%d fvgs=%d confirmaciones=%d | rechazadas por RR=%d direccion=%d "
