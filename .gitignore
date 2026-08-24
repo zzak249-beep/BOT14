@@ -1,10 +1,8 @@
-.env
 __pycache__/
-*.pyc
-*.pyo
-state/
-state.json
-*.tmp
-.DS_Store
-venv/
+*.py[cod]
 .venv/
+venv/
+.env
+state.json
+*.log
+.DS_Store
