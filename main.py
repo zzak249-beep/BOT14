@@ -27,7 +27,7 @@ from bingx import BingX, BingXError
 from notify import State, Telegram
 
 logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    level=getattr(logging, getattr(config, "LOG_LEVEL", "INFO"), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
@@ -35,11 +35,52 @@ logging.basicConfig(
 # ciclo cada pocos minutos, son decenas de miles de líneas al día que
 # entierran lo único que importa leer: los ciclos, las señales y los
 # errores. Se silencia salvo que se pida DEBUG a propósito.
-if config.LOG_LEVEL != "DEBUG":
+if getattr(config, "LOG_LEVEL", "INFO") != "DEBUG":
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("bot")
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# COMPATIBILIDAD DE CONFIGURACIÓN
+# Un bot con dinero real no puede morir porque el config.py del
+# repositorio sea más antiguo que main.py. Aquí se comprueba que existan
+# todos los ajustes que este archivo usa y, si falta alguno, se INYECTA
+# su valor por defecto y se avisa — en vez de reventar con un
+# AttributeError que además deja la posición sin vigilancia.
+# ══════════════════════════════════════════════════════════════════════
+_DEFAULTS = {
+    "MIN_ATR_PCT": 4.0, "MIN_COST_COVER": 30.0, "COST_ROUNDTRIP_PCT": 0.25,
+    "MAX_ER_LONG": 0.35, "MIN_QUOTE_VOLUME_24H": 2_000_000.0,
+    "MA_LEN": 20, "ATR_LEN": 14, "STRETCH_ATR": 2.5, "MAX_BARS_STRETCH": 6,
+    "SL_ATR": 1.0, "TP_MODE": "MEAN", "RR_FIXED": 1.5, "MIN_RR": 1.0,
+    "RISK_PCT": 0.5, "MAX_CONCURRENT": 2, "LEVERAGE": 3,
+    "MAX_CONSECUTIVE_LOSSES": 3, "COOLDOWN_MINUTES": 120,
+    "MAX_TRADE_BARS": 12, "USE_TIME_EXIT": True, "TIME_EXIT_ONLY_LOSING": True,
+    "ENTRY_TYPE": "LIMIT", "LIMIT_OFFSET_PCT": 0.05,
+    "TIMEFRAME": "5m", "SCAN_INTERVAL_SEC": 60, "MAX_SYMBOLS": 200,
+    "SCAN_ALL": True, "RANK_INTERVAL_MIN": 15, "RANK_TOP_N": 12,
+    "RANK_MODE": "top_siempre", "RANK_ONLY_WHEN_CANDIDATES": False,
+    "SCAN_CONCURRENCY": 8, "RANGE_LEN": 20, "ER_SHORT": 30, "ER_LONG": 180,
+    "ER_TREND": 0.40, "EXCLUDE_PREFIXES": ["NC"], "SYMBOL_WHITELIST": [],
+    "DAILY_SUMMARY": True, "DAILY_SUMMARY_HOUR_UTC": 7, "HEARTBEAT_HOURS": 12,
+    "IDLE_ALERT_DAYS": 5, "WATCH_ALERTS": True, "WATCH_COOLDOWN_MIN": 60,
+    "WATCH_NEAR_ATR": 0.5, "XSECTION_ENABLED": True, "XSECTION_HOUR_UTC": 0,
+    "XSECTION_N": 5, "XSECTION_MIN_VOL": 500_000.0,
+    "STATE_PATH": "/data/state.json", "LOG_LEVEL": "INFO",
+}
+
+
+def ensure_config() -> list[str]:
+    """Rellena lo que falte y devuelve la lista de lo inyectado."""
+    faltan = []
+    for nombre, valor in _DEFAULTS.items():
+        if not hasattr(config, nombre):
+            setattr(config, nombre, valor)
+            faltan.append(nombre)
+    return faltan
 
 
 def fmt_signal(sig: strategy.Signal, live: bool) -> str:
@@ -70,6 +111,16 @@ class Bot:
         self.last_heartbeat = time.time()
 
     async def start(self) -> None:
+        faltan = ensure_config()
+        if faltan:
+            log.error("config.py desactualizado, faltaban: %s", ", ".join(faltan))
+            await self.tg.send(
+                "⚠️ <b>config.py desactualizado</b>\n"
+                f"Faltaban {len(faltan)} ajustes; se han usado los valores por defecto "
+                f"para no parar el bot:\n<code>{', '.join(faltan[:12])}</code>"
+                + ("…" if len(faltan) > 12 else "")
+                + "\n\nSube el config.py actualizado cuando puedas."
+            )
         log.info("Modo: %s", config.describe())
         await self.tg.send(
             f"🤖 <b>Bot de reversión iniciado</b>\n"
