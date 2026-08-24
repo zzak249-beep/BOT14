@@ -1,246 +1,216 @@
 """
-Motor RSI "doble suelo" + salida por SuperTrend.
+Motor de la estrategia. Traducción literal de reversion_5m.pine.
 
-Traducción literal del Pine de ProBorsa (RSI & SuperTrend Özel Dip
-Stratejisi). Si cambias uno, cambia el otro.
+Si algún día cambias uno, cambia el otro. Un bot que opera algo
+distinto de lo que backtesteaste no es un bot: es una sorpresa.
 
-LA IDEA
-El RSI cruza al alza su propia media móvil. Si eso pasa POR DEBAJO de
-un nivel de disparo (50 por defecto), se cuenta como un intento. El
-primer intento suele fallar; el SEGUNDO es el que se opera. Eso es lo
-que dibuja una figura de doble suelo (W): el precio hace mínimo, rebota
-sin fuerza, vuelve a caer y entonces sí gira.
-
-El contador se REINICIA en cuanto el RSI sube por encima del nivel de
-disparo: si el mercado ya se recuperó, el intento anterior dejó de
-contar.
-
-SALIDA: cuando el SuperTrend cambia de dirección. No hay stop fijo — y
-eso hay que tenerlo muy presente, porque significa que el riesgo por
-operación NO está acotado de antemano.
-
-ADVERTENCIA IMPORTANTE
-Esta estrategia no tiene ni una sola operación medida en este proyecto.
-El Pine original viene con RSI de 10 (en vez de 14) y multiplicador
-2.5, ajustes que su autor describe como hechos para dar más señales y
-salidas más rentables — es decir, parámetros ya optimizados sobre algún
-histórico. Mídela antes de ponerle dinero.
+REGLA DE ORO DEL CÁLCULO: solo se usan velas CERRADAS. La última vela
+que devuelve el exchange está en curso y sus valores cambian hasta que
+cierra; usarla es la forma clásica de que el backtest y el bot no
+coincidan.
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 import config
-
-log = logging.getLogger("strategy")
 
 
 @dataclass
 class Signal:
     symbol: str
-    side: str            # siempre "BUY": la estrategia es solo de largos
+    side: str          # "BUY" (largo) | "SELL" (corto)
     entry: float
     sl: float
-    tp: float | None
-    rsi: float
-    cross_count: int
-    st_value: float
+    tp: float
+    rr: float
     atr_pct: float
+    stretch: float
+    cost_cover: float  # cuántas veces cubre el ATR el coste de ida y vuelta
 
 
-def sma(values: list[float], length: int) -> list[float]:
-    out: list[float] = []
-    acc = 0.0
-    for i, v in enumerate(values):
-        acc += v
-        if i >= length:
-            acc -= values[i - length]
-        out.append(acc / min(i + 1, length))
-    return out
-
-
-def rma(values: list[float], length: int) -> list[float]:
-    """Media de Wilder, que es la que usa el RSI de Pine."""
+def ema(values: list[float], length: int) -> list[float]:
     if not values:
         return []
+    k = 2.0 / (length + 1.0)
     out = [values[0]]
     for v in values[1:]:
-        out.append((out[-1] * (length - 1) + v) / length)
+        out.append(v * k + out[-1] * (1.0 - k))
     return out
 
 
-def rsi_series(closes: list[float], length: int) -> list[float]:
-    if len(closes) < 2:
-        return []
-    subidas = [0.0]
-    bajadas = [0.0]
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i - 1]
-        subidas.append(max(ch, 0.0))
-        bajadas.append(max(-ch, 0.0))
-    up = rma(subidas, length)
-    dn = rma(bajadas, length)
-    out: list[float] = []
-    for u, d in zip(up, dn):
-        if d == 0:
-            out.append(100.0)
-        elif u == 0:
-            out.append(0.0)
-        else:
-            out.append(100.0 - (100.0 / (1.0 + u / d)))
-    return out
-
-
-def atr_series(highs: list[float], lows: list[float], closes: list[float], length: int) -> list[float]:
+def atr(highs: list[float], lows: list[float], closes: list[float], length: int) -> list[float]:
+    """ATR de Wilder, igual que ta.atr de Pine."""
     if len(closes) < 2:
         return []
     trs = [highs[0] - lows[0]]
     for i in range(1, len(closes)):
-        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
-    return rma(trs, length)
-
-
-def supertrend(
-    highs: list[float], lows: list[float], closes: list[float], factor: float, period: int
-) -> tuple[list[float], list[int]]:
-    """
-    SuperTrend igual que ta.supertrend de Pine.
-    Dirección: -1 alcista (la línea va por debajo), +1 bajista.
-    """
-    a = atr_series(highs, lows, closes, period)
-    if not a:
-        return [], []
-    st: list[float] = []
-    dirs: list[int] = []
-    upper_prev = 0.0
-    lower_prev = 0.0
-    st_prev = 0.0
-    dir_prev = 1
-    for i in range(len(closes)):
-        hl2 = (highs[i] + lows[i]) / 2.0
-        upper = hl2 + factor * a[i]
-        lower = hl2 - factor * a[i]
-        if i == 0:
-            st.append(upper)
-            dirs.append(1)
-            upper_prev, lower_prev, st_prev, dir_prev = upper, lower, upper, 1
-            continue
-        lower = lower if (lower > lower_prev or closes[i - 1] < lower_prev) else lower_prev
-        upper = upper if (upper < upper_prev or closes[i - 1] > upper_prev) else upper_prev
-        if st_prev == upper_prev:
-            d = -1 if closes[i] > upper else 1
-        else:
-            d = 1 if closes[i] < lower else -1
-        valor = lower if d == -1 else upper
-        st.append(valor)
-        dirs.append(d)
-        upper_prev, lower_prev, st_prev, dir_prev = upper, lower, valor, d
-    return st, dirs
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    out = [trs[0]]
+    for tr in trs[1:]:
+        out.append((out[-1] * (length - 1) + tr) / length)
+    return out
 
 
 def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     """
-    Devuelve (señal, motivo). El motivo dice por qué NO hay señal, que en
-    un escáner vale más que el silencio.
+    Devuelve (señal, motivo). El motivo explica por qué NO hay señal,
+    que en un escáner es más útil que el silencio: sin él, "no pasa
+    nada" y "está roto" se parecen demasiado.
     """
-    need = max(config.RSI_LEN, config.SIG_LEN, config.ST_PERIOD) * 4 + 20
+    need = max(config.MA_LEN, config.ATR_LEN) + config.MAX_BARS_STRETCH + 5
     if len(candles) < need:
         return None, "pocas velas"
 
-    c = candles[:-1]  # la última está en curso
+    # Se descarta la última: está en curso.
+    c = candles[:-1]
     closes = [x["close"] for x in c]
     highs = [x["high"] for x in c]
     lows = [x["low"] for x in c]
+    opens = [x["open"] for x in c]
 
-    rsi = rsi_series(closes, config.RSI_LEN)
-    if len(rsi) < config.SIG_LEN + 2:
-        return None, "sin rsi"
-    rsi_sig = sma(rsi, config.SIG_LEN)
-    a = atr_series(highs, lows, closes, 14)
-    st, dirs = supertrend(highs, lows, closes, config.ST_FACTOR, config.ST_PERIOD)
-    if not st or not a:
-        return None, "sin supertrend"
+    ma_series = ema(closes, config.MA_LEN)
+    atr_series = atr(highs, lows, closes, config.ATR_LEN)
+    if not ma_series or not atr_series:
+        return None, "sin indicadores"
 
-    atr_pct = a[-1] / closes[-1] * 100.0 if closes[-1] > 0 else 0.0
-    if atr_pct < config.MIN_ATR_PCT:
-        return None, f"sin amplitud ({atr_pct:.2f}%)"
+    close = closes[-1]
+    ma = ma_series[-1]
+    a = atr_series[-1]
+    if a <= 0 or close <= 0:
+        return None, "atr cero"
 
-    # ── El contador, recorrido sobre todo el histórico disponible ──
-    # Se recalcula entero en cada evaluación en vez de guardarlo entre
-    # ciclos: así el estado del bot no puede desincronizarse del gráfico
-    # si se reinicia, que es de donde salen los fallos más difíciles de
-    # encontrar.
-    cross_count = 0
-    señal_idx = -1
-    for i in range(1, len(rsi)):
-        if rsi[i] > config.TRIGGER_LEVEL:
-            cross_count = 0
-            continue
-        cruce = rsi[i] > rsi_sig[i] and rsi[i - 1] <= rsi_sig[i - 1]
-        if cruce and rsi[i] < config.TRIGGER_LEVEL:
-            cross_count += 1
-            if cross_count == config.TARGET_CROSS:
-                señal_idx = i
-                cross_count = 0
+    atr_pct = a / close * 100.0
+    cover = atr_pct / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
 
-    if señal_idx != len(rsi) - 1:
-        return None, f"sin señal (contador en {cross_count} de {config.TARGET_CROSS}, RSI {rsi[-1]:.0f})"
+    # EL FILTRO QUE MANDA. Va primero a propósito: sin recorrido no hay
+    # negocio, por mucho que el patrón sea de libro.
+    if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
+        return None, f"sin amplitud ({atr_pct:.2f}%, {cover:.0f}x)"
 
-    entrada = closes[-1]
+    # Ratio de eficiencia de fondo: recorrido neto / suma de movimientos.
+    # Alto = línea recta = no es terreno de reversión.
+    er_len = min(180, len(closes) - 1)
+    if er_len > 20:
+        neto = abs(closes[-1] - closes[-1 - er_len])
+        total = sum(abs(closes[i] - closes[i - 1]) for i in range(len(closes) - er_len, len(closes)))
+        er_long = neto / total if total > 0 else 0.0
+        if er_long > config.MAX_ER_LONG:
+            return None, f"vertical (ER {er_long:.2f} > {config.MAX_ER_LONG})"
 
-    # El SuperTrend bajista deja su línea POR ENCIMA del precio: no
-    # sirve de stop. Dos salidas posibles, ambas defendibles.
-    if dirs[-1] == 1:
-        if config.REQUIRE_ST_BULL:
-            return None, "señal, pero el SuperTrend sigue bajista"
-        # Fiel al original: se entra igual, con el stop bajo el mínimo
-        # reciente. Sin esto la posición quedaría sin protección real
-        # hasta el próximo giro, que puede tardar días.
-        ventana = lows[-config.SL_SWING_LOOKBACK:]
-        stop = min(ventana) - a[-1] * config.SL_SWING_ATR
-    else:
-        stop = st[-1]
+    stretch = (close - ma) / a
 
-    if stop >= entrada:
-        return None, "stop por encima del precio"
+    # El estiramiento tiene que ser RÁPIDO: hace N velas aún no lo estaba.
+    idx_prev = -1 - config.MAX_BARS_STRETCH
+    if abs(idx_prev) > len(closes) or abs(idx_prev) > len(ma_series):
+        return None, "historial corto"
+    prev_stretch = (closes[idx_prev] - ma_series[idx_prev]) / atr_series[idx_prev]
+    was_flat = abs(prev_stretch) < config.STRETCH_ATR * 0.5
 
-    riesgo_pct = (entrada - stop) / entrada * 100.0
-    if riesgo_pct > config.MAX_RISK_PCT:
-        return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
+    over_up = stretch >= config.STRETCH_ATR and was_flat
+    over_dn = stretch <= -config.STRETCH_ATR and was_flat
+    if not (over_up or over_dn):
+        return None, f"sin estirón ({stretch:+.2f} ATR)"
 
-    tp = entrada + (entrada - stop) * config.RR_TARGET if config.USE_TP else None
+    # Vela de agotamiento: la primera que empuja en contra.
+    exhaust_up = over_up and closes[-1] < opens[-1] and closes[-1] < closes[-2]
+    exhaust_dn = over_dn and closes[-1] > opens[-1] and closes[-1] > closes[-2]
+    if not (exhaust_up or exhaust_dn):
+        return None, "estirado, sin vela de agotamiento"
+
+    if exhaust_up:  # corto contra la subida
+        sl = max(highs[-1], highs[-2]) + a * config.SL_ATR
+        risk = sl - close
+        tp = ma if config.TP_MODE == "MEAN" else close - risk * config.RR_FIXED
+        rr = (close - tp) / risk if risk > 0 else 0.0
+        side = "SELL"
+    else:           # largo contra la caída
+        sl = min(lows[-1], lows[-2]) - a * config.SL_ATR
+        risk = close - sl
+        tp = ma if config.TP_MODE == "MEAN" else close + risk * config.RR_FIXED
+        rr = (tp - close) / risk if risk > 0 else 0.0
+        side = "BUY"
+
+    if risk <= 0:
+        return None, "riesgo no válido"
+    if rr < config.MIN_RR:
+        return None, f"R:R insuficiente ({rr:.2f})"
 
     return (
         Signal(
             symbol=symbol,
-            side="BUY",
-            entry=entrada,
-            sl=stop,
+            side=side,
+            entry=close,
+            sl=sl,
             tp=tp,
-            rsi=rsi[-1],
-            cross_count=config.TARGET_CROSS,
-            st_value=st[-1],
+            rr=rr,
             atr_pct=atr_pct,
+            stretch=stretch,
+            cost_cover=cover,
         ),
         "ok",
     )
 
 
-def exit_signal(candles: list[dict]) -> bool:
-    """SuperTrend girando a bajista: es la salida del Pine original."""
-    if len(candles) < config.ST_PERIOD * 4:
-        return False
+def watch_status(candles: list[dict]) -> tuple[bool, float, float, str] | None:
+    """
+    ¿Está este símbolo A PUNTO de dar señal?
+
+    Aplica los MISMOS filtros previos que evaluate() — amplitud,
+    eficiencia — y devuelve el estiramiento actual. La diferencia es que
+    no exige la vela de agotamiento: avisa mientras el precio se estira,
+    no cuando ya se ha girado.
+
+    Devuelve (está_cerca, estiramiento, atr_pct, dirección probable).
+    """
+    need = max(config.MA_LEN, config.ATR_LEN) + config.MAX_BARS_STRETCH + 5
+    if len(candles) < need:
+        return None
+
     c = candles[:-1]
-    _, dirs = supertrend(
-        [x["high"] for x in c], [x["low"] for x in c], [x["close"] for x in c],
-        config.ST_FACTOR, config.ST_PERIOD,
-    )
-    return len(dirs) >= 2 and dirs[-1] == 1 and dirs[-2] == -1
+    closes = [x["close"] for x in c]
+    highs = [x["high"] for x in c]
+    lows = [x["low"] for x in c]
+
+    ma_series = ema(closes, config.MA_LEN)
+    atr_series = atr(highs, lows, closes, config.ATR_LEN)
+    if not ma_series or not atr_series:
+        return None
+
+    close = closes[-1]
+    a = atr_series[-1]
+    if a <= 0 or close <= 0:
+        return None
+
+    atr_pct = a / close * 100.0
+    cover = atr_pct / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
+    if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
+        return None
+
+    er_len = min(180, len(closes) - 1)
+    if er_len > 20:
+        neto = abs(closes[-1] - closes[-1 - er_len])
+        total = sum(abs(closes[i] - closes[i - 1]) for i in range(len(closes) - er_len, len(closes)))
+        er_long = neto / total if total > 0 else 0.0
+        if er_long > config.MAX_ER_LONG:
+            return None
+
+    stretch = (close - ma_series[-1]) / a
+    umbral = config.STRETCH_ATR * config.WATCH_STRETCH_PCT / 100.0
+    cerca = abs(stretch) >= umbral
+    lado = "CORTO" if stretch > 0 else "LARGO"
+    return cerca, stretch, atr_pct, lado
 
 
 def position_size(equity: float, entry: float, sl: float) -> float:
-    riesgo_unidad = abs(entry - sl)
-    if riesgo_unidad <= 0 or entry <= 0:
+    """Tamaño para arriesgar RISK_PCT del capital si salta el stop."""
+    risk_per_unit = abs(entry - sl)
+    if risk_per_unit <= 0 or entry <= 0:
         return 0.0
-    return (equity * config.RISK_PCT / 100.0) / riesgo_unidad
+    risk_cash = equity * config.RISK_PCT / 100.0
+    return risk_cash / risk_per_unit
