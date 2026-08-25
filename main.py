@@ -163,7 +163,24 @@ class Bot:
     async def handle_signal(self, sig: strategy.Signal) -> None:
         log.info("SEÑAL %s entrada=%.8g sl=%.8g rsi=%.1f", sig.symbol, sig.entry, sig.sl, sig.rsi)
         if not self.live:
-            await self.tg.send(fmt_signal(sig, live=False))
+            # En SIGNAL no se abre nada, así que la misma señal se
+            # volvería a detectar en CADA ciclo mientras la vela siga
+            # siendo la última cerrada: NEAR repetido cada 90 segundos.
+            # Un enfriamiento por símbolo lo convierte en un aviso.
+            ultimos = self.state.data.setdefault("last_signal", {})
+            previo = float(ultimos.get(sig.symbol, 0) or 0)
+            if time.time() - previo < config.SIGNAL_COOLDOWN_MIN * 60:
+                log.debug("%s: señal repetida, en enfriamiento", sig.symbol)
+                return
+            ultimos[sig.symbol] = time.time()
+            self.state.save()
+            entregado = await self.tg.send(fmt_signal(sig, live=False))
+            if not entregado:
+                log.error(
+                    "SEÑAL %s NO entregada por Telegram. Revisa TELEGRAM_CHAT_ID "
+                    "en este servicio: el bot la detecta pero no puede avisarte.",
+                    sig.symbol,
+                )
             return
 
         client_id = f"rsi{sig.symbol.split('-')[0][:6]}{int(time.time())}"

@@ -90,6 +90,10 @@ ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
 LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
 
 # ── Avisos ────────────────────────────────────────────────────────────
+# Enfriamiento por símbolo en modo SIGNAL: sin esto la misma señal se
+# repite en cada ciclo mientras no cambie la vela.
+SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
+
 DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
 DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
 HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
