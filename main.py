@@ -118,6 +118,7 @@ class Bot:
             return
 
         candidatos = 0
+        motivos: dict[str, int] = {}
         for sym in self.symbols:
             if sym in self.state.data.get("open", {}):
                 continue
@@ -126,6 +127,11 @@ class Bot:
                 continue
             sig, motivo = strategy.evaluate(sym, velas)
             if sig is None:
+                # Se agrupa por CLASE de motivo, no por el texto exacto:
+                # "sin señal (contador en 1...)" y "(contador en 0...)"
+                # son el mismo caso y separarlos escondería el patrón.
+                clave = motivo.split("(")[0].strip()
+                motivos[clave] = motivos.get(clave, 0) + 1
                 log.debug("%s: %s", sym, motivo)
                 continue
             candidatos += 1
@@ -134,7 +140,25 @@ class Bot:
             if abiertas >= config.MAX_CONCURRENT:
                 break
 
-        log.info("Ciclo completo · %d símbolos · %d señales", len(self.symbols), candidatos)
+        detalle = " · ".join(f"{k}: {v}" for k, v in sorted(motivos.items(), key=lambda x: -x[1])[:5])
+        log.info("Ciclo completo · %d símbolos · %d señales | %s", len(self.symbols), candidatos, detalle)
+
+        # Si el embudo se corta SIEMPRE en el mismo sitio, eso no es el
+        # mercado: es un filtro mal calibrado. Se avisa una vez al día.
+        if motivos:
+            top = max(motivos.items(), key=lambda x: x[1])
+            if top[1] >= len(self.symbols) * 0.9:
+                hoy = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+                if self.state.data.get("warned_funnel") != hoy:
+                    self.state.data["warned_funnel"] = hoy
+                    self.state.save()
+                    await self.tg.send(
+                        f"🔻 <b>El embudo se corta siempre en el mismo punto</b>\n"
+                        f"<code>{top[0]}</code> descarta {top[1]} de {len(self.symbols)} símbolos.\n"
+                        f"Si es «señal, pero el SuperTrend sigue bajista», el filtro "
+                        f"<code>REQUIRE_ST_BULL</code> está bloqueando la estrategia: un doble "
+                        f"suelo ocurre POR DEFINICIÓN en caída, cuando el SuperTrend está bajista."
+                    )
 
     async def handle_signal(self, sig: strategy.Signal) -> None:
         log.info("SEÑAL %s entrada=%.8g sl=%.8g rsi=%.1f", sig.symbol, sig.entry, sig.sl, sig.rsi)
