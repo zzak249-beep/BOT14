@@ -209,6 +209,11 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     if riesgo_pct > config.MAX_RISK_PCT:
         return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
 
+    # Coste en múltiplos de R: lo que la operación pierde de salida.
+    coste_r = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
+    if riesgo_pct < config.MIN_RISK_PCT or coste_r > config.MAX_COST_IN_R:
+        return None, f"stop demasiado cerca ({riesgo_pct:.2f}%, coste {coste_r:.2f}R)"
+
     tp = entrada + (entrada - stop) * config.RR_TARGET if config.USE_TP else None
 
     return (

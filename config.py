@@ -78,6 +78,14 @@ MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 3_000_000.0)
 # tope, una sola operación puede llevarse un múltiplo del riesgo previsto.
 MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
 MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
+# EL FILTRO QUE FALTABA. El stop lo pone el SuperTrend o el mínimo
+# reciente, y a veces queda MUY cerca: un riesgo del 0.69% con 0.25% de
+# coste significa que la operación empieza perdiendo 0.36R antes de que
+# el precio se mueva. Es el mismo error que ya se corrigió en el otro
+# bot: no basta con acotar el stop por arriba, hay que acotarlo también
+# por ABAJO en relación al coste.
+MIN_RISK_PCT = _float("MIN_RISK_PCT", 1.5)
+MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
 SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
 
 # ── Riesgo ────────────────────────────────────────────────────────────
