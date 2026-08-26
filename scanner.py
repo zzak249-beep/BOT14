@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
 from dataclasses import dataclass
 
 import config
 import strategy
+import liquidations
 from bingx import BingX
 
 log = logging.getLogger("scanner")
@@ -34,7 +34,8 @@ class Row:
     er_long: float
     stretch: float
     state: str      # "en rango" | "estirado" | "fuera"
-    verdict: str
+    verdict: str     # "LISTA" | "estirado" | "RUPTURA" | "vertical" | "en espera" | "sin amplitud"
+    signal: "strategy.Signal | None" = None  # solo si verdict == "LISTA"
 
 
 def efficiency_ratio(closes: list[float], length: int) -> float:
@@ -75,17 +76,30 @@ def analyse(symbol: str, candles: list[dict]) -> Row | None:
     else:
         state = "en rango"
 
-    # Mismo criterio que el radar de TradingView: manda la amplitud.
-    if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
+    # ANTES el ranking tenía su PROPIO criterio de "REVERSIÓN" (solo
+    # amplitud + estirón), distinto del que usa strategy.evaluate() para
+    # disparar de verdad (que además exige que no sea vertical, que haya
+    # cerrado la vela de agotamiento y que el R:R alcance el mínimo). Un
+    # símbolo podía salir marcado "REVERSIÓN" en el ranking y no generar
+    # jamás una señal — o al revés. Ahora se llama a strategy.evaluate()
+    # directamente: el ranking usa el MISMO criterio que abre la
+    # operación, ni más laxo ni más estricto.
+    sig, motivo = strategy.evaluate(symbol, candles)
+
+    if sig is not None:
+        verdict = "LISTA"  # cumple TODO el patrón ahora mismo, incluida la vela de agotamiento
+    elif atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
         verdict = "sin amplitud"
-    elif state == "estirado":
-        verdict = "REVERSIÓN"
+    elif motivo.startswith("vertical"):
+        verdict = "vertical"
+    elif motivo == "estirado, sin vela de agotamiento" or motivo.startswith("R:R insuficiente"):
+        verdict = "estirado"  # candidata cercana: falta la vela o el R:R no llega
     elif state == "fuera" and er_l >= config.ER_TREND:
-        verdict = "RUPTURA"
+        verdict = "RUPTURA"  # informativo: la estrategia no opera rupturas
     else:
         verdict = "en espera"
 
-    return Row(symbol, atr_pct, cover, er_s, er_l, stretch, state, verdict)
+    return Row(symbol, atr_pct, cover, er_s, er_l, stretch, state, verdict, sig)
 
 
 class Scanner:
@@ -119,161 +133,93 @@ class Scanner:
         return rows
 
 
-def funnel(rows: list[Row], closes_ok: int, total: int, liquidez_ok: int) -> str:
-    """
-    EMBUDO: cuántos símbolos caen en cada filtro.
-
-    Responde con números a "¿por qué no entra nunca?", que si no se
-    contesta deduciendo. Y deja a la vista una interacción que es fácil
-    no ver: el umbral efectivo de ATR no es MIN_ATR_PCT, sino el mayor
-    de los dos — MIN_COST_COVER × COST_ROUNDTRIP_PCT. Con 30× y 0.25%
-    de coste se están pidiendo 7.5% de ATR, no 4%.
-    """
-    umbral_efectivo = max(config.MIN_ATR_PCT, config.MIN_COST_COVER * config.COST_ROUNDTRIP_PCT)
-    con_amp = [r for r in rows if r.atr_pct >= umbral_efectivo]
-    tras_er = [r for r in con_amp if r.er_long <= config.MAX_ER_LONG]
-    estirados = [r for r in tras_er if abs(r.stretch) >= config.STRETCH_ATR]
-
-    return (
-        f"🔻 <b>Embudo del escaneo</b>\n"
-        f"Universo: {total}\n"
-        f"→ liquidez ≥{config.MIN_QUOTE_VOLUME_24H/1e6:.1f}M: <b>{liquidez_ok}</b>\n"
-        f"→ con datos suficientes: {closes_ok}\n"
-        f"→ ATR ≥{umbral_efectivo:.1f}%: <b>{len(con_amp)}</b>\n"
-        f"→ no vertical (ER ≤{config.MAX_ER_LONG}): <b>{len(tras_er)}</b>\n"
-        f"→ estirado ≥{config.STRETCH_ATR} ATR: <b>{len(estirados)}</b>\n\n"
-        f"<i>El umbral de ATR que se aplica de verdad es {umbral_efectivo:.1f}% "
-        f"({config.MIN_COST_COVER:.0f}× × {config.COST_ROUNDTRIP_PCT}% de coste), "
-        f"no el {config.MIN_ATR_PCT}% de MIN_ATR_PCT.</i>"
-    )
-
-
-def market_temperature(rows: list[Row]) -> dict:
-    """
-    Termómetro del universo. La pregunta que responde no es "¿hay
-    candidatos?" sino "¿se está calentando el mercado?", que es la que
-    permite anticipar. Un mercado con la mediana de ATR subiendo va a
-    dar candidatos pronto aunque hoy no dé ninguno; uno con la mediana
-    plana puede pasarse semanas sin dar nada, y eso también es una
-    respuesta.
-    """
-    if not rows:
-        return {"n": 0}
-    atrs = sorted(r.atr_pct for r in rows)
-    n = len(atrs)
-    mediana = atrs[n // 2]
-    p90 = atrs[int(n * 0.90)] if n >= 10 else atrs[-1]
-    umbral = config.MIN_ATR_PCT
-    return {
-        "n": n,
-        "mediana": mediana,
-        "p90": p90,
-        "maximo": atrs[-1],
-        "cerca": sum(1 for a in atrs if umbral * 0.5 <= a < umbral),
-        "listos": sum(1 for a in atrs if a >= umbral),
-    }
-
-
-def _tf_minutes(tf: str) -> int:
-    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120, "4h": 240}.get(tf, 5)
-
-
-def candidates_at_timeframe(rows: list[Row], tf_destino: str) -> int:
-    """
-    Cuántos símbolos pasarían el filtro en OTRO timeframe.
-
-    La volatilidad escala con la RAÍZ del tiempo (ATR de 15m ≈ 1.73× el
-    de 5m), pero el coste de operar NO escala: la comisión y el spread
-    son los mismos entres en la vela que entres. Por eso subir de
-    timeframe da más candidatos SIN rebajar el listón — no es aflojar el
-    filtro, es que el mismo movimiento pesa más frente al mismo coste.
-
-    Es una estimación por la regla de la raíz, no una medición: sirve
-    para decidir si merece la pena mirarlo de verdad.
-    """
-    if not rows:
-        return 0
-    factor = math.sqrt(_tf_minutes(tf_destino) / _tf_minutes(config.TIMEFRAME))
-    n = 0
-    for r in rows:
-        atr_esc = r.atr_pct * factor
-        cover_esc = atr_esc / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
-        if atr_esc >= config.MIN_ATR_PCT and cover_esc >= config.MIN_COST_COVER:
-            n += 1
-    return n
-
-
-def format_temperature(t: dict) -> str:
-    if not t.get("n"):
-        return "Sin datos del universo."
-    return (
-        f"🌡️ <b>Temperatura del mercado</b>\n"
-        f"ATR mediano {t['mediana']:.2f}%  ·  percentil 90: {t['p90']:.2f}%  ·  máx {t['maximo']:.2f}%\n"
-        f"A media distancia del umbral: {t['cerca']}  ·  listos: {t['listos']}\n"
-        f"(umbral {config.MIN_ATR_PCT}% sobre {t['n']} símbolos)"
-    )
-
-
-def format_watchlist(rows: list[Row], top: int) -> str:
-    """
-    Top por amplitud AUNQUE ninguno sea operable todavía.
-    Es la lista de vigilancia: las mejores situadas del mercado ahora
-    mismo, con una marca de si pasan el listón o solo se acercan.
-    """
-    if not rows:
-        return "📡 <b>Escaneo BingX</b>\nSin datos."
-    mejores = sorted(rows, key=lambda r: r.cover, reverse=True)[:top]
-    t = market_temperature(rows)
-    lineas = [f"📡 <b>Mejores situadas</b> — {len(rows)} símbolos\n"]
-    for r in mejores:
-        if r.verdict == "REVERSIÓN":
-            marca = "🔶"
-        elif r.verdict == "RUPTURA":
-            marca = "🟩"
-        elif r.verdict == "sin amplitud":
-            marca = "·"
-        else:
-            marca = "✅"
-        base = r.symbol.split("-")[0]
-        lineas.append(
-            f"{marca} <b>{base}</b>  {r.atr_pct:.2f}% ({r.cover:.0f}×)  "
-            f"ER {r.er_short:.2f}/{r.er_long:.2f}  {r.state} {r.stretch:+.1f}"
-        )
-    lineas.append(
-        f"\n🔶 reversión lista · 🟩 ruptura lista · ✅ pasa el listón, esperando · · aún no"
-    )
-    lineas.append(f"Umbral: ≥{config.MIN_ATR_PCT}% y ≥{config.MIN_COST_COVER:.0f}×  ·  ATR mediano {t.get('mediana', 0):.2f}%")
-    return "\n".join(lineas)
-
-
 def format_ranking(rows: list[Row], top: int) -> str:
     con_amplitud = [r for r in rows if r.verdict != "sin amplitud"]
     if not con_amplitud:
-        en15 = candidates_at_timeframe(rows, "15m")
-        en30 = candidates_at_timeframe(rows, "30m")
-        extra = ""
-        if en15 or en30:
-            extra = (
-                f"\n\n💡 Con el MISMO listón, en 15m pasarían <b>{en15}</b> y en 30m <b>{en30}</b>.\n"
-                f"La volatilidad crece con la raíz del tiempo y el coste no: "
-                f"subir de timeframe da más candidatos sin rebajar el filtro."
-            )
         return (
             f"📡 <b>Escaneo BingX</b>\n"
             f"{len(rows)} símbolos analizados.\n"
             f"<b>Ninguno con amplitud suficiente</b> (≥{config.MIN_ATR_PCT}% y "
             f"≥{config.MIN_COST_COVER:.0f}× el coste).\n"
             f"Mercado tranquilo: no es un fallo, es que no hay nada que operar."
-            f"{extra}"
         )
 
     lineas = [f"📡 <b>Escaneo BingX</b> — {len(rows)} símbolos, {len(con_amplitud)} con amplitud\n"]
+    marcas = {"LISTA": "🏆", "estirado": "🔶", "RUPTURA": "🟩", "vertical": "▫"}
     for r in con_amplitud[:top]:
-        marca = "🔶" if r.verdict == "REVERSIÓN" else "🟩" if r.verdict == "RUPTURA" else "·"
+        marca = marcas.get(r.verdict, "·")
         base = r.symbol.split("-")[0]
         lineas.append(
             f"{marca} <b>{base}</b>  {r.atr_pct:.2f}% ({r.cover:.0f}×)  "
             f"ER {r.er_short:.2f}/{r.er_long:.2f}  {r.state} {r.stretch:+.1f}"
         )
-    lineas.append("\n🔶 reversión lista · 🟩 ruptura lista · · con amplitud, en espera")
+    lineas.append(
+        "\n🏆 lista para operar YA · 🔶 estirada, falta vela · 🟩 ruptura (informativo) "
+        "· ▫ vertical, descartada · · con amplitud, en espera"
+    )
+    return "\n".join(lineas)
+
+
+def format_favorites(rows: list[Row], top: int, cascade_lookup=None) -> str | None:
+    """
+    El mensaje que responde a "¿cuáles son las favoritas de este
+    escaneo?". Distinto del ranking: el ranking ordena por amplitud
+    aunque el patrón no esté completo; esto solo cuenta lo que
+    strategy.evaluate() aceptaría abrir en este mismo instante.
+
+    cascade_lookup, si se pasa, es una función symbol -> dict|None
+    (normalmente LiquidationTracker.cascade_status). Cuando la
+    cascada activa confirma la dirección de la señal, se añade una
+    línea aparte — es información extra, no cambia qué símbolos
+    entran en la lista ni el orden.
+
+    Devuelve None si no hay nada que decir (ni listas ni candidatas
+    cercanas), para que el bot no mande un mensaje vacío.
+    """
+    listas = [r for r in rows if r.verdict == "LISTA" and r.signal is not None]
+    if listas:
+        lineas = [f"🏆 <b>Favoritas de este escaneo</b> — {len(listas)} lista(s) para operar\n"]
+        for r in listas[:top]:
+            sig = r.signal
+            base = r.symbol.split("-")[0]
+            lado = "LARGO" if sig.side == "BUY" else "CORTO"
+            emoji = "🟢" if sig.side == "BUY" else "🔴"
+            linea = (
+                f"{emoji} <b>{base}</b> {lado} — entrada <code>{sig.entry:.8g}</code>  "
+                f"SL <code>{sig.sl:.8g}</code>  TP <code>{sig.tp:.8g}</code>\n"
+                f"   R:R {sig.rr:.2f} · ATR {sig.atr_pct:.2f}% ({sig.cost_cover:.0f}×) "
+                f"· estirón {sig.stretch:+.2f} ATR"
+            )
+            if cascade_lookup:
+                casc = cascade_lookup(r.symbol)
+                if casc and casc["activa"] and liquidations.cascade_confirms(sig.side, casc["lado"]):
+                    linea += (
+                        f"\n   🔥 <b>Confirmada por cascada de liquidaciones</b>: "
+                        f"{casc['multiplicador']:.1f}× lo normal, {casc['n_eventos']} "
+                        f"liquidaciones de {casc['lado'].lower()} en los últimos "
+                        f"{config.LIQ_SHORT_WINDOW_SEC // 60} min"
+                    )
+            lineas.append(linea)
+        lineas.append(
+            "\n<i>Cumplen el patrón completo ahora mismo. Si hay hueco libre "
+            "(MAX_CONCURRENT) el bot ya las está procesando por su cuenta.</i>"
+        )
+        return "\n".join(lineas)
+
+    casi = sorted(
+        (r for r in rows if r.verdict == "estirado"),
+        key=lambda r: abs(r.stretch),
+        reverse=True,
+    )[:5]
+    if not casi:
+        return None
+
+    lineas = ["👀 <b>Ninguna lista todavía</b> — las más cerca de estarlo:\n"]
+    for r in casi:
+        base = r.symbol.split("-")[0]
+        direccion = "sobrecomprada" if r.stretch > 0 else "sobrevendida"
+        lineas.append(
+            f"· <b>{base}</b> {direccion}, estirón {r.stretch:+.2f} ATR "
+            f"— falta la vela de agotamiento o el R:R no llega"
+        )
     return "\n".join(lineas)
