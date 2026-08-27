@@ -117,6 +117,87 @@ coste y donde no hubo negocio, 6-13×.
 
 ---
 
+## Puntuación de confianza de entrada (ordena y mide, no adivina)
+
+`score.py` combina en un solo número (0-100) lo que hasta ahora se
+mostraba disperso — margen sobre los mínimos de R:R y cobertura de
+coste, confirmación del RSI, cascada de liquidación. Se usa para dos
+cosas concretas:
+
+**1. Decidir cuál señal se opera primero.** Antes, con `MAX_CONCURRENT`
+limitado, el bot recorría el universo en el orden que devuelve la API
+de BingX — arbitrario para lo que importa. Ahora usa la amplitud
+(`cover`) del último ranking (`self.last_rows`, ya calculado, sin
+llamadas extra) para escanear primero los símbolos con mejor amplitud.
+No es un rediseño completo — sigue cortando en cuanto se llenan los
+huecos, no escanea el universo entero cada ciclo — pero sube mucho la
+probabilidad de que el hueco libre lo llene la mejor oportunidad del
+momento, no la primera que aparece.
+
+**2. Quedar registrado para comprobarlo con datos.** Cada operación
+cerrada guarda su score junto al R conseguido. El resumen diario
+compara la expectativa real por franja de score:
+
+```
+🎯 ¿El score predice algo? (comparar franjas)
+
+Score <40 · n=15 · media -0.36R · PF 0.27
+Score 80-100 · n=15 · media +0.08R · PF 1.14
+```
+
+Si las franjas altas no rinden mejor que las bajas con muestra
+suficiente, el score no está aportando nada — y hay que decirlo, no
+seguir usándolo por inercia. Es la misma disciplina que ya aplica
+`stats.py` al resto del sistema: medir en vez de asumir.
+
+**Qué NO hace:** no sustituye ningún bloqueo existente. El filtro de
+contra-tendencia de 30m sigue siendo un bloqueo duro — no se diluye
+sumando o restando puntos. `SCORE_MIN` (0 por defecto, desactivado)
+puede usarse como un umbral adicional más graduado que un simple sí/no,
+pero nadie lo activa por ti: hay que ponerlo a mano.
+
+---
+
+## RSI de doble cruce + radar de 30m (confirmación de entrada)
+
+Dos filtros nuevos sobre las señales de 5m, pensados para trabajar
+juntos:
+
+**RSI de doble cruce** (`rsi_confirm.py`) — traducción del script Pine
+"ProBorsa: RSI & SuperTrend". No es un cruce de RSI cualquiera: cuenta
+cuántas veces el RSI cruza por encima de su propia media móvil
+MIENTRAS sigue por debajo de 50, y solo confirma en el 2º cruce desde
+la última vez que superó 50 — un doble suelo visto en el RSI en vez de
+en el precio. El script original solo detectaba el lado alcista; aquí
+se añadió el espejo exacto para el lado corto (doble techo), porque el
+bot opera los dos lados.
+
+```
+📈 RSI confirma: doble techo hace 1 vela(s) (RSI 68)
+```
+
+Con `RSI_REQUIRE=true` (por defecto) es un filtro real: una señal sin
+confirmar por RSI **no se envía ni se abre**. Con `RSI_REQUIRE=false`
+pasa a ser solo informativo — recomendado si quieres medir primero
+cuánto recorta antes de dejarlo bloquear entradas.
+
+**Radar de 30m** (`RADAR30M_ENABLED`) — un segundo escaneo del universo
+completo, en 30m, exclusivamente para detectar tendencia de fondo. Si
+un símbolo está en RUPTURA clara en 30m, bloquea las señales de 5m que
+apuesten EN CONTRA de esa tendencia. No es un filtro cualquiera: ataca
+directamente el patrón que el propio histórico de este proyecto
+identificó como la principal fuente de pérdidas — largos a
+contra-tendencia en mercado bajista (~43% de acierto frente a ~79% en
+cortos). Un símbolo sin tendencia clara en 30m (en rango o estirado) no
+bloquea nada — se prefiere dejar pasar una señal con contexto
+desconocido antes que bloquear todo por falta de dato.
+
+```
+🧭 A favor de la tendencia de 30m (bajista)
+```
+
+---
+
 ## Cascadas de liquidación (confirmación, gratis)
 
 Un módulo aparte, `liquidations.py`, escucha dos streams públicos y
@@ -152,6 +233,51 @@ configuración aparte. El estado de conexión de ambos streams
 (`Binance ✓ · Bybit ✓`) sale en el resumen diario, por la misma razón
 que el latido de Telegram: si un stream se cae, hay que enterarse por
 el aviso, no descubrirlo semanas después.
+
+---
+
+## ¿Cómo sé si es rentable?
+
+El bot guarda el resultado real (en R, múltiplos de lo arriesgado) de
+cada operación cerrada — no solo si ganó o perdió. Cada resumen diario
+incluye el informe de expectancy:
+
+```
+📈 Rentabilidad — expectancy en R
+
+SIGNAL · n=40
+Media: +0.11R  ·  IC95%: [-0.16, +0.39]
+Win rate: 55%  ·  Profit factor: 1.37
+Drawdown máx: 4.76R
+⚠️ muestra insuficiente — el intervalo cruza cero, podría ser azar
+```
+
+**El win rate solo no basta.** Dos sistemas con el mismo % de aciertos
+pueden ser uno ganador y otro perdedor según el tamaño de los ganadores
+frente a los perdedores. Lo que decide si hay ventaja es la
+**expectativa** (media de R por operación).
+
+**Y la expectativa sola tampoco basta con pocas operaciones.** Con la
+varianza típica de una reversión (se gana 1-1.5R, se pierde 1R, y suele
+haber más pérdidas que aciertos grandes), hacen falta del orden de
+100-150 operaciones para que el intervalo de confianza al 95% deje de
+tocar cero. Por debajo de eso, un +0.3R de media puede ser tan real
+como pura suerte — es la misma cautela que ya pedía este README a mano
+("35 operaciones... es apostar, no operar"), aquí convertida en número
+exacto: si el IC95% toca cero, con esos mismos datos una estrategia SIN
+ventaja real podría dar ese mismo promedio solo por azar.
+
+El informe separa **SIGNAL de LIVE** a propósito: SIGNAL no paga
+slippage ni comisión real, LIVE sí — mezclarlos escondería justo la
+diferencia que la sección "Riesgo que conviene tener presente" de más
+abajo avisa que va a doler.
+
+**Detalle técnico importante:** en modo SIGNAL no hay posición real que
+el exchange cierre solo — el bot comprueba cada ciclo si el precio tocó
+el SL o el TP contra las velas reales (`reconcile_signal()` en
+`main.py`). Sin esto, una señal en SIGNAL no se cerraría nunca salvo por
+el límite de tiempo, y las estadísticas de rentabilidad estarían
+incompletas desde el principio.
 
 ---
 
@@ -289,7 +415,10 @@ los del Strategy Tester, no iguales.
 | `main.py` | Bucle de escaneo, señales y ejecución |
 | `strategy.py` | Motor — traducción literal del Pine |
 | `scanner.py` | Escaneo del universo completo, ranking y favoritas |
+| `stats.py` | Expectancy en R, IC95%, profit factor — ¿es rentable o es ruido? |
 | `liquidations.py` | Cascadas de liquidación (Binance + Bybit, gratis) — confirmación, no criterio de entrada |
+| `rsi_confirm.py` | RSI de doble cruce (traducido de ProBorsa) — confirmación de entrada en 5m |
+| `score.py` | Puntuación de confianza 0-100 — ordena el universo y se mide contra el R real |
 | `xsection.py` | Sección cruzada (retorno de 24h) |
 | `bingx.py` | Cliente de la API (velas, saldo, órdenes) |
 | `notify.py` | Telegram y estado en disco |
@@ -338,7 +467,10 @@ caído"**. Si un día no llega el latido, es lo segundo.
 main.py                    Bucle: escaneo, señales, salidas por tiempo, avisos
 strategy.py                Motor — traducción literal de reversion_5m.pine
 scanner.py                 Escaneo del universo completo, ranking y favoritas
+stats.py                   Expectancy en R, IC95%, profit factor
 liquidations.py            Cascadas de liquidación (Binance + Bybit, gratis)
+rsi_confirm.py             RSI de doble cruce — confirmación de entrada
+score.py                   Puntuación de confianza 0-100 — ordena y mide
 xsection.py                Sección cruzada (retorno de 24h)
 bingx.py                   Cliente de la API
 notify.py                  Telegram y estado en disco

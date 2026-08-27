@@ -138,9 +138,6 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
 
     if risk <= 0:
         return None, "riesgo no válido"
-    riesgo_pct = abs(entrada - sl) / entrada * 100.0 if entrada > 0 else 99.0
-    if riesgo_pct > config.MAX_RISK_PCT:
-        return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
     if rr < config.MIN_RR:
         return None, f"R:R insuficiente ({rr:.2f})"
 

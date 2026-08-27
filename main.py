@@ -15,22 +15,23 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
-import os
 import time
 
 import httpx
 
 import config
-import journal
 import scanner
 import xsection
 import strategy
 import liquidations
+import rsi_confirm
+import score as scoring
+import stats
 from bingx import BingX, BingXError
 from notify import State, Telegram
 
 logging.basicConfig(
-    level=getattr(logging, getattr(config, "LOG_LEVEL", "INFO"), logging.INFO),
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
@@ -38,56 +39,21 @@ logging.basicConfig(
 # ciclo cada pocos minutos, son decenas de miles de líneas al día que
 # entierran lo único que importa leer: los ciclos, las señales y los
 # errores. Se silencia salvo que se pida DEBUG a propósito.
-if getattr(config, "LOG_LEVEL", "INFO") != "DEBUG":
+if config.LOG_LEVEL != "DEBUG":
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("bot")
 
 
-
-# ══════════════════════════════════════════════════════════════════════
-# COMPATIBILIDAD DE CONFIGURACIÓN
-# Un bot con dinero real no puede morir porque el config.py del
-# repositorio sea más antiguo que main.py. Se comprueba que existan los
-# ajustes que este archivo usa y, si falta alguno, se INYECTA su valor
-# por defecto y se avisa — en vez de reventar con un AttributeError.
-# ══════════════════════════════════════════════════════════════════════
-_DEFAULTS = {
-    "MIN_ATR_PCT": 4.0, "MIN_COST_COVER": 30.0, "COST_ROUNDTRIP_PCT": 0.25,
-    "MAX_ER_LONG": 0.35, "MIN_QUOTE_VOLUME_24H": 2_000_000.0,
-    "MA_LEN": 20, "ATR_LEN": 14, "STRETCH_ATR": 2.5, "MAX_BARS_STRETCH": 6,
-    "SL_ATR": 1.0, "TP_MODE": "MEAN", "RR_FIXED": 1.5, "MIN_RR": 1.0,
-    "RISK_PCT": 0.5, "MAX_CONCURRENT": 2, "LEVERAGE": 3,
-    "MAX_CONSECUTIVE_LOSSES": 3, "COOLDOWN_MINUTES": 120,
-    "MAX_TRADE_BARS": 12, "MAX_TRADE_MINUTES": 60, "USE_TIME_EXIT": True,
-    "TIME_EXIT_ONLY_LOSING": True, "ENTRY_TYPE": "LIMIT", "LIMIT_OFFSET_PCT": 0.05,
-    "TIMEFRAME": "5m", "SCAN_INTERVAL_SEC": 60, "MAX_SYMBOLS": 200,
-    "SCAN_ALL": True, "RANK_INTERVAL_MIN": 15, "RANK_TOP_N": 12,
-    "RANK_ONLY_WHEN_CANDIDATES": True, "SCAN_CONCURRENCY": 8,
-    "RANGE_LEN": 20, "ER_SHORT": 30, "ER_LONG": 180, "ER_TREND": 0.40,
-    "EXCLUDE_PREFIXES": ["NC"], "SYMBOL_WHITELIST": [],
-    "DAILY_SUMMARY": True, "DAILY_SUMMARY_HOUR_UTC": 7, "HEARTBEAT_HOURS": 12,
-    "IDLE_ALERT_DAYS": 5, "XSECTION_ENABLED": True, "XSECTION_HOUR_UTC": 0,
-    "XSECTION_N": 5, "XSECTION_MIN_VOL": 500_000.0,
-    "LIQUIDATIONS_ENABLED": True, "LIQ_BASELINE_MIN": 30,
-    "LIQ_SHORT_WINDOW_SEC": 90, "LIQ_MIN_EVENTS": 3, "LIQ_MULTIPLIER": 3.0,
-    "LIQ_MIN_USD": 5_000.0,
-    "STATE_PATH": "/data/state.json", "LOG_LEVEL": "INFO",
-}
-
-
-def ensure_config() -> list[str]:
-    """Rellena lo que falte y devuelve la lista de lo inyectado."""
-    faltan = []
-    for nombre, valor in _DEFAULTS.items():
-        if not hasattr(config, nombre):
-            setattr(config, nombre, valor)
-            faltan.append(nombre)
-    return faltan
-
-
-def fmt_signal(sig: strategy.Signal, live: bool, cascade: dict | None = None) -> str:
+def fmt_signal(
+    sig: strategy.Signal,
+    live: bool,
+    cascade: dict | None = None,
+    rsi_result: "rsi_confirm.RsiConfirm | None" = None,
+    bias30m: str | None = None,
+    score: "scoring.EntryScore | None" = None,
+) -> str:
     lado = "LARGO" if sig.side == "BUY" else "CORTO"
     cabecera = "🟢 EJECUTADO" if live else "🔔 SEÑAL"
     texto = (
@@ -102,6 +68,19 @@ def fmt_signal(sig: strategy.Signal, live: bool, cascade: dict | None = None) ->
             f"\n🔥 Confirmada por cascada: {cascade['multiplicador']:.1f}× lo normal, "
             f"{cascade['n_eventos']} liquidaciones de {cascade['lado'].lower()}"
         )
+    if rsi_result is not None:
+        if rsi_confirm.confirms(sig.side, rsi_result):
+            texto += (
+                f"\n📈 RSI confirma: doble "
+                f"{'suelo' if sig.side == 'BUY' else 'techo'} hace "
+                f"{rsi_result.velas_desde_señal} vela(s) (RSI {rsi_result.rsi_actual:.0f})"
+            )
+        else:
+            texto += f"\n📉 RSI sin confirmar (RSI {rsi_result.rsi_actual:.0f}) — solo informativo"
+    if bias30m and bias30m != "NEUTRAL":
+        texto += f"\n🧭 A favor de la tendencia de 30m ({bias30m.lower()})"
+    if score is not None:
+        texto += f"\n🎯 {scoring.format_breakdown(score)}"
     return texto
 
 
@@ -116,31 +95,24 @@ class Bot:
         self.scanner = scanner.Scanner(self.api)
         self.last_rank = 0.0
         self.volumes: dict[str, float] = {}
-        self.journal = journal.Journal(
-            os.path.join(os.path.dirname(config.STATE_PATH) or "/data", "operaciones.csv")
-        )
         self.had_candidates = False
         self.last_rows: list = []
         self.last_heartbeat = time.time()
         self.liq = liquidations.LiquidationTracker() if config.LIQUIDATIONS_ENABLED else None
+        self.radar30 = scanner.Scanner(self.api, timeframe=config.RADAR30M_TIMEFRAME) if config.RADAR30M_ENABLED else None
+        self.bias30m: dict[str, str] = {}
+        self.last_radar30 = 0.0
 
     async def start(self) -> None:
-        faltan = ensure_config()
-        if faltan:
-            log.error("config.py desactualizado, faltaban: %s", ", ".join(faltan))
-            await self.tg.send(
-                "⚠️ <b>config.py desactualizado</b>\n"
-                f"Faltaban {len(faltan)} ajustes; se han usado los valores por defecto "
-                f"para no parar el bot:\n<code>{', '.join(faltan[:12])}</code>"
-                + ("…" if len(faltan) > 12 else "")
-            )
         log.info("Modo: %s", config.describe())
         await self.tg.send(
             f"🤖 <b>Bot de reversión iniciado</b>\n"
             f"{config.describe()}\n"
             f"Filtro de amplitud: ATR ≥ {config.MIN_ATR_PCT}% y ≥ {config.MIN_COST_COVER:.0f}× el coste\n"
             f"Riesgo por operación: {config.RISK_PCT}%\n"
-            f"Cascadas de liquidación: {'activadas (Binance + Bybit)' if self.liq else 'desactivadas'}"
+            f"Cascadas de liquidación: {'activadas (Binance + Bybit)' if self.liq else 'desactivadas'}\n"
+            f"RSI doble cruce: {'EXIGIDO' if (config.RSI_CONFIRM_ENABLED and config.RSI_REQUIRE) else ('informativo' if config.RSI_CONFIRM_ENABLED else 'desactivado')}\n"
+            f"Radar 30m (contra-tendencia): {'activado' if self.radar30 else 'desactivado'}"
         )
         await self.refresh_symbols()
         if self.liq:
@@ -150,10 +122,11 @@ class Bot:
             try:
                 await self.maybe_xsection()
                 await self.reconcile()
+                await self.reconcile_signal()
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
-                await self.maybe_idle_warning()
                 await self.check_time_exits()
+                await self.maybe_radar30m()
                 await self.maybe_rank()
                 await self.scan_once()
             except Exception as exc:  # noqa: BLE001
@@ -223,32 +196,30 @@ class Bot:
         if not entregado:
             log.error("El resumen diario NO se entregó: revisa las credenciales de Telegram")
 
-    async def maybe_idle_warning(self) -> None:
-        """
-        Aviso de INACTIVIDAD ECONÓMICA.
+        informe = self.build_expectancy_report()
+        if informe:
+            await self.tg.send(informe)
 
-        El fallo más traicionero en producción es el silencioso: la
-        infraestructura sigue viva, los logs no dan errores y el exchange
-        responde, pero hace semanas que no se opera. Vigilar la salud del
-        proceso no detecta eso — hay que vigilar el resultado.
+        franjas = stats.buckets_por_score(self.state.data.get("trades", []))
+        if franjas:
+            await self.tg.send(franjas)
+
+    def build_expectancy_report(self) -> str | None:
         """
-        if not self.live or config.IDLE_ALERT_DAYS <= 0:
-            return
-        ultima = float(self.state.data.get("last_trade_ts", 0) or 0)
-        if ultima <= 0:
-            ultima = float(self.state.data.setdefault("started_ts", time.time()))
-        dias = (time.time() - ultima) / 86400.0
-        if dias < config.IDLE_ALERT_DAYS:
-            return
-        if self.state.data.get("idle_warned_at", 0) and time.time() - float(self.state.data["idle_warned_at"]) < 86400:
-            return
-        self.state.data["idle_warned_at"] = time.time()
-        self.state.save()
-        await self.tg.send(
-            f"🔇 <b>{dias:.0f} días sin una sola operación</b> estando en LIVE.\n"
-            f"Puede ser el mercado (filtros exigentes) o puede ser un fallo silencioso.\n"
-            f"Comprueba: ¿siguen llegando los escaneos? ¿el saldo es correcto?"
-        )
+        Arma {'SIGNAL': [...], 'LIVE': [...]} a partir del historial
+        guardado y delega en stats.format_report(). Separado por modo
+        a propósito: SIGNAL no paga slippage ni comisión real, LIVE sí
+        — mezclarlos escondería justo la diferencia que el README
+        avisa que va a doler.
+        """
+        trades = self.state.data.get("trades", [])
+        if not trades:
+            return None
+        rs_por_modo: dict[str, list[float]] = {}
+        for t in trades:
+            modo = t.get("mode", "LIVE")
+            rs_por_modo.setdefault(modo, []).append(float(t["r"]))
+        return stats.format_report(rs_por_modo)
 
     async def maybe_heartbeat(self) -> None:
         """Señal de vida periódica: si deja de llegar, el bot está caído."""
@@ -348,21 +319,14 @@ class Bot:
                 ultimo = velas[-1]["close"] if velas else pos["entry"]
             except Exception:  # noqa: BLE001
                 ultimo = pos["entry"]
-            if pos["side"] == "BUY":
-                gano = ultimo > pos["entry"]
-            else:
-                gano = ultimo < pos["entry"]
-            log.info("%s cerrada fuera del bot (%s)", symbol, "ganada" if gano else "perdida")
-            riesgo = abs(float(pos["entry"]) - float(pos["sl"]))
-            r_real = ((ultimo - float(pos["entry"])) if pos["side"] == "BUY"
-                      else (float(pos["entry"]) - ultimo)) / riesgo if riesgo > 0 else 0.0
-            minutos = int((time.time() - float(pos.get("opened_at", time.time()))) / 60)
-            self.journal.cerrar(symbol, "sl/tp", ultimo, r_real, minutos)
+            r = stats.compute_r(pos["entry"], pos["sl"], pos["side"], ultimo)
+            gano = r > 0
+            log.info("%s cerrada fuera del bot (%s, %+.2fR)", symbol, "ganada" if gano else "perdida", r)
             await self.tg.send(
                 f"{'✅' if gano else '🛑'} <b>{symbol}</b> cerrada · "
-                f"{'objetivo' if gano else 'stop'}\n{self.stats_text()}"
+                f"{'objetivo' if gano else 'stop'} · {r:+.2f}R\n{self.stats_text()}"
             )
-            self.register_close(symbol, gano)
+            self.register_close_r(symbol, pos, ultimo, reason=("objetivo" if gano else "stop"), mode=pos.get("mode", "LIVE"))
 
     async def check_time_exits(self) -> None:
         """
@@ -370,6 +334,13 @@ class Bot:
         El SL y el TP los vigila el exchange; el reloj lo vigila el bot,
         porque el exchange no sabe nada de la ventana en la que la
         estrategia tiene sentido.
+
+        ANTES esto hacía pop() del estado sin llamar a
+        register_close_r(): la operación desaparecía sin dejar rastro
+        en wins/losses ni en el historial de R. Con MAX_TRADE_BARS de
+        por medio, buena parte de los cierres pasan por aquí — sin
+        registrarlos, las estadísticas de rentabilidad estaban
+        incompletas desde el principio.
         """
         if not config.USE_TIME_EXIT:
             return
@@ -379,20 +350,22 @@ class Bot:
             edad = ahora - float(pos.get("opened_at", ahora))
             if edad < limite:
                 continue
-            if config.TIME_EXIT_ONLY_LOSING:
-                try:
-                    velas = await self.api.klines(symbol, config.TIMEFRAME, limit=2)
-                    ultimo = velas[-1]["close"] if velas else None
-                except Exception:  # noqa: BLE001
-                    ultimo = None
-                if ultimo is not None:
-                    entrada = float(pos.get("entry", ultimo))
-                    a_favor = ultimo > entrada if pos["side"] == "BUY" else ultimo < entrada
-                    if a_favor:
-                        log.info("%s pasa del límite pero va a favor: se deja correr", symbol)
-                        continue
+
+            try:
+                velas = await self.api.klines(symbol, config.TIMEFRAME, limit=2)
+                ultimo = velas[-1]["close"] if velas else None
+            except Exception:  # noqa: BLE001
+                ultimo = None
+
+            if config.TIME_EXIT_ONLY_LOSING and ultimo is not None:
+                entrada = float(pos.get("entry", ultimo))
+                a_favor = ultimo > entrada if pos["side"] == "BUY" else ultimo < entrada
+                if a_favor:
+                    log.info("%s pasa del límite pero va a favor: se deja correr", symbol)
+                    continue
+
             log.info("%s lleva %.0f min abierta: cierre por tiempo", symbol, edad / 60)
-            if self.live:
+            if self.live and pos.get("mode") != "SIGNAL":
                 try:
                     qty = float(pos.get("qty", 0))
                     if qty > 0:
@@ -400,12 +373,88 @@ class Bot:
                 except Exception as exc:  # noqa: BLE001
                     await self.tg.send(f"⚠️ No se pudo cerrar {symbol} por tiempo: {exc}")
                     continue
-            self.state.data["open"].pop(symbol, None)
-            self.state.save()
+
+            exit_price = ultimo if ultimo is not None else pos["entry"]
+            r = stats.compute_r(pos["entry"], pos["sl"], pos["side"], exit_price)
             await self.tg.send(
                 f"⏱️ <b>{symbol}</b> cerrada por tiempo tras {edad / 60:.0f} min "
-                f"(límite {limite // 60} min)\nLa vuelta no llegó: fuera de la ventana útil."
+                f"(límite {limite // 60} min) · {r:+.2f}R\n"
+                f"La vuelta no llegó: fuera de la ventana útil."
             )
+            self.register_close_r(symbol, pos, exit_price, reason="tiempo", mode=pos.get("mode", "LIVE"))
+
+    async def reconcile_signal(self) -> None:
+        """
+        En SIGNAL no hay posición real en el exchange que vigilar — el
+        SL y el TP son solo dos números guardados en el estado. SIN
+        ESTE MÉTODO, una señal en SIGNAL no se cerraba NUNCA salvo por
+        el límite de tiempo: si el precio tocaba el stop a los cinco
+        minutos, el bot no se enteraba hasta MAX_TRADE_BARS después (o
+        nunca, si iba a favor). Wins/losses se quedaban a cero para
+        siempre y era imposible saber si el sistema es rentable — que
+        es exactamente el problema que esto soluciona.
+        """
+        abiertas = self.state.data.get("open", {})
+        objetivo = [(sym, pos) for sym, pos in abiertas.items() if pos.get("mode") == "SIGNAL"]
+        for symbol, pos in objetivo:
+            try:
+                velas = await self.api.klines(symbol, config.TIMEFRAME, limit=3)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("%s: no se pudo comprobar SL/TP en SIGNAL (%s)", symbol, exc)
+                continue
+            if len(velas) < 2:
+                continue
+            # Se ignora la vela en curso — igual que en strategy.py, solo
+            # cuentan velas cerradas. Se miran las 2 últimas cerradas por
+            # si el ciclo se saltó una vela entre comprobaciones.
+            cerradas = velas[:-1][-2:]
+            entry, sl, tp, side = pos["entry"], pos["sl"], pos["tp"], pos["side"]
+            for vela in cerradas:
+                if side == "BUY":
+                    tp_hit = vela["high"] >= tp
+                    sl_hit = vela["low"] <= sl
+                else:
+                    tp_hit = vela["low"] <= tp
+                    sl_hit = vela["high"] >= sl
+                if not tp_hit and not sl_hit:
+                    continue
+                # Si la misma vela toca los dos niveles, se asume el
+                # PEOR caso (SL primero): es la convención conservadora
+                # — sin datos de tick no hay forma de saber el orden
+                # real dentro de la vela.
+                if sl_hit:
+                    exit_price, reason = sl, "stop"
+                else:
+                    exit_price, reason = tp, "objetivo"
+                r = stats.compute_r(entry, sl, side, exit_price)
+                await self.tg.send(
+                    f"{'✅' if r > 0 else '🛑'} <b>{symbol}</b> "
+                    f"{'objetivo' if r > 0 else 'stop'} (SIGNAL) · {r:+.2f}R\n{self.stats_text()}"
+                )
+                self.register_close_r(symbol, pos, exit_price, reason=reason, mode="SIGNAL")
+                break
+
+    async def maybe_radar30m(self) -> None:
+        """
+        Escaneo aparte, en 30m, EXCLUSIVAMENTE para saber si hay
+        tendencia de fondo. No genera señales ni avisos propios — solo
+        actualiza self.bias30m, que scan_once() consulta para bloquear
+        entradas de 5m a contra-tendencia.
+        """
+        if not self.radar30:
+            return
+        if time.time() - self.last_radar30 < config.RADAR30M_INTERVAL_MIN * 60:
+            return
+        self.last_radar30 = time.time()
+        try:
+            rows = await self.radar30.run(self.symbols)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Radar 30m falló (%s): se mantiene el sesgo anterior", exc)
+            return
+        nuevo_bias = {r.symbol: scanner.bias_from_row(r) for r in rows}
+        con_tendencia = sum(1 for v in nuevo_bias.values() if v != "NEUTRAL")
+        log.info("Radar 30m: %d símbolos, %d con tendencia de fondo marcada", len(rows), con_tendencia)
+        self.bias30m = nuevo_bias
 
     async def maybe_rank(self) -> None:
         """Ranking del universo completo, cada RANK_INTERVAL_MIN."""
@@ -446,6 +495,25 @@ class Bot:
     def in_cooldown(self) -> bool:
         return time.time() < float(self.state.data.get("cooldown_until", 0))
 
+    def _priority_order(self) -> list[str]:
+        """
+        Antes se recorría self.symbols en el orden que devuelve la API
+        de BingX — arbitrario para lo que importa aquí. Con
+        MAX_CONCURRENT limitado y corte en cuanto se llenan los
+        huecos, ese orden decidía en la práctica qué señal se tomaba:
+        la primera que apareciera, no la mejor.
+
+        Se reordena usando la amplitud (cover) del último ranking del
+        universo (self.last_rows, actualizado cada RANK_INTERVAL_MIN) —
+        dato que YA se calculó, sin llamadas extra a la API. Los
+        símbolos sin dato (antes del primer ranking, o que fallaron esa
+        vez) van al final, en su orden original, para no perderlos.
+        """
+        cover = {r.symbol: r.cover for r in self.last_rows}
+        con_dato = sorted((s for s in self.symbols if s in cover), key=lambda s: cover[s], reverse=True)
+        sin_dato = [s for s in self.symbols if s not in cover]
+        return con_dato + sin_dato
+
     async def scan_once(self) -> None:
         if self.in_cooldown():
             restante = int(float(self.state.data["cooldown_until"]) - time.time()) // 60
@@ -458,7 +526,7 @@ class Bot:
             return
 
         con_amplitud = 0
-        for sym in self.symbols:
+        for sym in self._priority_order():
             try:
                 velas = await self.api.klines(sym, config.TIMEFRAME, limit=300)
             except Exception as exc:  # noqa: BLE001
@@ -474,7 +542,45 @@ class Bot:
             if sym in self.state.data.get("open", {}):
                 continue
 
-            await self.handle_signal(sig)
+            # Filtro de contra-tendencia (radar 30m). Solo bloquea
+            # cuando hay un sesgo CLARO — símbolo sin dato o en rango
+            # en 30m pasa igual, para no bloquear todo por falta de
+            # información. Es el mismo patrón que ya se midió como
+            # principal fuente de pérdidas: largos a contra-tendencia
+            # en mercado bajista. Esto sigue siendo un bloqueo DURO,
+            # no algo que el score pueda compensar sumando puntos.
+            bias = self.bias30m.get(sym, "NEUTRAL")
+            if (bias == "BAJISTA" and sig.side == "BUY") or (bias == "ALCISTA" and sig.side == "SELL"):
+                log.info("%s: señal %s bloqueada — contra-tendencia de 30m (%s)", sym, sig.side, bias)
+                continue
+
+            # Confirmación por RSI de doble cruce, sobre las MISMAS
+            # velas de 5m — sin llamadas extra a la API.
+            rsi_result = rsi_confirm.evaluate(
+                velas,
+                length=config.RSI_LENGTH,
+                sig_length=config.RSI_SIGNAL_LENGTH,
+                trigger=config.RSI_TRIGGER,
+                target_count=config.RSI_TARGET_CROSSES,
+                ventana=config.RSI_CONFIRM_BARS,
+            ) if config.RSI_CONFIRM_ENABLED else None
+
+            if config.RSI_CONFIRM_ENABLED and config.RSI_REQUIRE:
+                if not rsi_confirm.confirms(sig.side, rsi_result):
+                    log.info("%s: señal %s sin confirmar por RSI — descartada", sym, sig.side)
+                    continue
+
+            cascade = self.liq.cascade_status(sym) if self.liq else None
+
+            score_result = scoring.compute(sig, rsi_result, cascade, bias) if config.SCORE_ENABLED else None
+            if score_result and config.SCORE_MIN > 0 and score_result.total < config.SCORE_MIN:
+                log.info(
+                    "%s: score %.0f por debajo del mínimo (%.0f) — descartada",
+                    sym, score_result.total, config.SCORE_MIN,
+                )
+                continue
+
+            await self.handle_signal(sig, rsi_result=rsi_result, bias30m=bias, cascade=cascade, score=score_result)
             abiertas += 1
             if abiertas >= config.MAX_CONCURRENT:
                 break
@@ -486,34 +592,34 @@ class Bot:
             con_amplitud,
         )
 
-    def aviso_en_frio(self, symbol: str, clave: str) -> bool:
-        """
-        ¿Toca avisar de esto, o ya se avisó hace poco?
-
-        Una señal que no se puede ejecutar se vuelve a detectar en cada
-        ciclo, así que sin enfriamiento manda el mismo mensaje cada
-        minuto. Quince avisos idénticos no informan quince veces:
-        informan una y luego enseñan a ignorarlos.
-        """
-        avisos = self.state.data.setdefault("avisos", {})
-        k = f"{symbol}:{clave}"
-        previo = float(avisos.get(k, 0) or 0)
-        if time.time() - previo < config.SIGNAL_COOLDOWN_MIN * 60:
-            return False
-        avisos[k] = time.time()
-        self.state.save()
-        return True
-
-    async def handle_signal(self, sig: strategy.Signal) -> None:
+    async def handle_signal(
+        self,
+        sig: strategy.Signal,
+        rsi_result: "rsi_confirm.RsiConfirm | None" = None,
+        bias30m: str | None = None,
+        cascade: dict | None = None,
+        score: "scoring.EntryScore | None" = None,
+    ) -> None:
         log.info(
-            "SEÑAL %s %s entrada=%.8g sl=%.8g tp=%.8g rr=%.2f atr=%.2f%%",
+            "SEÑAL %s %s entrada=%.8g sl=%.8g tp=%.8g rr=%.2f atr=%.2f%%%s",
             sig.side, sig.symbol, sig.entry, sig.sl, sig.tp, sig.rr, sig.atr_pct,
+            f" score={score.total:.0f}" if score else "",
         )
-        cascade = self.liq.cascade_status(sig.symbol) if self.liq else None
 
         if not self.live:
-            await self.tg.send(fmt_signal(sig, live=False, cascade=cascade))
-            self.state.data.setdefault("last_signal", {})[sig.symbol] = time.time()
+            await self.tg.send(
+                fmt_signal(sig, live=False, cascade=cascade, rsi_result=rsi_result, bias30m=bias30m, score=score)
+            )
+            self.state.data.setdefault("open", {})[sig.symbol] = {
+                "mode": "SIGNAL",
+                "side": sig.side,
+                "entry": sig.entry,
+                "sl": sig.sl,
+                "tp": sig.tp,
+                "qty": 0,
+                "opened_at": time.time(),
+                "score": score.total if score else None,
+            }
             self.state.save()
             return
 
@@ -526,19 +632,11 @@ class Bot:
             qty = self.api.round_qty(sig.symbol, qty)
             minimo = self.api.min_qty(sig.symbol)
             if qty <= 0 or (minimo > 0 and qty < minimo):
-                if self.aviso_en_frio(sig.symbol, "lote_minimo"):
-                    riesgo_pct = abs(sig.entry - sig.sl) / sig.entry * 100.0
-                    riesgo_min = minimo * abs(sig.entry - sig.sl)
-                    pct_necesario = (riesgo_min / equity * 100.0) if equity > 0 else 0.0
-                    await self.tg.send(
-                        f"⚠️ <b>{sig.symbol}</b> sin ejecutar: tamaño {qty} "
-                        f"por debajo del lote mínimo ({minimo}).\n"
-                        f"Stop al {riesgo_pct:.1f}% · saldo {equity:.2f} USDT.\n"
-                        f"Para entrar en este símbolo harían falta "
-                        f"<b>{pct_necesario:.2f}%</b> de riesgo por operación "
-                        f"(ahora {config.RISK_PCT}%).\n"
-                        f"<i>Siguiente aviso de este símbolo en {config.SIGNAL_COOLDOWN_MIN} min.</i>"
-                    )
+                await self.tg.send(
+                    f"⚠️ Señal en {sig.symbol} sin ejecutar: tamaño {qty} "
+                    f"por debajo del mínimo del contrato ({minimo}).\n"
+                    f"Con {config.RISK_PCT}% de riesgo y este stop no da para el lote mínimo."
+                )
                 return
 
             # Segunda comprobación, contra el EXCHANGE y no contra el
@@ -558,9 +656,6 @@ class Bot:
                 log.warning("No se pudo comprobar posiciones de %s: %s", sig.symbol, exc)
                 return
             await self.api.set_leverage(sig.symbol, "LONG" if sig.side == "BUY" else "SHORT", config.LEVERAGE)
-            # Identificador propio para poder comprobar después si la
-            # orden existe cuando la respuesta se pierda por el camino.
-            client_id = f"rev{sig.symbol.split('-')[0][:6]}{int(time.time())}"
             if config.ENTRY_TYPE == "LIMIT":
                 # Se pide un pelín MEJOR que el precio actual: en un libro
                 # fino no entrar es mejor que entrar a cualquier precio.
@@ -568,52 +663,43 @@ class Bot:
                 precio = self.api.round_price(sig.symbol, sig.entry * (ajuste if sig.side == "SELL" else 2 - ajuste))
                 sl_r = self.api.round_price(sig.symbol, sig.sl)
                 tp_r = self.api.round_price(sig.symbol, sig.tp)
-                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sl_r, tp_r, client_id)
+                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sl_r, tp_r)
             else:
                 sl_r = self.api.round_price(sig.symbol, sig.sl)
                 tp_r = self.api.round_price(sig.symbol, sig.tp)
-                await self.api.market_order(sig.symbol, sig.side, qty, sl_r, tp_r, client_id)
+                await self.api.market_order(sig.symbol, sig.side, qty, sl_r, tp_r)
         except BingXError as exc:
             await self.tg.send(f"❌ BingX rechazó la orden en {sig.symbol}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001
-            # LA RESPUESTA SE PERDIÓ, PERO LA ORDEN PUEDE EXISTIR.
-            # Es el fallo clásico de los bots en producción: la petición
-            # llega al exchange y la respuesta no vuelve. Darla por
-            # fallida sin comprobar lleva a abrir una segunda encima.
-            if await self.api.order_exists(sig.symbol, client_id):
-                await self.tg.send(
-                    f"⚠️ <b>{sig.symbol}</b>: fallo de red al enviar, pero la orden SÍ existe "
-                    f"en el exchange.\nSe registra como abierta.\n<code>{exc}</code>"
-                )
-                log.warning("%s: respuesta perdida pero la orden existe", sig.symbol)
-            else:
-                await self.tg.send(
-                    f"❌ Error al ejecutar {sig.symbol} y la orden NO existe en el exchange: {exc}"
-                )
-                return
+            await self.tg.send(f"❌ Error al ejecutar {sig.symbol}: {exc}")
+            return
 
-        self.journal.abrir(sig, qty, "LIVE")
-        self.state.data["last_trade_ts"] = time.time()
-        self.state.data.pop("idle_warned_at", None)
         self.state.data.setdefault("open", {})[sig.symbol] = {
+            "mode": "LIVE",
             "side": sig.side,
             "entry": sig.entry,
             "sl": sig.sl,
             "tp": sig.tp,
             "qty": qty,
             "opened_at": time.time(),
+            "score": score.total if score else None,
         }
         self.state.save()
-        await self.tg.send(fmt_signal(sig, live=True, cascade=cascade))
+        await self.tg.send(fmt_signal(sig, live=True, cascade=cascade, rsi_result=rsi_result, bias30m=bias30m, score=score))
 
-    def register_close(self, symbol: str, won: bool) -> None:
+    def register_close_r(self, symbol: str, pos: dict, exit_price: float, reason: str, mode: str) -> None:
         """
-        Lo llama el reconciliador cuando detecta una posición cerrada.
-        El circuit breaker cuenta RACHAS, no dinero: el bot no lleva la
-        contabilidad en euros del exchange y fingir un drawdown en % con
-        datos que no tiene sería inventarse una cifra.
+        Registra el cierre con el R conseguido, no solo si ganó o
+        perdió. El circuit breaker sigue contando RACHAS igual que
+        antes — el bot no lleva contabilidad en euros del exchange y
+        fingir un drawdown en % con datos que no tiene sería
+        inventarse una cifra. Lo nuevo es el historial en R
+        (state.data['trades']), que es lo único que permite calcular
+        expectativa y profit factor de verdad — ver stats.py.
         """
+        r = stats.compute_r(pos["entry"], pos["sl"], pos["side"], exit_price)
+        won = r > 0
         d = self.state.data
         d["closed_trades"] = d.get("closed_trades", 0) + 1
         if won:
@@ -634,6 +720,24 @@ class Bot:
                     )
                 )
         d.get("open", {}).pop(symbol, None)
+
+        # Historial en R, acotado a las últimas 1000 para que
+        # state.json no crezca sin límite con el tiempo.
+        historial = d.setdefault("trades", [])
+        historial.append(
+            {
+                "symbol": symbol,
+                "side": pos["side"],
+                "r": round(r, 4),
+                "reason": reason,
+                "mode": mode,
+                "score": pos.get("score"),
+                "closed_at": time.time(),
+            }
+        )
+        if len(historial) > 1000:
+            del historial[: len(historial) - 1000]
+
         self.state.save()
 
 

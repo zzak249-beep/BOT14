@@ -71,24 +71,7 @@ class State:
     def _load(self) -> None:
         try:
             if self.path.exists():
-                cargado = json.loads(self.path.read_text())
-                # ESTADO DE OTRO BOT: si el archivo viene de un bot
-                # anterior que compartía volumen, sus contadores producen
-                # incoherencias tipo "0 cerradas · 4 aciertos". Se
-                # detecta y se descarta la parte numérica en vez de
-                # arrastrar un historial que no es de este bot.
-                cerradas = int(cargado.get("closed_trades", 0) or 0)
-                wins = int(cargado.get("wins", 0) or 0)
-                losses = int(cargado.get("losses", 0) or 0)
-                if wins + losses > cerradas:
-                    log.warning(
-                        "Estado incoherente (cerradas=%d, aciertos=%d, fallos=%d): "
-                        "parece de otro bot. Se reinician los contadores.",
-                        cerradas, wins, losses,
-                    )
-                    for k in ("closed_trades", "wins", "losses", "consecutive_losses"):
-                        cargado.pop(k, None)
-                self.data.update(cargado)
+                self.data.update(json.loads(self.path.read_text()))
                 log.info("Estado cargado de %s", self.path)
             else:
                 log.warning(

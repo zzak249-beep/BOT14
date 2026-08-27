@@ -56,11 +56,6 @@ TELEGRAM_CHAT_ID = (
 
 # ── Universo y escaneo ────────────────────────────────────────────────
 TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip()
-
-
-def _tf_min_early() -> int:
-    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
-
 SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 60)
 MAX_SYMBOLS = _int("MAX_SYMBOLS", 200)
 SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
@@ -96,10 +91,8 @@ RANK_ONLY_WHEN_CANDIDATES = _bool("RANK_ONLY_WHEN_CANDIDATES", True)
 # Mil símbolos son mil llamadas: el semáforo evita que BingX responda 429.
 SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
 RANGE_LEN = _int("RANGE_LEN", 20)
-ER_SHORT_MINUTES = _int("ER_SHORT_MINUTES", 150)
-ER_LONG_MINUTES = _int("ER_LONG_MINUTES", 900)
-ER_SHORT = _int("ER_SHORT", 0) or max(10, round(ER_SHORT_MINUTES / _tf_min_early()))
-ER_LONG = _int("ER_LONG", 0) or max(30, round(ER_LONG_MINUTES / _tf_min_early()))
+ER_SHORT = _int("ER_SHORT", 30)
+ER_LONG = _int("ER_LONG", 180)
 ER_TREND = _float("ER_TREND", 0.40)
 
 # ── Liquidez ──────────────────────────────────────────────────────────
@@ -131,11 +124,6 @@ STRETCH_ATR = _float("STRETCH_ATR", 2.5)
 MAX_BARS_STRETCH = _int("MAX_BARS_STRETCH", 6)
 SL_ATR = _float("SL_ATR", 1.0)
 MIN_RR = _float("MIN_RR", 1.0)
-# Tope de riesgo en % del precio. El stop lo pone la zona, y a veces
-# queda lejísimos: ONG-USDT dio un stop al 16% del precio en velas de
-# 5 minutos. Con un stop así el objetivo (la media) está a horas de
-# distancia, y una sola operación puede atarte la cuenta medio día.
-MAX_RISK_PCT = _float("MAX_RISK_PCT", 6.0)
 TP_MODE = os.getenv("TP_MODE", "MEAN").strip().upper()  # MEAN | FIXED_R
 RR_FIXED = _float("RR_FIXED", 1.5)
 
@@ -145,16 +133,7 @@ RR_FIXED = _float("RR_FIXED", 1.5)
 # tras retornos anormales. Si la vuelta no llega pronto, ya no estás en
 # el fenómeno que querías operar — estás en el que va en tu contra.
 # 12 velas de 5m = 60 minutos. Mismo valor que reversion_5m.pine.
-# Un parámetro en BARRAS cambia de significado al cambiar de timeframe:
-# 12 velas son 1 hora en 5m pero SEIS en 30m, y la reversión intradía
-# vive en la ventana de minutos a una hora. Se define en minutos y las
-# barras se calculan solas.
-def _tf_min() -> int:
-    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
-
-
-MAX_TRADE_MINUTES = _int("MAX_TRADE_MINUTES", 60)
-MAX_TRADE_BARS = _int("MAX_TRADE_BARS", 0) or max(2, round(MAX_TRADE_MINUTES / _tf_min()))
+MAX_TRADE_BARS = _int("MAX_TRADE_BARS", 12)
 USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
 # Corrección a partir de datos reales: en el histórico medido, varias de
 # las MEJORES ganadoras duraron 75, 100 y 105 minutos. Cortarlas a los 60
@@ -193,21 +172,9 @@ XSECTION_N = _int("XSECTION_N", 5)
 XSECTION_MIN_VOL = _float("XSECTION_MIN_VOL", 500_000.0)
 
 # ── Avisos ────────────────────────────────────────────────────────────
-# Enfriamiento por símbolo para los AVISOS. Sin esto, una señal que no
-# se puede ejecutar se vuelve a detectar en cada ciclo y manda el mismo
-# mensaje cada minuto: quince avisos idénticos de ONG en un rato.
-SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
-
 DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
 DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
 HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
-# Días sin operar en LIVE que disparan aviso. El fallo más traicionero
-# es el silencioso: todo "funciona" y hace semanas que no se opera.
-IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
-
-# ── Estado ────────────────────────────────────────────────────────────
-STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
 # ── Cascadas de liquidación (confirmación, no sustituto) ───────────────
 # Gratis: streams públicos de Binance y Bybit — BingX no publica esto,
@@ -229,6 +196,53 @@ LIQ_MULTIPLIER = _float("LIQ_MULTIPLIER", 3.0)
 # Piso absoluto en USD: sin esto, un símbolo casi sin actividad de
 # liquidaciones da falsos "3×" sobre una base casi nula.
 LIQ_MIN_USD = _float("LIQ_MIN_USD", 5_000.0)
+
+# ── RSI de doble cruce (confirmación de entrada, 5m) ───────────────────
+# Traducción del script "ProBorsa: RSI & SuperTrend" — cuenta cruces del
+# RSI sobre su propia media mientras sigue en zona débil, y dispara en
+# el 2º cruce (doble suelo/techo visto en el RSI). Aquí se hizo
+# simétrico: el original solo detectaba el lado alcista.
+RSI_CONFIRM_ENABLED = _bool("RSI_CONFIRM_ENABLED", True)
+RSI_LENGTH = _int("RSI_LENGTH", 10)
+RSI_SIGNAL_LENGTH = _int("RSI_SIGNAL_LENGTH", 10)
+RSI_TRIGGER = _float("RSI_TRIGGER", 50.0)
+RSI_TARGET_CROSSES = _int("RSI_TARGET_CROSSES", 2)
+# Cuántas velas de 5m hacia atrás cuentan como "reciente" — el cruce no
+# tiene por qué caer EXACTAMENTE en la misma vela que la de agotamiento.
+RSI_CONFIRM_BARS = _int("RSI_CONFIRM_BARS", 3)
+# Si True, una señal SIN confirmación del RSI no se envía ni se abre —
+# es un filtro real, no solo informativo. Empieza en True porque es
+# literalmente lo que se pidió: combinar el RSI con las entradas.
+# Se puede aflojar a False para verlo solo como información mientras
+# se mide si ayuda o solo recorta señales buenas.
+RSI_REQUIRE = _bool("RSI_REQUIRE", True)
+
+# ── Radar de 30m (sesgo de tendencia, filtra contra-tendencia) ─────────
+# Un segundo escaneo del universo, en 30m, EXCLUSIVAMENTE para decidir
+# si hay una tendencia de fondo clara. Si la hay, bloquea las señales
+# de 5m que apuesten EN CONTRA de ella — el patrón que el propio
+# histórico del proyecto señaló como el principal origen de pérdidas
+# (largos a contra-tendencia en mercado bajista, ~43% de acierto).
+RADAR30M_ENABLED = _bool("RADAR30M_ENABLED", True)
+RADAR30M_TIMEFRAME = os.getenv("RADAR30M_TIMEFRAME", "30m").strip()
+RADAR30M_INTERVAL_MIN = _int("RADAR30M_INTERVAL_MIN", 30)
+
+# ── Puntuación de confianza de entrada (score.py) ──────────────────────
+# Combina en un solo número lo que antes se mostraba disperso (RSI,
+# cascada, margen sobre los mínimos de R:R/cobertura). Se usa para
+# ordenar el universo por calidad antes de escanear (ver
+# Bot._priority_order) y se guarda junto a cada operación cerrada, para
+# poder comprobar con datos propios si predice algo — ver
+# stats.buckets_por_score(). No sustituye ningún bloqueo existente: el
+# filtro de contra-tendencia de 30m sigue siendo un bloqueo duro.
+SCORE_ENABLED = _bool("SCORE_ENABLED", True)
+# 0 = desactivado, no bloquea nada por score. Ejemplo: 55 exige señales
+# de calidad media-alta (aprox. base + un par de confirmaciones).
+SCORE_MIN = _float("SCORE_MIN", 0.0)
+
+# ── Estado ────────────────────────────────────────────────────────────
+STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
 
 def is_live() -> bool:

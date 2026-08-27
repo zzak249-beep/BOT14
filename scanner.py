@@ -102,16 +102,36 @@ def analyse(symbol: str, candles: list[dict]) -> Row | None:
     return Row(symbol, atr_pct, cover, er_s, er_l, stretch, state, verdict, sig)
 
 
+def bias_from_row(r: Row) -> str:
+    """
+    Sesgo direccional de un símbolo en el timeframe de este Row —
+    pensado para usarse con un Scanner en 30m como filtro de
+    contra-tendencia sobre las señales de 5m.
+
+    Solo se marca sesgo cuando hay una RUPTURA de verdad (fuera de
+    rango + ER de tendencia alto) — el mismo criterio que ya usa
+    scanner.analyse() para RUPTURA, no uno nuevo. Sin eso, "estirado"
+    o "en rango" en 30m no dicen nada sobre la tendencia de fondo,
+    así que se devuelve NEUTRAL y no se bloquea nada: es mejor dejar
+    pasar una señal con sesgo desconocido que bloquear todo por falta
+    de dato.
+    """
+    if r.verdict == "RUPTURA":
+        return "ALCISTA" if r.stretch > 0 else "BAJISTA"
+    return "NEUTRAL"
+
+
 class Scanner:
-    def __init__(self, api: BingX) -> None:
+    def __init__(self, api: BingX, timeframe: str | None = None) -> None:
         self.api = api
+        self.timeframe = timeframe or config.TIMEFRAME
         self.sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
         self.last_run = 0.0
 
     async def _one(self, symbol: str) -> Row | None:
         async with self.sem:
             try:
-                candles = await self.api.klines(symbol, config.TIMEFRAME, limit=300)
+                candles = await self.api.klines(symbol, self.timeframe, limit=300)
                 return analyse(symbol, candles)
             except Exception as exc:  # noqa: BLE001
                 log.debug("%s: %s", symbol, exc)
@@ -124,7 +144,8 @@ class Scanner:
         rows.sort(key=lambda r: r.cover, reverse=True)
         self.last_run = time.time()
         log.info(
-            "Escaneo: %d/%d símbolos analizados en %.0fs · %d con amplitud",
+            "Escaneo (%s): %d/%d símbolos analizados en %.0fs · %d con amplitud",
+            self.timeframe,
             len(rows),
             len(symbols),
             time.time() - t0,
