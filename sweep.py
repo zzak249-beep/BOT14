@@ -43,17 +43,8 @@ import strategy
 
 # Combinaciones a probar. Pocas y con sentido, no una rejilla enorme:
 # cuantas más pruebas, más fácil encontrar un ganador por azar.
-COMBINACIONES = [
-    # (MIN_COST_COVER, MAX_ER_LONG, STRETCH_ATR)
-    (30, 0.35, 2.5),   # actual
-    (20, 0.35, 2.5),
-    (15, 0.35, 2.5),
-    (10, 0.35, 2.5),
-    (20, 0.50, 2.5),   # más permisivo con verticales
-    (20, 0.35, 2.0),   # estirón más fácil
-    (20, 0.35, 3.0),   # estirón más exigente
-    (10, 0.50, 2.0),   # todo flojo: el extremo, para ver hasta dónde
-]
+CLAVES = ("MIN_RISK_PCT", "TARGET_CROSS", "MAX_COST_IN_R")
+COMBINACIONES = [(1.5, 2, 0.20), (1.0, 2, 0.20), (1.5, 1, 0.20), (2.0, 2, 0.25), (1.0, 1, 0.30), (2.5, 2, 0.15)]
 
 
 def evaluar(velas_por_symbol: dict[str, list[dict]], mitad: str) -> tuple[float, int]:
@@ -97,15 +88,14 @@ async def main() -> int:
         print("Sin datos.")
         return 1
 
-    print(f"\n{'cover':>6} {'ER':>5} {'estirón':>8} │ {'PRIMERA mitad':>22} │ {'SEGUNDA mitad':>22} │")
+    print(f"\n{CLAVES[0][:6]:>6} {CLAVES[1][:5]:>5} {CLAVES[2][:8]:>8} │ {'PRIMERA mitad':>22} │ {'SEGUNDA mitad':>22} │")
     print(f"{'':>6} {'':>5} {'':>8} │ {'(se elige aquí)':>22} │ {'(se comprueba aquí)':>22} │")
     print("─" * 78)
 
     filas = []
     for cover, er, stretch in COMBINACIONES:
-        os.environ["MIN_COST_COVER"] = str(cover)
-        os.environ["MAX_ER_LONG"] = str(er)
-        os.environ["STRETCH_ATR"] = str(stretch)
+        for clave, valor in zip(CLAVES, (cover, er, stretch)):
+            os.environ[clave] = str(valor)
         importlib.reload(config)
         importlib.reload(strategy)
         importlib.reload(backtest)
@@ -141,8 +131,8 @@ async def main() -> int:
         # mejor expectativa: con muestras pequeñas la mejor expectativa
         # suele ser la más afortunada.
         mejor = max(aguantan, key=lambda f: f[4] + f[6])
-        print(f"\nLa que aguanta con más muestra: cover={mejor[0]} "
-              f"ER={mejor[1]} estirón={mejor[2]}")
+        print(f"\nLa que aguanta con más muestra: "
+              + " ".join(f"{k}={v}" for k, v in zip(CLAVES, mejor[:3])))
         print(f"  primera {mejor[3]:+.3f} R ({mejor[4]} ops) · "
               f"segunda {mejor[5]:+.3f} R ({mejor[6]} ops)")
         print("\nAntes de aplicarlo: repítelo con OTROS símbolos. Si la misma")

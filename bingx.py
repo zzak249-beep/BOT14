@@ -30,6 +30,23 @@ class BingXError(RuntimeError):
     pass
 
 
+def _fmt(value: float, precision: int) -> str:
+    """
+    Formatea con decimales FIJOS, nunca notación científica.
+
+    BUG QUE ESTO EVITA: al pasar un float crudo en los parámetros de la
+    petición, tanto el %-format de Python como httpx lo convierten con
+    str(), que para valores pequeños usa notación científica —
+    str(0.0000012) -> '1.2e-06'. BingX no acepta ese formato en precio
+    ni en cantidad, y es justo lo que le pasa a las monedas micro-cap
+    de precio muy bajo, que son buena parte del universo que escanea
+    este bot. El error llega silencioso: la API rechaza la orden con
+    un código, no con un traceback, así que sin vigilar los logs de
+    "BingX rechazó la orden" pasa desapercibido.
+    """
+    return f"{value:.{max(precision, 0)}f}"
+
+
 class BingX:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._c = client
@@ -101,6 +118,14 @@ class BingX:
 
     def min_qty(self, symbol: str) -> float:
         return float(self._precision.get(symbol, {}).get("min_qty", 0.0))
+
+    def fmt_qty(self, symbol: str, qty: float) -> str:
+        p = self._precision.get(symbol, {})
+        return _fmt(qty, int(p.get("qty", 4)))
+
+    def fmt_price(self, symbol: str, price: float) -> str:
+        p = self._precision.get(symbol, {})
+        return _fmt(price, int(p.get("price", 6)))
 
     async def tickers_24h(self) -> dict[str, float]:
         """Volumen de 24h en USDT por símbolo, en UNA llamada."""
@@ -179,12 +204,14 @@ class BingX:
             "side": side,
             "positionSide": position_side,
             "type": "MARKET",
-            "quantity": quantity,
+            "quantity": self.fmt_qty(symbol, quantity),
             "stopLoss": (
-                '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl
+                '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, sl)
             ),
             "takeProfit": (
-                '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp
+                '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, tp)
             ),
         }
         return await self._private("POST", "/openApi/swap/v2/trade/order", params)
@@ -206,11 +233,13 @@ class BingX:
                 "side": side,
                 "positionSide": position_side,
                 "type": "LIMIT",
-                "price": price,
-                "quantity": quantity,
+                "price": self.fmt_price(symbol, price),
+                "quantity": self.fmt_qty(symbol, quantity),
                 "timeInForce": "GTC",
-                "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl,
-                "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp,
+                "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, sl),
+                "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, tp),
             },
         )
 
@@ -234,10 +263,64 @@ class BingX:
                 "side": exit_side,
                 "positionSide": position_side,
                 "type": "MARKET",
-                "quantity": quantity,
+                "quantity": self.fmt_qty(symbol, quantity),
             },
         )
 
     async def open_positions(self) -> list[dict]:
         data = await self._private("GET", "/openApi/swap/v2/user/positions")
         return data if isinstance(data, list) else []
+
+    async def open_interest(self, symbol: str) -> float | None:
+        """
+        Foto ACTUAL del Open Interest — BingX no da serie histórica en
+        este endpoint (confirmado contra su esquema real: solo devuelve
+        openInterest/symbol/time). Para saber si SUBÍA o BAJABA durante
+        el estirón hay que muestrear esto nosotros mismos y guardar nuestro
+        propio historial corto — eso es lo que hace OpenInterestTracker
+        en oi_confirm.py, exactamente igual que liquidations.py construye
+        su propia ventana a partir de streams que tampoco dan histórico.
+        """
+        try:
+            data = await self._public("/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            valor = data.get("openInterest") if isinstance(data, dict) else None
+            return float(valor) if valor is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def spread_pct(self, symbol: str) -> float | None:
+        """
+        Spread bid-ask actual, en % del precio medio. None si no se pudo
+        leer el libro — no bloquea la entrada por un fallo de red, solo
+        cuando SÍ hay dato y el spread es ancho de verdad.
+
+        POR QUÉ HACE FALTA: el volumen de 24h (MIN_QUOTE_VOLUME_24H) es
+        una foto de todo el día, no del libro AHORA MISMO. Un símbolo con
+        volumen suficiente puede tener el libro vacío en el instante de
+        la señal — típico justo después del estirón que dispara esta
+        estrategia, cuando el flujo forzado ya se llevó la liquidez
+        cercana. Sin este chequeo, una entrada a mercado en ese momento
+        paga el spread completo, no el que viste en el ranking.
+        """
+        try:
+            data = await self._public(
+                "/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": 5}
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            bids = data.get("bids") if isinstance(data, dict) else None
+            asks = data.get("asks") if isinstance(data, dict) else None
+            if not bids or not asks:
+                return None
+            mejor_bid = float(bids[0][0])
+            mejor_ask = float(asks[0][0])
+            if mejor_bid <= 0 or mejor_ask <= 0:
+                return None
+            medio = (mejor_bid + mejor_ask) / 2.0
+            return (mejor_ask - mejor_bid) / medio * 100.0
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None

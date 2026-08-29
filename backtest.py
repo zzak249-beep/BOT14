@@ -1,7 +1,7 @@
 """
 Backtest local sobre histórico descargado del exchange.
 
-    python backtest.py CATE-USDT 5m 60
+    python backtest.py ZEC-USDT 5m 240
     python backtest.py ZEC-USDT 15m 240 --mensual
     python backtest.py ZEC-USDT,PUMP-USDT,LDO-USDT 30m 240
 
@@ -53,8 +53,6 @@ class Trade:
     entry_ts: int
     entry: float
     sl: float
-    side: str = "BUY"
-    tp: float = 0.0
     exit_ts: int = 0
     exit: float = 0.0
     r: float = 0.0
@@ -119,38 +117,22 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
         vela = velas[i]
 
         if abierta:
-            # Salida por stop, por objetivo o por tiempo.
-            golpe_stop = (
-                vela["low"] <= abierta.sl if abierta.side == "BUY" else vela["high"] >= abierta.sl
-            )
-            if golpe_stop:
+            # Salida por stop, o por giro del SuperTrend.
+            if vela["low"] <= abierta.sl:
                 abierta.exit = abierta.sl
                 abierta.exit_ts = vela["time"]
                 abierta.r = -1.0
                 abierta.motivo = "stop"
                 res.trades.append(abierta)
                 abierta = None
-            elif abierta.tp and (
-                (abierta.side == "BUY" and vela["high"] >= abierta.tp)
-                or (abierta.side == "SELL" and vela["low"] <= abierta.tp)
-            ):
-                riesgo = abs(abierta.entry - abierta.sl)
-                abierta.exit = abierta.tp
-                abierta.exit_ts = vela["time"]
-                bruto = (abierta.tp - abierta.entry) if abierta.side == "BUY" else (abierta.entry - abierta.tp)
-                abierta.r = bruto / riesgo if riesgo > 0 else 0.0
-                abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo / abierta.entry * 100.0)
-                abierta.motivo = "objetivo"
-                res.trades.append(abierta)
-                abierta = None
-            elif (vela["time"] - abierta.entry_ts) / 60000 >= config.MAX_TRADE_MINUTES:
-                riesgo = abs(abierta.entry - abierta.sl)
-                bruto = (vela["close"] - abierta.entry) if abierta.side == "BUY" else (abierta.entry - vela["close"])
+            elif strategy.exit_signal(velas[: i + 1]):
+                riesgo = abierta.entry - abierta.sl
                 abierta.exit = vela["close"]
                 abierta.exit_ts = vela["time"]
-                abierta.r = bruto / riesgo if riesgo > 0 else 0.0
+                abierta.r = (vela["close"] - abierta.entry) / riesgo if riesgo > 0 else 0.0
+                # El coste se descuenta SIEMPRE, en R, igual que en vivo.
                 abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo / abierta.entry * 100.0)
-                abierta.motivo = "tiempo"
+                abierta.motivo = "supertrend"
                 res.trades.append(abierta)
                 abierta = None
             i += 1
@@ -161,7 +143,7 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
             clave = motivo.split("(")[0].strip()
             res.descartes[clave] = res.descartes.get(clave, 0) + 1
         else:
-            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl, sig.side, sig.tp)
+            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl)
         i += 1
 
     return res
@@ -228,7 +210,7 @@ async def main() -> int:
 
     print(f"Descargando {days} días en {interval} para {len(symbols)} símbolo(s)...")
     print(f"Filtros activos: coste {config.COST_ROUNDTRIP_PCT}% · "
-          f"amplitud ≥{config.MIN_ATR_PCT}% y ≥{config.MIN_COST_COVER:.0f}×")
+          f"riesgo {config.MIN_RISK_PCT}-{config.MAX_RISK_PCT}%")
 
     total_r = 0.0
     total_ops = 0

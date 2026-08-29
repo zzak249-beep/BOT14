@@ -157,11 +157,20 @@ class Scanner:
 def format_ranking(rows: list[Row], top: int) -> str:
     con_amplitud = [r for r in rows if r.verdict != "sin amplitud"]
     if not con_amplitud:
+        mejor = max(rows, key=lambda r: r.cover, default=None)
+        linea_mejor = (
+            f"Más cerca: <b>{mejor.symbol.split('-')[0]}</b> con ATR "
+            f"{mejor.atr_pct:.2f}% ({mejor.cover:.1f}×) — le faltó "
+            f"{max(0.0, config.MIN_ATR_PCT - mejor.atr_pct):.2f} pp de ATR o "
+            f"{max(0.0, config.MIN_COST_COVER - mejor.cover):.1f}× de cobertura.\n"
+            if mejor else ""
+        )
         return (
             f"📡 <b>Escaneo BingX</b>\n"
             f"{len(rows)} símbolos analizados.\n"
             f"<b>Ninguno con amplitud suficiente</b> (≥{config.MIN_ATR_PCT}% y "
             f"≥{config.MIN_COST_COVER:.0f}× el coste).\n"
+            f"{linea_mejor}"
             f"Mercado tranquilo: no es un fallo, es que no hay nada que operar."
         )
 

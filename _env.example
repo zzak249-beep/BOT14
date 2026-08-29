@@ -1,0 +1,119 @@
+# ── Modo ──────────────────────────────────────────────────────────
+# SIGNAL = solo avisa por Telegram (recomendado hasta tener 100+ operaciones medidas)
+# LIVE   = envía órdenes reales, y ADEMÁS exige LIVE_CONFIRMED=true
+MODE=SIGNAL
+LIVE_CONFIRMED=false
+
+# ── BingX (solo hacen falta en LIVE) ──────────────────────────────
+BINGX_API_KEY=
+BINGX_API_SECRET=
+BINGX_BASE_URL=https://open-api.bingx.com
+
+# ── Telegram ──────────────────────────────────────────────────────
+TELEGRAM_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# ── Universo y escaneo ──────────────────────────────────────────────
+TIMEFRAME=5m
+SCAN_INTERVAL_SEC=60
+MAX_SYMBOLS=200
+SYMBOL_WHITELIST=
+EXCLUDE_PREFIXES=NC
+
+# ── Filtro de amplitud: el hallazgo principal del proyecto ────────
+MIN_ATR_PCT=4.0
+COST_ROUNDTRIP_PCT=0.25
+MIN_COST_COVER=30
+
+# ── Escáner del universo completo (sustituye al radar manual) ─────
+SCAN_ALL=true
+RANK_INTERVAL_MIN=15
+RANK_TOP_N=12
+RANK_ONLY_WHEN_CANDIDATES=true
+# Si BingX empieza a devolver 429, BAJA esto antes que subir el intervalo.
+SCAN_CONCURRENCY=8
+RANGE_LEN=20
+ER_SHORT=30
+ER_LONG=180
+ER_TREND=0.40
+
+# ── Liquidez ────────────────────────────────────────────────────────
+MIN_QUOTE_VOLUME_24H=2000000
+
+# ── Filtro de eficiencia: descarta los verticales ──────────────────
+MAX_ER_LONG=0.35
+
+# ── Ejecución ─────────────────────────────────────────────────────
+ENTRY_TYPE=LIMIT
+LIMIT_OFFSET_PCT=0.05
+
+# ── Estrategia (misma que reversion_5m.pine) ───────────────────────
+MA_LEN=20
+ATR_LEN=14
+STRETCH_ATR=2.5
+MAX_BARS_STRETCH=6
+SL_ATR=1.0
+TP_MODE=MEAN
+RR_FIXED=1.5
+MIN_RR=1.0
+
+# ── Tiempo máximo por operación ────────────────────────────────────
+MAX_TRADE_BARS=12
+USE_TIME_EXIT=true
+TIME_EXIT_ONLY_LOSING=true
+
+# ── Riesgo ────────────────────────────────────────────────────────
+RISK_PCT=0.5
+MAX_CONCURRENT=2
+LEVERAGE=3
+MAX_CONSECUTIVE_LOSSES=3
+COOLDOWN_MINUTES=120
+
+# ── Sección cruzada (retorno de 24 h, arranca en modo registro) ───
+XSECTION_ENABLED=true
+XSECTION_HOUR_UTC=0
+XSECTION_N=5
+XSECTION_MIN_VOL=500000
+
+# ── Avisos de Telegram ──────────────────────────────────────────────
+DAILY_SUMMARY=true
+DAILY_SUMMARY_HOUR_UTC=7
+HEARTBEAT_HOURS=12
+
+# ── Estado (monta un volumen de Railway en /data) ─────────────────
+STATE_PATH=/data/state.json
+LOG_LEVEL=INFO
+
+# ── Cascadas de liquidación (confirmación, no sustituto) ───────────
+# Gratis: streams públicos de Binance y Bybit. Solo añade una línea a
+# la señal cuando confirma la dirección — no cambia si se abre o no.
+LIQUIDATIONS_ENABLED=true
+LIQ_BASELINE_MIN=30
+LIQ_SHORT_WINDOW_SEC=90
+LIQ_MIN_EVENTS=3
+LIQ_MULTIPLIER=3.0
+LIQ_MIN_USD=5000
+
+# ── RSI de doble cruce (confirmación de entrada, traducido de tu script) ──
+# RSI_REQUIRE=true significa que una señal SIN confirmar por RSI NO se
+# envía ni se abre — es un filtro real. Ponlo en false para verlo solo
+# como información mientras mides si ayuda o solo recorta señales.
+RSI_CONFIRM_ENABLED=true
+RSI_LENGTH=10
+RSI_SIGNAL_LENGTH=10
+RSI_TRIGGER=50.0
+RSI_TARGET_CROSSES=2
+RSI_CONFIRM_BARS=3
+RSI_REQUIRE=true
+
+# ── Radar de 30m (sesgo de tendencia, bloquea contra-tendencia) ──────
+RADAR30M_ENABLED=true
+RADAR30M_TIMEFRAME=30m
+RADAR30M_INTERVAL_MIN=30
+
+# ── Puntuación de confianza de entrada (ordena y mide, no bloquea por
+# defecto) ────────────────────────────────────────────────────────
+SCORE_ENABLED=true
+# 0 = no bloquea nada por score, solo ordena y registra. Ejemplo: 55
+# exige señales de calidad media-alta.
+SCORE_MIN=0

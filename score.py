@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 
 import config
 import liquidations
+import oi_confirm
 import rsi_confirm
 import strategy
 
@@ -43,6 +44,7 @@ def compute(
     rsi_result: "rsi_confirm.RsiConfirm | None",
     cascade: dict | None,
     bias30m: str | None,
+    oi_dir: str | None = None,
 ) -> EntryScore:
     detalle: dict[str, float] = {}
 
@@ -72,6 +74,24 @@ def compute(
     else:
         detalle["cascada"] = 0.0
 
+    # Open Interest — ASIMÉTRICO A PROPÓSITO (ver oi_confirm.py para el
+    # motivo completo, incluido el aviso de que el número de la
+    # asimetría no está verificado de forma independiente). BUY con OI
+    # cayendo (liquidación de largos) confirma; SELL con OI cayendo
+    # (cobertura de cortos) NO suma nada, ni a favor ni en contra.
+    # Peso menor (+10, no +15) porque es el componente más nuevo y
+    # menos contrastado del score: hasta que stats.py no diga lo
+    # contrario con datos propios, pesa menos que RSI o cascada.
+    if config.OI_CONFIRM_ENABLED and sig.side == "BUY" and oi_confirm.confirms_buy(oi_dir):
+        detalle["oi"] = 10.0
+    else:
+        detalle["oi"] = 0.0
+
+    # El total se recorta a 100 — con todo maximizado (base+rr+cobertura
+    # +rsi+cascada ya suman 100 antes de contar OI), el bonus de OI solo
+    # se nota cuando algún otro componente no está al máximo. Es
+    # deliberado: no se ha subido el techo para no diluir el peso
+    # relativo de lo ya validado (RSI, cascada) frente a lo nuevo.
     total = max(0.0, min(100.0, sum(detalle.values())))
     return EntryScore(total=total, detalle=detalle)
 

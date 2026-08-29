@@ -140,9 +140,22 @@ def buckets_por_score(trades: list[dict]) -> str | None:
     if len(bloques) < 2:
         return None  # con una sola franja poblada no hay nada que comparar
     return "🎯 <b>¿El score predice algo?</b> (comparar franjas)\n\n" + "\n".join(bloques)
-    """rs_por_modo: {'SIGNAL': [...], 'LIVE': [...]}. Se informan por
+
+
+def format_report(rs_por_modo: dict[str, list[float]]) -> str:
+    """
+    rs_por_modo: {'SIGNAL': [...], 'LIVE': [...]}. Se informan por
     separado a propósito: tienen slippage distinto y mezclarlos
-    escondería justo la diferencia que el README avisa que va a doler."""
+    escondería justo la diferencia que el README avisa que va a doler.
+
+    BUG QUE ESTO ARREGLA: esta función vivía como código MUERTO dentro
+    de buckets_por_score(), después de su return — nunca se ejecutaba
+    y `stats.format_report` no existía como atributo del módulo.
+    main.py la llama cada día en el resumen: sin esto, el resumen
+    diario fallaba con AttributeError una vez al día y con él se
+    saltaba el ciclo de escaneo entero de ese momento (todas las
+    tareas del loop comparten el mismo try/except en main.start()).
+    """
     etiquetas = {
         "insuficiente": "⚠️ muestra insuficiente — el intervalo cruza cero, podría ser azar",
         "indicios": "🟡 hay indicios, todavía no es concluyente",
