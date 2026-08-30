@@ -1,0 +1,200 @@
+//@version=6
+strategy(title="ProBorsa: RSI & SuperTrend Gercek Cift Dip Stratejisi v2", shorttitle="RSI+ST Cift Dip v2", format=format.price, precision=2, overlay=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// =========================================================================
+// DEGISIKLIK NOTU (v1 -> v2)
+// =========================================================================
+// v1'deki "Ikili Dip" sinyali, RSI'in kendi ortalamasini 50'nin altinda kac
+// kez yukari kestigini sayan bir sayacti - fiyatin gercekten iki benzer dip
+// yapip yapmadigina hic bakmiyordu, bu yuzden fiyat hala dusarken de
+// tetiklenebiliyordu (canli grafikte gorulen erken/erken-kapanan islemler
+// bunun sonucu). v2, gercek bir "W" formasyonu ariyor:
+//   1. Fiyatta iki onayli pivot dip bulunur (L1 eski, L2 yeni).
+//   2. Ikisi birbirine yakin (maxBottomDiffPct), aralarinda yeterli bar
+//      (min/maxBarsBetween) ve aralarindaki tepe (neckline) yeterince
+//      yuksek (minNecklineBouncePct) olmali.
+//   3. L2'de RSI, L1'deki RSI'dan yuksek olmali (klasik boga uyumsuzlugu -
+//      script'in eski "UYUMSUZLUK" bolumu bunu zaten hesapliyordu ama
+//      sadece gorsel amacliydi, girise hic baglanmamisti).
+//   4. Kurulum onaylandiktan sonra ALIM, fiyat neckline'i yukari kirdiginda
+//      tetiklenir - RSI kesisiminin oldugu anda degil. Bu, "dusen bicagi
+//      yakalama" giris sorununu dogrudan cozer.
+// SuperTrend cikis mantigi v1 ile ayni.
+
+// =========================================================================
+// 1. GIRDILER (INPUTS)
+// =========================================================================
+rsiLengthInput = input.int(10, minval=1, title="RSI Uzunlugu", group="RSI Ayarlari")
+rsiSourceInput = input.source(close, "Kaynak", group="RSI Ayarlari")
+triggerLevel = input.float(50, "RSI Bolge Filtresi (2. dip bu seviyenin altinda olmali)", group="RSI Ayarlari")
+sigLength = input.int(10, "RSI Sinyal (SMA) Periyodu - sadece gorsel", group="RSI Ayarlari")
+calculateDivergence = input.bool(false, title="Genel Uyumsuzluklari Hesapla (Gorsel)", group="RSI Ayarlari")
+
+// --- CIFT DIP TESPIT AYARLARI (v2) ---
+pivotLeft = input.int(5, "Pivot Sol Bar", group="Cift Dip Ayarlari", tooltip="Bir dibin pivot sayilmasi icin solundaki bar sayisi")
+pivotRight = input.int(5, "Pivot Sag Bar (Onay Gecikmesi)", group="Cift Dip Ayarlari", tooltip="Bir dibin onaylanmasi icin sagindaki bar sayisi - onay bu kadar bar gecikir")
+maxBottomDiffPct = input.float(2.0, "Maks. Dip Fiyat Farki %", group="Cift Dip Ayarlari", tooltip="Iki dip birbirine bu yuzdeden daha yakin olmali")
+minBarsBetween = input.int(3, "Dipler Arasi Min Bar", group="Cift Dip Ayarlari")
+maxBarsBetween = input.int(50, "Dipler Arasi Maks Bar", group="Cift Dip Ayarlari")
+minNecklineBouncePct = input.float(1.0, "Min Neckline Sicrama %", group="Cift Dip Ayarlari", tooltip="Iki dip arasindaki tepe, diplerden en az bu kadar yuksek olmali")
+requireRsiDivergence = input.bool(true, "RSI Boga Uyumsuzlugu Zorunlu", group="Cift Dip Ayarlari", tooltip="2. dipte RSI, 1. dipten yuksek olmali")
+maxWaitBars = input.int(20, "Neckline Kirilimi Icin Maks Bekleme (Bar)", group="Cift Dip Ayarlari")
+
+// --- SUPERTREND CIKIS GIRDILERI ---
+atrPeriod = input.int(10, "SuperTrend ATR Periyodu", group="Cikis (SuperTrend) Ayarlari")
+stFactor = input.float(2.5, "SuperTrend Carpani", step=0.1, group="Cikis (SuperTrend) Ayarlari")
+
+// --- UST ZAMAN DILIMI TREND FILTRESI (opsiyonel) ---
+useHtfFilter = input.bool(true, "Ust Zaman Dilimi Trend Filtresini Kullan", group="Ust Zaman Dilimi Filtresi")
+htfTimeframe = input.timeframe("240", "Ust Zaman Dilimi", group="Ust Zaman Dilimi Filtresi", tooltip="240 = 4 saat")
+htfEmaLength = input.int(100, "Ust TF EMA Uzunlugu", group="Ust Zaman Dilimi Filtresi")
+htfSlopeLookback = input.int(10, "Ust TF EMA Egim Bakis (Bar)", group="Ust Zaman Dilimi Filtresi")
+htfMaxDownSlopePct = input.float(0.5, "Ust TF Maks. Dusus Egimi %", group="Ust Zaman Dilimi Filtresi", tooltip="EMA bu yuzdeden fazla duserse yeni LONG acilmaz")
+
+
+// =========================================================================
+// 2. RSI HESAPLAMASI
+// =========================================================================
+change_val = ta.change(rsiSourceInput)
+up = ta.rma(math.max(change_val, 0), rsiLengthInput)
+down = ta.rma(-math.min(change_val, 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+rsiSignal = ta.sma(rsi, sigLength)  // v2'de sinyale girmiyor, sadece referans cizgi
+
+// =========================================================================
+// 3. GRAFIK CIZIMLERI (PLOTS)
+// =========================================================================
+plot(rsi, "RSI", color=#7E57C2, linewidth=2)
+plot(rsiSignal, "RSI SMA (gorsel referans)", color=color.yellow)
+
+rsiUpperBand = hline(70, "RSI Upper Band", color=#787B86)
+midline = hline(50, "RSI Middle Band", color=color.new(#787B86, 50))
+rsiLowerBand = hline(30, "RSI Lower Band", color=#787B86)
+fill(rsiUpperBand, rsiLowerBand, color=color.rgb(126, 87, 194, 90), title="RSI Background Fill")
+hline(triggerLevel, "Tetik Seviyesi (RSI Bolge Filtresi)", color=color.new(color.purple, 50), linestyle=hline.style_dotted)
+
+
+// =========================================================================
+// 4. GERCEK CIFT DIP TESPITI (PIYASA YAPISI + RSI UYUMSUZLUGU)
+// =========================================================================
+pivotLowPrice = ta.pivotlow(low, pivotLeft, pivotRight)
+
+// Ust zaman dilimi trend filtresi - close[1] + lookahead_off, repaint
+// olmadan sadece KAPANMIS ust TF barini kullanir.
+htfClose = request.security(syminfo.tickerid, htfTimeframe, close[1], lookahead=barmerge.lookahead_off)
+htfEma = ta.ema(htfClose, htfEmaLength)
+htfEmaPast = htfEma[htfSlopeLookback]
+htfSlopePct = na(htfEmaPast) or htfEmaPast == 0 ? na : (htfEma - htfEmaPast) / math.abs(htfEmaPast) * 100
+htfTrendOk = not useHtfFilter or (not na(htfSlopePct) and htfSlopePct >= -math.abs(htfMaxDownSlopePct))
+
+var float l1Price = na
+var float l1Rsi = na
+var int   l1Bar = na
+var float l2Price = na
+var float l2Rsi = na
+var int   l2Bar = na
+
+var bool  setupActive = false
+var float necklinePrice = na
+var int   setupBar = na
+
+specialBuy = false
+
+if not na(pivotLowPrice)
+    rsiAtPivot = rsi[pivotRight]
+    barAtPivot = bar_index - pivotRight
+
+    l1Price := l2Price
+    l1Rsi := l2Rsi
+    l1Bar := l2Bar
+    l2Price := pivotLowPrice
+    l2Rsi := rsiAtPivot
+    l2Bar := barAtPivot
+    setupActive := false  // yeni bir dip oldugu an bekleyen kurulum sifirlanir
+
+    if not na(l1Price)
+        barsBetween = l2Bar - l1Bar
+        diffPct = math.abs(l2Price - l1Price) / l1Price * 100
+        neckline = ta.highest(high, barsBetween + 1)[pivotRight]
+        loLevel = math.min(l1Price, l2Price)
+        bouncePct = (neckline - loLevel) / loLevel * 100
+        divergenceOk = not requireRsiDivergence or (l2Rsi > l1Rsi)
+        rsiZoneOk = l2Rsi < triggerLevel
+
+        if barsBetween >= minBarsBetween and barsBetween <= maxBarsBetween and diffPct <= maxBottomDiffPct and bouncePct >= minNecklineBouncePct and divergenceOk and rsiZoneOk
+            setupActive := true
+            necklinePrice := neckline
+            setupBar := bar_index
+
+// neckBreak/filteredBuy se calculan ANTES del bloque de estado, en el
+// scope principal - en Pine, una variable declarada con "=" dentro de una
+// rama if/else no es visible fuera de esa rama.
+neckBreak = setupActive and close > necklinePrice
+filteredBuy = neckBreak and not htfTrendOk
+
+if setupActive
+    if neckBreak
+        if htfTrendOk
+            specialBuy := true
+        setupActive := false
+    else if low < l2Price * (1 - maxBottomDiffPct / 100) or (bar_index - setupBar) > maxWaitBars
+        setupActive := false
+
+plotshape(series=specialBuy ? rsi : na, title="Cift Dip AL Sinyali", text="Cift\nDip", style=shape.labelup, location=location.absolute, color=color.lime, textcolor=color.white, size=size.small)
+plotshape(series=filteredBuy ? rsi : na, title="Filtrelenen Sinyal (Ust TF Trend)", text="Filtre", style=shape.xcross, location=location.absolute, color=color.orange, textcolor=color.white, size=size.tiny)
+plot(setupActive ? necklinePrice : na, title="Neckline (Bekleyen Kurulum, fiyat olceginde degil)", color=color.new(color.orange, 0), style=plot.style_circles, display=display.data_window)
+
+// =========================================================================
+// 5. SUPERTREND HESAPLAMASI VE ISLEME GIRIS/CIKIS (STRATEJI)
+// =========================================================================
+[stValue, stDirection] = ta.supertrend(stFactor, atrPeriod)
+
+stSellCondition = ta.change(stDirection) > 0
+
+if specialBuy
+    strategy.entry("Long Giris", strategy.long)
+
+if stSellCondition
+    strategy.close("Long Giris", comment="ST SAT Cikis")
+
+
+// =========================================================================
+// 6. GENEL UYUMSUZLUK GORSELI (v1'den degismedi - opsiyonel/gorsel amacli)
+// =========================================================================
+lookbackRight = 5
+lookbackLeft = 5
+rangeUpper = 60
+rangeLower = 5
+bearColor = color.red
+bullColor = color.green
+textColor = color.white
+noneColor = color.new(color.white, 100)
+
+_inRange(bool cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+
+plFound = false
+phFound = false
+bullCond = false
+bearCond = false
+
+rsiLBR = rsi[lookbackRight]
+
+if calculateDivergence
+    plFound := not na(ta.pivotlow(rsi, lookbackLeft, lookbackRight))
+    rsiHL = rsiLBR > ta.valuewhen(plFound, rsiLBR, 1) and _inRange(plFound[1])
+    lowLBR = low[lookbackRight]
+    priceLL = lowLBR < ta.valuewhen(plFound, lowLBR, 1)
+    bullCond := priceLL and rsiHL and plFound
+
+    phFound := not na(ta.pivothigh(rsi, lookbackLeft, lookbackRight))
+    rsiLH = rsiLBR < ta.valuewhen(phFound, rsiLBR, 1) and _inRange(phFound[1])
+    highLBR = high[lookbackRight]
+    priceHH = highLBR > ta.valuewhen(phFound, highLBR, 1)
+    bearCond := priceHH and rsiLH and phFound
+
+plot(plFound ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bullish", linewidth = 2, color = (bullCond ? bullColor : noneColor), display = display.pane, editable = calculateDivergence)
+plotshape(bullCond ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bullish Label", text = " Bull ", style = shape.labelup, location = location.absolute, color = bullColor, textcolor = textColor, display = display.pane, editable = calculateDivergence)
+plot(phFound ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bearish", linewidth = 2, color = (bearCond ? bearColor : noneColor), display = display.pane, editable = calculateDivergence)
+plotshape(bearCond ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bearish Label", text = " Bear ", style = shape.labeldown, location = location.absolute, color = bearColor, textcolor = textColor, display = display.pane, editable = calculateDivergence)

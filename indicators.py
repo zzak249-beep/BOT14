@@ -1,24 +1,44 @@
 """
 indicators.py
 
-Pure-Python (no pandas/numpy) port of the Pine Script v6 strategy:
-"ProBorsa: RSI & SuperTrend Ozel Dip Stratejisi"
+Signal engine v2 - replaces the RSI-crossover counter with genuine
+price-structure double-bottom detection confirmed by RSI bullish divergence.
 
-Everything here is a deterministic function of a list of OHLC candles, so it
-can be unit tested and re-run safely on every polling cycle.
+Why this changed from v1:
+  The original Pine script's "Ikili Dip" (double dip) signal counted how many
+  times RSI crossed above its own moving average while under 50. That is a
+  momentum-oscillator heuristic, not an actual double-bottom pattern - it has
+  no requirement that PRICE forms two similar lows, so it can (and did, per
+  the live chart) fire while price is still making a fresh lower low. The
+  script's own divergence section already computes real bullish divergence
+  (pivot lows + comparing price/RSI at them) but was wired up as a purely
+  visual, optional overlay - never connected to strategy.entry.
 
-Signal logic (mirrors the Pine source 1:1):
-  1. RSI(rsi_length) computed with Wilder smoothing (ta.rma).
-  2. rsi_signal = SMA(rsi, rsi_signal_length).
-  3. bull_cross = rsi crosses over rsi_signal.
-  4. A running counter increments every bull_cross that happens while
-     rsi < trigger_level. The counter resets to 0 whenever rsi rises above
-     trigger_level. When the counter reaches target_cross_count, a
-     "special_buy" (double-dip / W) signal fires and the counter resets.
-  5. SuperTrend(st_atr_period, st_factor) is used purely as the exit:
-     st_sell fires the bar the trend direction flips from up (-1) to down (1).
+v2 detects an actual "W" in price:
+  1. Find confirmed pivot lows in PRICE (ta.pivotlow-equivalent).
+  2. Take the two most recent pivot lows (L1 older, L2 newer). Validate:
+       - the two lows are within `max_bottom_diff_pct` of each other
+       - they are `min/max_bars_between_lows` bars apart
+       - the peak between them (the "neckline") rises at least
+         `min_neckline_bounce_pct` above the lows
+       - RSI at L2 > RSI at L1 (bullish divergence: price holds/matches the
+         prior low while momentum improves) - the "real" version of what the
+         original crossover counter was trying to approximate
+       - RSI at L2 is still below `trigger_level` (keeps the "buying a dip"
+         character of the original strategy)
+  3. Only THEN arm a pending setup, and only fire the buy signal once price
+     actually closes back above the neckline - i.e. wait for proof of
+     reversal instead of buying into an unconfirmed dip. This is the direct
+     fix for the "catches the falling knife" entries visible on the live
+     chart.
 
-direction convention (matches Pine's ta.supertrend): -1 = uptrend, 1 = downtrend.
+v2.1 adds an optional higher-timeframe trend gate (evaluate_htf_trend):
+  skips the entry when a higher-timeframe EMA is dropping too fast, the
+  same multi-timeframe-confirmation idea already used elsewhere. This does
+  not change what counts as a double bottom - it only decides whether the
+  bot is allowed to act on one.
+
+SuperTrend exit logic is unchanged from v1.
 """
 
 from dataclasses import dataclass
@@ -27,19 +47,23 @@ from dataclasses import dataclass
 @dataclass
 class StrategyParams:
     rsi_length: int = 10
-    rsi_signal_length: int = 10
-    trigger_level: float = 50.0
-    target_cross_count: int = 2
+    trigger_level: float = 50.0          # RSI at the 2nd low must be below this
+
+    pivot_left: int = 5
+    pivot_right: int = 5                 # confirmation lag: a pivot is only knowable `right` bars later
+    max_bottom_diff_pct: float = 2.0     # how close the two lows must be, in %
+    min_bars_between_lows: int = 3
+    max_bars_between_lows: int = 50
+    min_neckline_bounce_pct: float = 1.0
+    require_rsi_divergence: bool = True
+    max_wait_bars: int = 20              # bars to wait for the neckline break before the setup expires
+
     st_atr_period: int = 10
     st_factor: float = 2.5
 
 
 def rma(values, length):
-    """Wilder's moving average - matches Pine Script's ta.rma exactly.
-
-    First valid value (index length-1) is a plain SMA of the first `length`
-    values; every value after that follows the recursive smoothing formula.
-    """
+    """Wilder's moving average - matches Pine Script's ta.rma exactly."""
     n = len(values)
     out = [None] * n
     if length <= 0 or n < length:
@@ -52,21 +76,37 @@ def rma(values, length):
     return out
 
 
-def sma(values, length):
-    """Simple moving average, None-safe (propagates None until a full window
-    of non-None values is available)."""
+def ema(values, length):
+    """Classic EMA (seeded with a plain SMA of the first `length` values,
+    same seeding convention as rma() above)."""
     n = len(values)
     out = [None] * n
-    if length <= 0:
+    if length <= 0 or n < length:
         return out
-    for i in range(n):
-        if i < length - 1:
-            continue
-        window = values[i - length + 1 : i + 1]
-        if any(v is None for v in window):
-            continue
-        out[i] = sum(window) / length
+    seed = sum(values[:length]) / length
+    out[length - 1] = seed
+    alpha = 2.0 / (length + 1)
+    for i in range(length, n):
+        out[i] = alpha * values[i] + (1 - alpha) * out[i - 1]
     return out
+
+
+def evaluate_htf_trend(closes, ema_length, slope_lookback, max_down_slope_pct):
+    """Higher-timeframe trend gate for entries. Compares the HTF EMA now
+    against `slope_lookback` bars ago; if it has dropped more than
+    `max_down_slope_pct` (%), the trend is considered too weak for a new
+    long. Fails CLOSED on insufficient data - i.e. trend_ok=False rather
+    than assuming it's fine, since skipping one trade is cheaper than
+    entering blind into an unconfirmed regime."""
+    n = len(closes)
+    e = ema(closes, ema_length)
+    idx_now = n - 1
+    idx_then = idx_now - slope_lookback
+    if idx_then < 0 or idx_now < 0 or e[idx_now] is None or e[idx_then] is None or e[idx_then] == 0:
+        return {"trend_ok": False, "ema": None, "slope_pct": None}
+    slope_pct = (e[idx_now] - e[idx_then]) / abs(e[idx_then]) * 100.0
+    trend_ok = slope_pct >= -abs(max_down_slope_pct)
+    return {"trend_ok": trend_ok, "ema": e[idx_now], "slope_pct": slope_pct}
 
 
 def compute_rsi(closes, length):
@@ -168,51 +208,115 @@ def compute_supertrend(highs, lows, closes, period, multiplier):
     return st, direction
 
 
+def find_pivot_low_at(lows, idx, left, right):
+    """True if lows[idx] is the minimum over the centered window
+    [idx-left, idx+right]. Only meaningful once `right` bars have passed
+    idx - callers must not query this before that (see detection loop)."""
+    if idx - left < 0 or idx + right >= len(lows):
+        return False
+    window = lows[idx - left: idx + right + 1]
+    return lows[idx] <= min(window)
+
+
+def validate_double_bottom_pair(l1_price, l2_price, l1_rsi, l2_rsi, bars_between, neckline, params: StrategyParams):
+    """Pure validation of a candidate (L1, L2) pivot-low pair against the
+    double-bottom + divergence rules. Split out from generate_signals so it
+    can be unit tested directly with hand-picked numbers."""
+    if not l1_price or l2_price is None or neckline is None:
+        return False
+    diff_pct = abs(l2_price - l1_price) / l1_price * 100.0
+    lo_level = min(l1_price, l2_price)
+    if not lo_level:
+        return False
+    bounce_pct = (neckline - lo_level) / lo_level * 100.0
+
+    divergence_ok = (not params.require_rsi_divergence) or (l1_rsi is not None and l2_rsi is not None and l2_rsi > l1_rsi)
+    rsi_zone_ok = l2_rsi is not None and l2_rsi < params.trigger_level
+
+    return (
+        params.min_bars_between_lows <= bars_between <= params.max_bars_between_lows
+        and diff_pct <= params.max_bottom_diff_pct
+        and bounce_pct >= params.min_neckline_bounce_pct
+        and divergence_ok
+        and rsi_zone_ok
+    )
+
+
 def generate_signals(highs, lows, closes, params: StrategyParams):
-    """Runs the full bar-by-bar port of the Pine strategy over a candle
-    window and returns per-bar series. Only the LAST index needs to be acted
-    on live; earlier bars are kept so the running cross-counter state is
-    correct by the time it reaches the latest bar."""
+    """Runs the double-bottom + divergence detector and the SuperTrend exit
+    over a candle window. Only the LAST index needs to be acted on live;
+    earlier bars are kept so pivot/setup state is correct by the time it
+    reaches the latest bar. Output keys are stable across versions:
+    rsi, supertrend, direction, special_buy, st_sell - plus new
+    setup_l1_price / setup_l2_price / setup_neckline / setup_l1_rsi /
+    setup_l2_rsi for richer alerts."""
     n = len(closes)
     rsi = compute_rsi(closes, params.rsi_length)
-    rsi_signal = sma(rsi, params.rsi_signal_length)
     st, direction = compute_supertrend(highs, lows, closes, params.st_atr_period, params.st_factor)
 
-    bull_cross = [False] * n
     special_buy = [False] * n
     st_sell = [False] * n
-    cross_count_series = [0] * n
+    setup_l1_price = [None] * n
+    setup_l2_price = [None] * n
+    setup_neckline = [None] * n
+    setup_l1_rsi = [None] * n
+    setup_l2_rsi = [None] * n
 
-    cross_count = 0
+    recent_pivots = []   # up to the last two confirmed pivot-low indices, oldest first
+    active_setup = None  # dict: l1_price, l2_price, neckline, l1_rsi, l2_rsi, confirmed_at
+
     for i in range(1, n):
         if direction[i] is not None and direction[i - 1] is not None:
             st_sell[i] = (direction[i] - direction[i - 1]) > 0
 
-        r, rs, rp, rsp = rsi[i], rsi_signal[i], rsi[i - 1], rsi_signal[i - 1]
-        if r is None or rs is None or rp is None or rsp is None:
-            cross_count_series[i] = cross_count
-            continue
+        confirm_idx = i - params.pivot_right
+        if confirm_idx - params.pivot_left >= 0 and find_pivot_low_at(lows, confirm_idx, params.pivot_left, params.pivot_right):
+            recent_pivots.append(confirm_idx)
+            recent_pivots = recent_pivots[-2:]
+            active_setup = None  # a fresh swing low always resets a pending pattern
 
-        bull_cross[i] = (r > rs) and (rp <= rsp)
+            if len(recent_pivots) == 2:
+                l1_idx, l2_idx = recent_pivots
+                l1_price, l2_price = lows[l1_idx], lows[l2_idx]
+                bars_between = l2_idx - l1_idx
+                neckline = max(highs[l1_idx:l2_idx + 1])
+                r1, r2 = rsi[l1_idx], rsi[l2_idx]
 
-        if r > params.trigger_level:
-            cross_count = 0
-        if bull_cross[i] and r < params.trigger_level:
-            cross_count += 1
+                if validate_double_bottom_pair(l1_price, l2_price, r1, r2, bars_between, neckline, params):
+                    active_setup = {
+                        "l1_price": l1_price,
+                        "l2_price": l2_price,
+                        "neckline": neckline,
+                        "l1_rsi": r1,
+                        "l2_rsi": r2,
+                        "confirmed_at": i,
+                    }
 
-        special_buy[i] = bull_cross[i] and (r < params.trigger_level) and (cross_count == params.target_cross_count)
-        if special_buy[i]:
-            cross_count = 0
+        if active_setup is not None:
+            setup_l1_price[i] = active_setup["l1_price"]
+            setup_l2_price[i] = active_setup["l2_price"]
+            setup_neckline[i] = active_setup["neckline"]
+            setup_l1_rsi[i] = active_setup["l1_rsi"]
+            setup_l2_rsi[i] = active_setup["l2_rsi"]
 
-        cross_count_series[i] = cross_count
+            invalidation_price = active_setup["l2_price"] * (1 - params.max_bottom_diff_pct / 100.0)
+            waited = i - active_setup["confirmed_at"]
+
+            if closes[i] > active_setup["neckline"]:
+                special_buy[i] = True
+                active_setup = None
+            elif lows[i] < invalidation_price or waited > params.max_wait_bars:
+                active_setup = None
 
     return {
         "rsi": rsi,
-        "rsi_signal": rsi_signal,
         "supertrend": st,
         "direction": direction,
-        "bull_cross": bull_cross,
         "special_buy": special_buy,
         "st_sell": st_sell,
-        "cross_count": cross_count_series,
+        "setup_l1_price": setup_l1_price,
+        "setup_l2_price": setup_l2_price,
+        "setup_neckline": setup_neckline,
+        "setup_l1_rsi": setup_l1_rsi,
+        "setup_l2_rsi": setup_l2_rsi,
     }

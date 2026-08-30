@@ -1,485 +1,173 @@
-# Bot de Reversión por Sobreextensión — BingX 5m
+# RSI + SuperTrend — Bot BingX Futures (v2: Doble Suelo Real)
 
-Ejecuta en BingX (USDT-M perpetuos) la misma lógica que
-`reversion_5m.pine`: cuando el precio se aleja rápido de su media,
-entra en contra buscando la vuelta.
+Port a Python del script Pine v6 **"ProBorsa: RSI & SuperTrend Özel Dip Stratejisi"**.
+Solo LONG. Sale cuando el SuperTrend gira de alcista a bajista.
 
-**Arranca en modo SIGNAL.** Avisa por Telegram y no toca el exchange.
+**v2 cambia por completo cómo se detecta la entrada** — ver sección 6.
 
----
-
-## Lo primero, porque importa más que el código
-
-Esta estrategia tiene **35 operaciones medidas** repartidas en dos
-símbolos, y ambos estaban en un pump del +80/+100% ese día. Eso es
-una pista prometedora, no una ventaja demostrada.
-
-Lo que **sí** está demostrado con 323 operaciones es que la estrategia
-contraria (ruptura de rango) pierde en ese tipo de símbolo.
-
-Traducido a lo práctico: deja el bot en `SIGNAL` unas semanas, acumula
-señales, comprueba si se cumplen, y solo entonces plantéate `LIVE`.
-Poner dinero con 35 operaciones es apostar, no operar.
-
----
-
-## El filtro que manda
-
-`MIN_ATR_PCT` y `MIN_COST_COVER` son el hallazgo principal de todo el
-trabajo previo, no dos parámetros más:
-
-| Símbolo | ATR | × coste | Resultado |
-|---------|-----|---------|-----------|
-| CATE    | 5,89% | 42× | 13 operaciones, PF 1,615 |
-| JIMOTHY | 5,76% | 41× | 22 operaciones, +0,13R |
-| MERL    | 1,49% | 11× | 2 operaciones, −0,15R |
-| SEI     | ~0,9% | 6×  | **0 operaciones** |
-
-Donde no hay recorrido no hay negocio: el coste de entrar y salir se
-come el movimiento entero. El bot descarta esos símbolos antes de
-mirar el patrón.
-
----
-
-## Escáner del universo completo
-
-Con `SCAN_ALL=true` (por defecto) el bot recorre **todos** los perpetuos
-de BingX cada `RANK_INTERVAL_MIN` y manda a Telegram un ranking ordenado
-por amplitud:
+## Estructura
 
 ```
-📡 Escaneo BingX — 987 símbolos, 14 con amplitud
-
-🏆 CATE      5.89% (42×)  ER 0.31/0.22  estirado +2.8
-🔶 BASECAT  10.43% (74×)  ER 0.03/0.17  estirado +2.7
-🟩 CASHCAT   5.49% (39×)  ER 0.25/0.16  fuera +0.4
-·  MERL      4.48% (32×)  ER 0.27/0.10  en rango +0.3
+rsi-supertrend-bot/
+├── main.py                                    # loop principal (asyncio)
+├── config.py                                   # variables de entorno
+├── bingx_client.py                             # cliente BingX Perpetual Futures v2 (HMAC-SHA256)
+├── indicators.py                               # RSI, SuperTrend, detector de doble suelo (puro Python)
+├── telegram_notifier.py                        # notificaciones Telegram
+├── state_manager.py                            # persistencia JSON con escritura atómica
+├── tests/test_indicators.py                    # 18 tests unitarios
+├── ProBorsa_RSI_SuperTrend_CiftDip_v2.pine     # indicador/estrategia Pine v6 actualizado (para TradingView)
+├── requirements.txt
+├── .env.example
+├── .gitignore
+├── Dockerfile
+└── railway.json
 ```
 
-🏆 lista para operar YA · 🔶 estirada, falta la vela de agotamiento ·
-🟩 ruptura (informativo, la estrategia no la opera) · ▫ vertical,
-descartada por el filtro de ER · `·` con amplitud, en espera.
-
-El veredicto **no es un criterio aparte del que abre la operación**:
-el escáner llama a la misma `strategy.evaluate()` que decide si se
-abre o no, así que 🏆 en el ranking y 🔔 SEÑAL / 🟢 EJECUTADO son la
-misma cosa vista dos veces, no dos criterios que puedan discrepar.
-
-Justo después del ranking llega un segundo aviso, solo con lo que está
-LISTO ahora mismo (o, si no hay nada listo, con lo más cerca de estarlo):
-
-```
-🏆 Favoritas de este escaneo — 1 lista(s) para operar
-
-🔴 CATE CORTO — entrada 0.1234  SL 0.135  TP 0.115
-   R:R 1.80 · ATR 5.89% (42×) · estirón +2.80 ATR
-   🔥 Confirmada por cascada de liquidaciones: 17.8× lo normal,
-   5 liquidaciones de cortos en los últimos 1 min
-```
-
-La línea 🔥 solo aparece cuando hay una cascada de liquidación real
-(Binance + Bybit, gratis, ver más abajo) confirmando la dirección de
-la señal — es información añadida, no cambia si el bot abre o no.
-
-Esto sustituye al radar de TradingView, que solo admite diez símbolos
-escritos a mano. Aquí no eliges: se miran todos y suben los que valen.
-
-**Sobre el límite de peticiones:** mil símbolos son mil llamadas. Van con
-un semáforo (`SCAN_CONCURRENCY=8`). Si BingX devuelve 429, baja ese
-número antes que subir el intervalo — es la palanca que no te cuesta
-frescura en los datos.
-
-Un ciclo completo tarda del orden de dos a cuatro minutos. Por eso el
-ranking va cada 15 y no cada minuto.
-
----
-
-## Si no da señales: sube de timeframe, no bajes el listón
-
-La volatilidad escala con la **raíz cuadrada del tiempo**: el ATR de 15m
-es ≈1.73× el de 5m, y el de 30m ≈2.45×. Pero el coste de operar **no
-escala** — la comisión y el spread son los mismos entres en la vela que
-entres.
-
-Consecuencia práctica: subir de timeframe da más candidatos **sin
-rebajar el filtro**. No es aflojar nada; es que el mismo movimiento pesa
-más frente al mismo coste.
-
-Cuando el escaneo no encuentra a nadie, el aviso incluye cuántos
-pasarían el MISMO listón en 15m y en 30m. Si ahí hay números, cambia
-`TIMEFRAME` y vuelve a medir en TradingView antes de operarlo: la
-estrategia se validó en 5m y el comportamiento en 30m hay que
-comprobarlo, no suponerlo.
-
-Lo que NO conviene: bajar `MIN_COST_COVER`. Ese umbral no es un gusto
-personal, sale de los datos — donde la estrategia funcionó había 40× el
-coste y donde no hubo negocio, 6-13×.
-
----
-
-## Puntuación de confianza de entrada (ordena y mide, no adivina)
-
-`score.py` combina en un solo número (0-100) lo que hasta ahora se
-mostraba disperso — margen sobre los mínimos de R:R y cobertura de
-coste, confirmación del RSI, cascada de liquidación. Se usa para dos
-cosas concretas:
-
-**1. Decidir cuál señal se opera primero.** Antes, con `MAX_CONCURRENT`
-limitado, el bot recorría el universo en el orden que devuelve la API
-de BingX — arbitrario para lo que importa. Ahora usa la amplitud
-(`cover`) del último ranking (`self.last_rows`, ya calculado, sin
-llamadas extra) para escanear primero los símbolos con mejor amplitud.
-No es un rediseño completo — sigue cortando en cuanto se llenan los
-huecos, no escanea el universo entero cada ciclo — pero sube mucho la
-probabilidad de que el hueco libre lo llene la mejor oportunidad del
-momento, no la primera que aparece.
-
-**2. Quedar registrado para comprobarlo con datos.** Cada operación
-cerrada guarda su score junto al R conseguido. El resumen diario
-compara la expectativa real por franja de score:
-
-```
-🎯 ¿El score predice algo? (comparar franjas)
-
-Score <40 · n=15 · media -0.36R · PF 0.27
-Score 80-100 · n=15 · media +0.08R · PF 1.14
-```
-
-Si las franjas altas no rinden mejor que las bajas con muestra
-suficiente, el score no está aportando nada — y hay que decirlo, no
-seguir usándolo por inercia. Es la misma disciplina que ya aplica
-`stats.py` al resto del sistema: medir en vez de asumir.
-
-**Qué NO hace:** no sustituye ningún bloqueo existente. El filtro de
-contra-tendencia de 30m sigue siendo un bloqueo duro — no se diluye
-sumando o restando puntos. `SCORE_MIN` (0 por defecto, desactivado)
-puede usarse como un umbral adicional más graduado que un simple sí/no,
-pero nadie lo activa por ti: hay que ponerlo a mano.
-
----
-
-## RSI de doble cruce + radar de 30m (confirmación de entrada)
-
-Dos filtros nuevos sobre las señales de 5m, pensados para trabajar
-juntos:
-
-**RSI de doble cruce** (`rsi_confirm.py`) — traducción del script Pine
-"ProBorsa: RSI & SuperTrend". No es un cruce de RSI cualquiera: cuenta
-cuántas veces el RSI cruza por encima de su propia media móvil
-MIENTRAS sigue por debajo de 50, y solo confirma en el 2º cruce desde
-la última vez que superó 50 — un doble suelo visto en el RSI en vez de
-en el precio. El script original solo detectaba el lado alcista; aquí
-se añadió el espejo exacto para el lado corto (doble techo), porque el
-bot opera los dos lados.
-
-```
-📈 RSI confirma: doble techo hace 1 vela(s) (RSI 68)
-```
-
-Con `RSI_REQUIRE=true` (por defecto) es un filtro real: una señal sin
-confirmar por RSI **no se envía ni se abre**. Con `RSI_REQUIRE=false`
-pasa a ser solo informativo — recomendado si quieres medir primero
-cuánto recorta antes de dejarlo bloquear entradas.
-
-**Radar de 30m** (`RADAR30M_ENABLED`) — un segundo escaneo del universo
-completo, en 30m, exclusivamente para detectar tendencia de fondo. Si
-un símbolo está en RUPTURA clara en 30m, bloquea las señales de 5m que
-apuesten EN CONTRA de esa tendencia. No es un filtro cualquiera: ataca
-directamente el patrón que el propio histórico de este proyecto
-identificó como la principal fuente de pérdidas — largos a
-contra-tendencia en mercado bajista (~43% de acierto frente a ~79% en
-cortos). Un símbolo sin tendencia clara en 30m (en rango o estirado) no
-bloquea nada — se prefiere dejar pasar una señal con contexto
-desconocido antes que bloquear todo por falta de dato.
-
-```
-🧭 A favor de la tendencia de 30m (bajista)
-```
-
----
-
-## Cascadas de liquidación (confirmación, gratis)
-
-Un módulo aparte, `liquidations.py`, escucha dos streams públicos y
-gratuitos — Binance Futures (`!forceOrder@arr`, todos los símbolos de
-golpe) y Bybit (`allLiquidation`, símbolo a símbolo) — sin API key ni
-cuenta en ninguno de los dos. BingX no publica liquidaciones, y
-Coinglass ya no tiene tier gratuito (29$/mes mínimo), así que esto es
-la fuente primaria sin intermediario de pago.
-
-**Qué mide:** no basta con que haya habido una liquidación grande —
-una liquidación suelta puede ser una sola cuenta, no un mecanismo de
-mercado. Se marca cascada cuando, en los últimos `LIQ_SHORT_WINDOW_SEC`
-(90s por defecto), hay al menos `LIQ_MIN_EVENTS` (3) liquidaciones
-distintas sumando `LIQ_MULTIPLIER` (3×) la actividad normal de ESE
-símbolo en los últimos `LIQ_BASELINE_MIN` (30 min), con un piso de
-`LIQ_MIN_USD` (5.000$) para que un símbolo casi sin actividad no dé un
-falso "3×" sobre una base casi nula. Ese umbral de velocidad+volumen es
-el mismo que usó el único backtest de esto con walk-forward que
-sobrevivió (PF>2.5 en SOL/ETH; BTC descartado por libro demasiado
-profundo para que el sobreimpulso sea operable).
-
-**Qué NO hace:** no decide si se abre una operación. `strategy.evaluate()`
-sigue siendo el único criterio de entrada, exactamente igual que antes.
-La cascada solo añade una línea 🔥 a la señal cuando la dirección
-coincide — largos liquidados (venta forzada) confirma una señal BUY
-(fade de bajada); cortos liquidados (compra forzada) confirma una señal
-SELL (fade de subida). Se puede desactivar con `LIQUIDATIONS_ENABLED=false`
-sin que cambie nada más del bot.
-
-Requiere `websockets` (ya en `requirements.txt`) y salida de red hacia
-`fstream.binance.com` y `stream.bybit.com` — en Railway funciona sin
-configuración aparte. El estado de conexión de ambos streams
-(`Binance ✓ · Bybit ✓`) sale en el resumen diario, por la misma razón
-que el latido de Telegram: si un stream se cae, hay que enterarse por
-el aviso, no descubrirlo semanas después.
-
----
-
-## ¿Cómo sé si es rentable?
-
-El bot guarda el resultado real (en R, múltiplos de lo arriesgado) de
-cada operación cerrada — no solo si ganó o perdió. Cada resumen diario
-incluye el informe de expectancy:
-
-```
-📈 Rentabilidad — expectancy en R
-
-SIGNAL · n=40
-Media: +0.11R  ·  IC95%: [-0.16, +0.39]
-Win rate: 55%  ·  Profit factor: 1.37
-Drawdown máx: 4.76R
-⚠️ muestra insuficiente — el intervalo cruza cero, podría ser azar
-```
-
-**El win rate solo no basta.** Dos sistemas con el mismo % de aciertos
-pueden ser uno ganador y otro perdedor según el tamaño de los ganadores
-frente a los perdedores. Lo que decide si hay ventaja es la
-**expectativa** (media de R por operación).
-
-**Y la expectativa sola tampoco basta con pocas operaciones.** Con la
-varianza típica de una reversión (se gana 1-1.5R, se pierde 1R, y suele
-haber más pérdidas que aciertos grandes), hacen falta del orden de
-100-150 operaciones para que el intervalo de confianza al 95% deje de
-tocar cero. Por debajo de eso, un +0.3R de media puede ser tan real
-como pura suerte — es la misma cautela que ya pedía este README a mano
-("35 operaciones... es apostar, no operar"), aquí convertida en número
-exacto: si el IC95% toca cero, con esos mismos datos una estrategia SIN
-ventaja real podría dar ese mismo promedio solo por azar.
-
-El informe separa **SIGNAL de LIVE** a propósito: SIGNAL no paga
-slippage ni comisión real, LIVE sí — mezclarlos escondería justo la
-diferencia que la sección "Riesgo que conviene tener presente" de más
-abajo avisa que va a doler.
-
-**Detalle técnico importante:** en modo SIGNAL no hay posición real que
-el exchange cierre solo — el bot comprueba cada ciclo si el precio tocó
-el SL o el TP contra las velas reales (`reconcile_signal()` en
-`main.py`). Sin esto, una señal en SIGNAL no se cerraría nunca salvo por
-el límite de tiempo, y las estadísticas de rentabilidad estarían
-incompletas desde el principio.
-
----
-
-## Sección cruzada (opera todos los días)
-
-Segundo sistema, independiente del anterior y con una diferencia clave:
-su criterio es **relativo**, no absoluto. Siempre existe un "peor 1%",
-así que siempre hay candidatos — justo lo que le falta a la reversión,
-cuyo filtro de amplitud deja días enteros sin nada.
-
-**La idea, con respaldo:** un estudio sobre más de 3.600 monedas
-encuentra que las cripto con el retorno más bajo del último día superan
-sistemáticamente a las de retorno más alto. Cada día a la hora fijada,
-el bot ordena el universo por retorno de 24 h y apunta: largo en las N
-peores, corto en las N mejores.
-
-**Arranca en modo REGISTRO y no manda órdenes.** Guarda el ranking, y
-al día siguiente evalúa qué habría pasado **descontando el coste de ida
-y vuelta**. Te llega el resultado del día y el acumulado.
-
-Con 20 días tendrás una respuesta propia a la única pregunta que
-importa: ¿queda diferencial después de costes?
-
-**El conflicto que hay que vigilar:** los autores atribuyen el efecto a
-la iliquidez, y señalan que las monedas más grandes muestran momentum
-diario en vez de reversión — el efecto contrario. O sea que el edge vive
-donde más caro es operar. Por eso `XSECTION_MIN_VOL` es más bajo que el
-filtro de la otra estrategia: si se filtra igual, se corta justo donde
-el efecto es más fuerte. El coste dirá si compensa.
-
----
-
-## Termómetro del mercado
-
-El resumen diario incluye la temperatura del universo: ATR mediano,
-percentil 90 y cuántos símbolos están a media distancia del umbral.
-
-Responde a una pregunta distinta de "¿hay candidatos hoy?": **¿se está
-calentando el mercado?** Con la mediana subiendo, van a aparecer
-candidatos pronto aunque hoy no haya ninguno. Con la mediana plana,
-puedes pasarte semanas sin una sola señal — y eso también es una
-respuesta, no un fallo.
-
-Contexto que conviene tener presente: la frecuencia de oportunidades de
-esta estrategia depende del RÉGIMEN del mercado. Cuando la dominancia de
-Bitcoin es alta y las alts están estancadas, hay poco que filtrar. En
-fases de rotación hacia alts, los movimientos del 10-20% diario son
-frecuentes y el radar se llena.
-
----
-
-## Despliegue en Railway
-
-**1. Sube el repositorio a GitHub** con estos archivos en la raíz.
-
-**2. En Railway:** New Project → Deploy from GitHub repo.
-
-**3. Monta un volumen en `/data`.** Sin él, el estado y el circuit
-breaker se reinician en cada despliegue. Ya pasó una vez en este
-proyecto y se perdió un historial entero.
-
-**4. Variables de entorno:** copia las de `.env.example`. Las mínimas
-para SIGNAL son `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID`.
-
-**5. Comprueba los logs.** Al arrancar dice el modo y cuántos símbolos
-tiene en el universo, y cada ciclo informa de cuántos pasaron el filtro
-de amplitud. Si ese número es 0 durante horas, el mercado está tranquilo
-— no está roto.
-
----
-
-## Pasar a LIVE
-
-Hacen falta **dos** interruptores, no uno:
-
-```
-MODE=LIVE
-LIVE_CONFIRMED=true
-BINGX_API_KEY=...
-BINGX_API_SECRET=...
-```
-
-Si falta alguno, el bot se queda en SIGNAL y lo dice en el log. Dos
-cerrojos no es paranoia: el coste de un despliegue equivocado es
-dinero, el de un cerrojo extra es un minuto.
-
-Recomendado para el primer LIVE: `RISK_PCT=0.25`, `MAX_CONCURRENT=1`,
-`SYMBOL_WHITELIST` con dos o tres símbolos que ya hayas medido.
-
----
-
-## Detalles de ejecución que evitan rechazos
-
-- Las cantidades y los precios se **redondean a la precisión del
-  contrato** que publica BingX. Sin esto, la primera orden en LIVE se
-  rechaza por enviar 13847.293847 donde solo se aceptan enteros, y el
-  bot parece roto sin estarlo.
-- Si el tamaño calculado queda por debajo del **lote mínimo** del
-  contrato, la señal se descarta con un aviso explicando por qué: con
-  un riesgo del 0.25% y un stop ancho, en algunos símbolos simplemente
-  no da para el mínimo.
-- Antes de abrir se comprueba si ya hay posición **en el exchange**, no
-  solo en el estado propio. Si una posición se abrió fuera del bot o el
-  estado se perdió, abrir otra sería doblar el riesgo sin enterarse.
-
----
-
-## Lo que el bot no hace, a propósito
-
-- No promedia a la baja.
-- No reentra tras un stop hasta pasado el enfriamiento.
-- No abre una posición sin stop: el SL viaja en la misma orden que la
-  entrada, para que una desconexión no deje nada desprotegido.
-- No opera símbolos sin amplitud, por bonito que sea el patrón.
-- No calcula el drawdown en euros: el circuit breaker cuenta **rachas**
-  de pérdidas, porque el bot no lleva la contabilidad del exchange y
-  fingir un porcentaje con datos que no tiene sería inventárselo.
-
----
-
-## Riesgo que conviene tener presente
-
-Ponerse corto contra una moneda que acaba de subir un 100% es de lo
-más peligroso que existe: short squeeze, iliquidez, huecos de precio.
-El deslizamiento de 2 ticks que asume el backtest es **optimista** justo
-en esas condiciones. Si el bot pasa a LIVE, espera resultados peores que
-los del Strategy Tester, no iguales.
-
----
-
-## Archivos
-
-| Archivo | Qué hace |
-|---------|----------|
-| `main.py` | Bucle de escaneo, señales y ejecución |
-| `strategy.py` | Motor — traducción literal del Pine |
-| `scanner.py` | Escaneo del universo completo, ranking y favoritas |
-| `stats.py` | Expectancy en R, IC95%, profit factor — ¿es rentable o es ruido? |
-| `liquidations.py` | Cascadas de liquidación (Binance + Bybit, gratis) — confirmación, no criterio de entrada |
-| `rsi_confirm.py` | RSI de doble cruce (traducido de ProBorsa) — confirmación de entrada en 5m |
-| `score.py` | Puntuación de confianza 0-100 — ordena el universo y se mide contra el R real |
-| `xsection.py` | Sección cruzada (retorno de 24h) |
-| `bingx.py` | Cliente de la API (velas, saldo, órdenes) |
-| `notify.py` | Telegram y estado en disco |
-| `config.py` | Variables de entorno |
-
-Si algún día cambias el Pine, cambia también `strategy.py`. Un bot que
-opera algo distinto de lo que backtesteaste no es un bot: es una
-sorpresa.
-
----
-
-## Avisos de Telegram
-
-Comprueba las credenciales **antes** de desplegar:
+## 1. Setup local
 
 ```bash
-python test_telegram.py
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env    # completar claves/params
+python -m unittest discover -s tests -v   # valida el detector de doble suelo
+python main.py
 ```
 
-Un bot que no puede avisarte es un bot mudo, y lo peor es que parece
-que funciona: los logs dicen "señal detectada" y a ti no te llega nada.
+Con `DRY_RUN=true` (default) el bot calcula señales, loguea y manda Telegram
+pero **no envía ninguna orden**. Déjalo correr así primero y confirmá que
+las señales llegan cuando esperás que lleguen antes de tocar `DRY_RUN=false`.
 
-Qué te va a llegar:
+## 2. Claves de BingX
 
-| Aviso | Cuándo |
-|-------|--------|
-| 🤖 Arranque | Al iniciar, con el modo y los filtros activos |
-| 📡 Ranking | Cada `RANK_INTERVAL_MIN`, con el top por amplitud |
-| 🏆 Favoritas | Justo después del ranking, solo lo que está LISTO ahora (o lo más cerca) |
-| 🔔 Señal | Cuando un símbolo cumple las condiciones (con 🔥 si hay cascada confirmando) |
-| 🟢 Ejecutado | Solo en LIVE, al abrir posición |
-| ⏱️ Cierre por tiempo | Si la vuelta no llega en `MAX_TRADE_BARS` |
-| ⏸️ Circuit breaker | Tras `MAX_CONSECUTIVE_LOSSES` pérdidas seguidas |
-| 📊 Resumen diario | A la hora que fijes en `DAILY_SUMMARY_HOUR_UTC` |
-| 💓 Latido | Cada `HEARTBEAT_HOURS` |
+1. BingX → API Management → crear API Key con permisos de **Perpetual
+   Futures** (lectura + trading). No actives withdrawals.
+2. El bot asume **Hedge Mode** en la cuenta (igual que tus otros bots) —
+   confirmalo en BingX antes de operar en real; si tu cuenta está en
+   One-way mode hay que cambiar `positionSide` de `LONG` a `BOTH` en
+   `bingx_client.py`.
+3. Para probar sin arriesgar capital real, BingX tiene un modo demo con
+   token **VST** en Perpetual Futures.
 
-El resumen diario y el latido existen por una razón concreta: **el
-silencio no distingue entre "no hay nada que operar" y "el bot está
-caído"**. Si un día no llega el latido, es lo segundo.
+## 3. Telegram
 
----
+1. Hablale a `@BotFather` → `/newbot` → copiá el token → `TELEGRAM_BOT_TOKEN`.
+2. Escribile algo a tu bot nuevo, después abrí
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` y copiá el `chat.id` →
+   `TELEGRAM_CHAT_ID`.
 
-## Archivos del repositorio
+## 4. Deploy en Railway
 
-```
-main.py                    Bucle: escaneo, señales, salidas por tiempo, avisos
-strategy.py                Motor — traducción literal de reversion_5m.pine
-scanner.py                 Escaneo del universo completo, ranking y favoritas
-stats.py                   Expectancy en R, IC95%, profit factor
-liquidations.py            Cascadas de liquidación (Binance + Bybit, gratis)
-rsi_confirm.py             RSI de doble cruce — confirmación de entrada
-score.py                   Puntuación de confianza 0-100 — ordena y mide
-xsection.py                Sección cruzada (retorno de 24h)
-bingx.py                   Cliente de la API
-notify.py                  Telegram y estado en disco
-config.py                  Variables de entorno
-test_telegram.py           Comprobación previa de credenciales
-requirements.txt           httpx, websockets
-Procfile / railway.json    Arranque en Railway
-.env.example               Todas las variables documentadas
-railway_vars_SIGNAL.txt    Pegar en el raw editor de Railway
-railway_vars_LIVE.txt      Ídem, para cuando pases a real
-.gitignore
-```
+1. Subí esta carpeta a un repo de GitHub.
+2. Railway → New Project → Deploy from GitHub repo.
+3. Railway detecta el `Dockerfile` (vía `railway.json`, builder forzado a
+   `DOCKERFILE` para evitar los fallos de build de Nixpacks/Metal).
+4. Variables → cargar todo lo de `.env.example` con tus valores reales.
+5. Si querés que el estado (`STATE_FILE_PATH`) sobreviva a un redeploy,
+   montá un **Volume** en `/app/data`; si no, el bot igual reconcilia la
+   posición real contra BingX al arrancar, así que nunca queda "ciego".
+6. Deploy. Revisá los logs y el mensaje de arranque en Telegram.
+
+## 5. Variables clave
+
+| Variable | Qué hace |
+|---|---|
+| `SYMBOLS` | uno o varios símbolos separados por coma (`BTC-USDT,ORDI-USDT`) |
+| `TIMEFRAME` | `15m` o `30m` — ver sección 7 antes de elegir |
+| `PIVOT_LEFT_BARS` / `PIVOT_RIGHT_BARS` | bars a cada lado para confirmar un pivote de precio como dip (default 5/5) |
+| `MAX_BOTTOM_DIFF_PCT` | qué tan parecidos en precio deben ser los dos suelos (default 2%) |
+| `MIN_BARS_BETWEEN_LOWS` / `MAX_BARS_BETWEEN_LOWS` | separación mínima/máxima entre los dos suelos |
+| `MIN_NECKLINE_BOUNCE_PCT` | cuánto debe subir el rebote entre los dos suelos (el "neckline") |
+| `REQUIRE_RSI_DIVERGENCE` | exige que el RSI en el 2º suelo sea mayor que en el 1º (divergencia alcista real) |
+| `MAX_WAIT_BARS` | cuántas velas espera la ruptura del neckline antes de descartar la señal |
+| `USE_HTF_TREND_FILTER` | si está en `true`, no compra cuando la tendencia de `HTF_TIMEFRAME` está cayendo fuerte |
+| `HTF_TIMEFRAME` / `HTF_EMA_LENGTH` | temporalidad y período de la EMA de referencia superior (default 4h / 100) |
+| `HTF_EMA_SLOPE_LOOKBACK` / `HTF_MAX_DOWN_SLOPE_PCT` | cuántas velas mira hacia atrás la EMA y cuánto puede caer (%) antes de bloquear entradas |
+| `POSITION_SIZING_MODE` | `RISK_PERCENT` (% del equity × leverage) o `FIXED_MARGIN` (margen fijo en USDT) |
+| `STOP_LOSS_PCT` | 0 = desactivado. Si lo activás, el bot coloca una orden `STOP_MARKET reduceOnly` real en BingX (no un chequeo local) |
+| `QUANTITY_PRECISION` / `PRICE_PRECISION` | decimales que exige BingX para el símbolo elegido — confirmalo antes de ir a real |
+
+## 6. Qué cambió en v2 (y por qué)
+
+Mirando el gráfico que mandaste: el v1 contaba cuántas veces el RSI cruzaba
+hacia arriba su propia media estando bajo 50 — un proxy de momentum, no una
+detección real de "doble suelo". Por eso podía entrar (y entró, en el
+último "Long Giriş" del gráfico) mientras el precio todavía estaba haciendo
+un mínimo más bajo, justo antes de la vela roja fuerte. El propio script
+original ya traía una sección de divergencia RSI real (`bullCond`), pero
+estaba desconectada de la entrada — solo era un dibujo.
+
+v2 detecta un "W" de verdad:
+1. Busca dos pivotes de mínimo en **precio** (no en RSI).
+2. Exige que estén a un precio parecido, con separación razonable en velas,
+   y que el rebote entre ambos (el "neckline") sea significativo.
+3. Exige que el RSI del 2º suelo sea mayor que el del 1º — divergencia
+   alcista real, confirmando que el momentum mejora aunque el precio
+   repita el nivel.
+4. Recién ahí arma una "señal pendiente", y **solo entra cuando el precio
+   rompe el neckline hacia arriba** — no en el instante del cruce de RSI.
+   Esto es lo que resuelve el problema de "comprar el cuchillo cayendo".
+
+La salida por SuperTrend no cambió.
+
+Además, ahora hay un **filtro de tendencia de timeframe superior** (lo que
+quedaba pendiente): si `USE_HTF_TREND_FILTER=true` (default), antes de
+entrar el bot chequea la EMA de `HTF_TIMEFRAME` (4h por defecto) — si cayó
+más de `HTF_MAX_DOWN_SLOPE_PCT`% en las últimas `HTF_EMA_SLOPE_LOOKBACK`
+velas, la señal se descarta. No se pierde: si el doble suelo es real pero
+la tendencia mayor está débil, Telegram manda un aviso "⛔ FILTRADO" aparte
+con los mismos datos del setup, para que decidas vos si entrar a mano.
+Si falla la consulta de la temporalidad superior, el bot **no entra** ese
+ciclo (falla cerrado, no abierto) — misma filosofía de cautela que el
+resto del bot. El mismo filtro está en el `.pine` vía `request.security`
+(con `close[1]` + `lookahead_off` para no repintar), así el backtest en
+TradingView refleja exactamente lo que hace el bot en vivo.
+
+## 7. 15m vs 30m — cómo decidir (no a ojo)
+
+Con pocas señales visibles en el gráfico no alcanza para concluir que 30m
+es mejor — podés estar viendo un tramo con suerte. La forma correcta de
+decidir:
+
+1. Subí `ProBorsa_RSI_SuperTrend_CiftDip_v2.pine` a TradingView (Pine
+   Editor → pegar → Add to chart) sobre el símbolo que te interesa.
+2. Abrí el **Strategy Tester** y compará, en la misma ventana de fechas,
+   15m vs 30m: cantidad de operaciones, win rate, profit factor, y sobre
+   todo el **max drawdown** — timeframes más altos suelen dar señales más
+   limpias (menos ruido) pero más lentas y más espaciadas; timeframes
+   bajos dan más señales pero más falsas rupturas de neckline.
+3. Con esos números elegís `TIMEFRAME` en `.env` — es una sola variable,
+   no requiere tocar código.
+4. Si el resultado es parejo, un punto medio razonable es correr la
+   detección en 30m (estructura más limpia) y no perder velocidad de
+   reacción porque `POLL_INTERVAL_SECONDS` ya revisa la vela cerrada más
+   reciente en cuanto BingX la publica.
+
+Como mejora futura (no incluida todavía): escalar el tamaño de posición
+según la fuerza de la tendencia superior, o exigir divergencia también en
+la temporalidad superior. Avisame si querés que lo sume.
+
+## 8. Señales en Telegram
+
+Cada aviso de entrada trae: precio, los dos suelos con su RSI respectivo,
+el neckline roto, si hubo divergencia alcista, nivel de SuperTrend (la
+referencia de salida), estado de la tendencia superior si el filtro está
+activo, stop sugerido si activaste `STOP_LOSS_PCT`, qty y leverage
+sugeridos, y timestamp — pensado para operar a mano sin abrir el gráfico.
+Las señales que el bot descarta por el filtro de tendencia superior
+también avisan (⛔ FILTRADO), con motivo y niveles, para que decidas vos.
+Con `DRY_RUN=true` el bot nunca manda una orden real: podés dejarlo así de
+forma permanente y ejecutar vos mismo.
+
+## 9. Notas importantes
+
+- El Pine original usa `default_qty_value=100` (100% del equity) — válido
+  para backtest, no para real con leverage; el bot usa sizing basado en
+  `RISK_PERCENT_EQUITY` por defecto.
+- Los endpoints de BingX (`/openApi/swap/v2/...`) están verificados contra
+  documentación pública y ejemplos en producción, pero BingX los revisa
+  de tanto en tanto — confirmá los paths actuales en
+  https://bingx-api.github.io/docs/#/swapV2/introduce antes de ir a real.
+- Este documento y el código son soporte técnico, no asesoramiento
+  financiero — la estrategia, el apalancamiento y el sizing son decisión
+  tuya.
