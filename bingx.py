@@ -165,7 +165,8 @@ class BingX:
         )
 
     async def market_order(
-        self, symbol: str, side: str, quantity: float, sl: float, tp: float
+        self, symbol: str, side: str, quantity: float, sl: float, tp: float,
+        client_id: str | None = None
     ) -> dict:
         """
         side: 'BUY' (largo) o 'SELL' (corto).
@@ -180,6 +181,9 @@ class BingX:
             "positionSide": position_side,
             "type": "MARKET",
             "quantity": quantity,
+            # Identificador propio: permite comprobar DESPUÉS si la orden
+            # existe cuando la respuesta se pierde por el camino.
+            "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
             "stopLoss": (
                 '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl
             ),
@@ -190,7 +194,8 @@ class BingX:
         return await self._private("POST", "/openApi/swap/v2/trade/order", params)
 
     async def limit_order(
-        self, symbol: str, side: str, quantity: float, price: float, sl: float, tp: float
+        self, symbol: str, side: str, quantity: float, price: float, sl: float, tp: float,
+        client_id: str | None = None
     ) -> dict:
         """
         Entrada con precio límite. Puede no ejecutarse, y eso es
@@ -209,6 +214,7 @@ class BingX:
                 "price": price,
                 "quantity": quantity,
                 "timeInForce": "GTC",
+                "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
                 "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl,
                 "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp,
             },
@@ -237,6 +243,34 @@ class BingX:
                 "quantity": quantity,
             },
         )
+
+    async def open_orders(self, symbol: str) -> list[dict]:
+        data = await self._private("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
+        if isinstance(data, dict):
+            data = data.get("orders", [])
+        return data if isinstance(data, list) else []
+
+    async def order_exists(self, symbol: str, client_id: str) -> bool:
+        """
+        ¿Existe esta orden en el exchange?
+
+        Se llama cuando el envío falló por red: la petición pudo llegar
+        igualmente y la respuesta perderse. Sin esta comprobación, el
+        bot da por fallida una orden que SÍ existe — y luego abre otra.
+        """
+        try:
+            for o in await self.open_orders(symbol):
+                if str(o.get("clientOrderID") or o.get("clientOrderId") or "") == client_id:
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for p in await self.open_positions():
+                if str(p.get("symbol")) == symbol and float(p.get("positionAmt", 0) or 0) != 0:
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     async def open_positions(self) -> list[dict]:
         data = await self._private("GET", "/openApi/swap/v2/user/positions")

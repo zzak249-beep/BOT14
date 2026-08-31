@@ -1,111 +1,162 @@
 """
-config.py
+Configuración del bot RSI doble suelo + SuperTrend.
 
-All runtime configuration comes from environment variables so the bot needs
-zero code changes between local testing and Railway (Railway injects env
-vars directly; python-dotenv is used only so a local .env file works the
-same way when running outside Railway).
+MODE=SIGNAL por defecto. Esta estrategia no tiene ni una operación
+medida: los parámetros del Pine original (RSI 10 en vez de 14,
+multiplicador 2.5) son ajustes que su autor hizo para dar más señales y
+salidas más rentables, o sea que vienen ya optimizados sobre algún
+histórico que no es el tuyo. Mídela antes de ponerle dinero.
 """
-
 import os
 
-from dotenv import load_dotenv
 
-load_dotenv()
+def _bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "si", "sí")
 
 
-def _get_bool(name, default):
-    val = os.getenv(name)
-    if val is None or val == "":
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
         return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _get_float(name, default):
-    val = os.getenv(name)
-    return float(val) if val not in (None, "") else default
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
-def _get_int(name, default):
-    val = os.getenv(name)
-    return int(val) if val not in (None, "") else default
+MODE = os.getenv("MODE", "SIGNAL").strip().upper()
+LIVE_CONFIRMED = _bool("LIVE_CONFIRMED", False)
+
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
+
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
+
+# ── Estrategia (mismos valores que el Pine original) ──────────────────
+RSI_LEN = _int("RSI_LEN", 10)
+SIG_LEN = _int("SIG_LEN", 10)
+TRIGGER_LEVEL = _float("TRIGGER_LEVEL", 50.0)
+# 2 = doble suelo (W). Con 1 se opera el primer intento, que es
+# justamente el que el autor considera que falla.
+TARGET_CROSS = _int("TARGET_CROSS", 2)
+ATR_LEN = _int("ATR_LEN", 14)
+ST_PERIOD = _int("ST_PERIOD", 10)
+ST_FACTOR = _float("ST_FACTOR", 2.5)
+# TENSIÓN REAL DEL PINE ORIGINAL, descubierta al probar el motor:
+# un doble suelo ocurre POR DEFINICIÓN durante una caída, así que en el
+# momento de la señal el SuperTrend casi siempre está bajista y su línea
+# queda POR ENCIMA del precio — no sirve como stop. El Pine no lo nota
+# porque su salida solo se dispara en el INSTANTE del giro a bajista:
+# si ya estaba bajista, la posición se queda abierta sin protección
+# hasta el siguiente giro, que puede tardar días.
+#   true  = exigir SuperTrend ya alcista. Menos señales, stop coherente.
+#   false = fiel al original. Entra igual, y el stop lo pone el mínimo
+#           reciente porque el SuperTrend no puede.
+REQUIRE_ST_BULL = _bool("REQUIRE_ST_BULL", True)
+SL_SWING_ATR = _float("SL_SWING_ATR", 0.5)
+SL_SWING_LOOKBACK = _int("SL_SWING_LOOKBACK", 20)
+
+# ── Objetivo ──────────────────────────────────────────────────────────
+# El Pine original NO tiene objetivo: sale solo cuando gira el
+# SuperTrend. Aquí es opcional para poder comparar las dos variantes.
+USE_TP = _bool("USE_TP", False)
+RR_TARGET = _float("RR_TARGET", 2.0)
+
+# ── Universo y filtros ────────────────────────────────────────────────
+TIMEFRAME = os.getenv("TIMEFRAME", "15m").strip()
+# Varios timeframes a la vez. El patrón se busca en cada uno por
+# separado y la señal dice en cuál salió.
+# AVISO SOBRE 5m: los stops del SuperTrend son proporcionalmente más
+# pequeños cuanto menor es el timeframe, y el coste de operar NO baja.
+# Con MIN_RISK_PCT=1.5 la mayoría de señales de 5m se descartarán por
+# "stop demasiado cerca" — eso no es un fallo, es el filtro haciendo su
+# trabajo. Si en 5m no sale nada, la respuesta no es bajar el mínimo:
+# es que en ese timeframe el coste se come el movimiento.
+TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", TIMEFRAME).split(",") if t.strip()]
+SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 90)
+MAX_SYMBOLS = _int("MAX_SYMBOLS", 400)
+SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
+EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC").split(",") if p.strip()]
+MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 3_000_000.0)
+# El stop lo pone el SuperTrend, que puede quedar lejísimos. Sin este
+# tope, una sola operación puede llevarse un múltiplo del riesgo previsto.
+MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
+MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
+# EL FILTRO QUE FALTABA. El stop lo pone el SuperTrend o el mínimo
+# reciente, y a veces queda MUY cerca: un riesgo del 0.69% con 0.25% de
+# coste significa que la operación empieza perdiendo 0.36R antes de que
+# el precio se mueva. Es el mismo error que ya se corrigió en el otro
+# bot: no basta con acotar el stop por arriba, hay que acotarlo también
+# por ABAJO en relación al coste.
+MIN_RISK_PCT = _float("MIN_RISK_PCT", 1.5)
+MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
+SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
+
+# ── Riesgo ────────────────────────────────────────────────────────────
+RISK_PCT = _float("RISK_PCT", 0.25)
+MAX_CONCURRENT = _int("MAX_CONCURRENT", 2)
+LEVERAGE = _int("LEVERAGE", 2)
+MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
+# LÍMITE DE PÉRDIDA DIARIA, en múltiplos de R.
+# El estudio de Taiwán sobre 450.000 traders encuentra que menos del 1%
+# gana de forma consistente, y que los que lo consiguen comparten un
+# rasgo concreto: stops duros de pérdida DIARIA, no solo por operación.
+# El circuit breaker por rachas no cubre esto — tres pérdidas seguidas
+# saltan, pero seis alternadas con dos ganancias pequeñas no, y el día
+# acaba igual de mal.
+MAX_DAILY_LOSS_R = _float("MAX_DAILY_LOSS_R", 3.0)
+
+# ── Contexto de mercado (BTC como referencia) ─────────────────────────
+# No es un filtro adivinatorio: es un REGISTRO. En cada operación se
+# apunta cómo iba BTC, porque el régimen actual (dominancia 56-59%,
+# índice de altseason por debajo de 40, rallies de alts aislados y
+# especulativos) hace que una estrategia SOLO DE LARGOS en alts esté
+# comprando contra la corriente relativa. Dentro de un mes, con el
+# diario delante, podrás ver si tus resultados dependen de eso — en
+# vez de suponerlo.
+BTC_CONTEXT = _bool("BTC_CONTEXT", True)
+# Filtro OPCIONAL y apagado: no abrir largos si BTC cae fuerte, porque
+# las alts caen más. Apagado a propósito: sin datos propios que lo
+# respalden, activarlo sería añadir una creencia al sistema.
+BTC_FILTER = _bool("BTC_FILTER", False)
+BTC_MIN_24H = _float("BTC_MIN_24H", -3.0)
+COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 180)
+ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
+LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
+
+# ── Avisos ────────────────────────────────────────────────────────────
+# Enfriamiento por símbolo en modo SIGNAL: sin esto la misma señal se
+# repite en cada ciclo mientras no cambie la vela.
+SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
+# Aviso periódico con las que están CERCA del patrón (contador en 1 de
+# 2). Las señales avisan cuando ya pasó; esto deja verlo venir. 0 lo
+# desactiva.
+WATCHLIST_MIN = _int("WATCHLIST_MIN", 30)
+
+DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
+DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
+HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
+IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
+
+STATE_PATH = os.getenv("STATE_PATH", "/data/state_rsi.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
 
 
-class Config:
-    def __init__(self):
-        # --- BingX ---
-        self.api_key = os.getenv("BINGX_API_KEY", "")
-        self.api_secret = os.getenv("BINGX_API_SECRET", "")
-        self.base_url = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
+def is_live() -> bool:
+    return MODE == "LIVE" and LIVE_CONFIRMED and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
 
-        # --- Market / strategy (defaults mirror the Pine script inputs) ---
-        self.symbols = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTC-USDT").split(",") if s.strip()]
-        self.timeframe = os.getenv("TIMEFRAME", "15m")
 
-        self.rsi_length = _get_int("RSI_LENGTH", 10)
-        self.trigger_level = _get_float("RSI_TRIGGER_LEVEL", 50.0)
-
-        self.pivot_left_bars = _get_int("PIVOT_LEFT_BARS", 5)
-        self.pivot_right_bars = _get_int("PIVOT_RIGHT_BARS", 5)
-        self.max_bottom_diff_pct = _get_float("MAX_BOTTOM_DIFF_PCT", 2.0)
-        self.min_bars_between_lows = _get_int("MIN_BARS_BETWEEN_LOWS", 3)
-        self.max_bars_between_lows = _get_int("MAX_BARS_BETWEEN_LOWS", 50)
-        self.min_neckline_bounce_pct = _get_float("MIN_NECKLINE_BOUNCE_PCT", 1.0)
-        self.require_rsi_divergence = _get_bool("REQUIRE_RSI_DIVERGENCE", True)
-        self.max_wait_bars = _get_int("MAX_WAIT_BARS", 20)
-
-        self.st_atr_period = _get_int("SUPERTREND_ATR_PERIOD", 10)
-        self.st_factor = _get_float("SUPERTREND_FACTOR", 2.5)
-
-        # --- Filtro de tendencia de timeframe superior (opcional) ---
-        self.use_htf_trend_filter = _get_bool("USE_HTF_TREND_FILTER", True)
-        self.htf_timeframe = os.getenv("HTF_TIMEFRAME", "4h")
-        self.htf_ema_length = _get_int("HTF_EMA_LENGTH", 100)
-        self.htf_ema_slope_lookback = _get_int("HTF_EMA_SLOPE_LOOKBACK", 10)
-        self.htf_max_down_slope_pct = _get_float("HTF_MAX_DOWN_SLOPE_PCT", 0.5)
-
-        # --- Risk / sizing (the Pine backtest used 100% of equity per trade -
-        # NOT safe for live leveraged capital, so this defaults to a
-        # risk-based size instead; see README) ---
-        self.leverage = _get_int("LEVERAGE", 5)
-        self.margin_mode = os.getenv("MARGIN_MODE", "ISOLATED").upper()
-        self.position_sizing_mode = os.getenv("POSITION_SIZING_MODE", "RISK_PERCENT").upper()
-        self.risk_percent_equity = _get_float("RISK_PERCENT_EQUITY", 2.0)
-        self.fixed_margin_usdt = _get_float("FIXED_MARGIN_USDT", 50.0)
-        self.stop_loss_pct = _get_float("STOP_LOSS_PCT", 0.0)  # 0 disables the safety stop
-        self.quantity_precision = _get_int("QUANTITY_PRECISION", 3)
-        self.price_precision = _get_int("PRICE_PRECISION", 2)
-
-        # --- Runtime ---
-        self.poll_interval_seconds = _get_int("POLL_INTERVAL_SECONDS", 30)
-        self.klines_lookback = _get_int("KLINES_LOOKBACK", 500)
-        self.recv_window_ms = _get_int("RECV_WINDOW_MS", 5000)
-        self.dry_run = _get_bool("DRY_RUN", True)
-        self.state_file_path = os.getenv("STATE_FILE_PATH", "./data/state.json")
-        self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-
-        # --- Telegram ---
-        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-
-    def validate(self):
-        errors = []
-        if not self.dry_run:
-            if not self.api_key:
-                errors.append("BINGX_API_KEY is required when DRY_RUN=false")
-            if not self.api_secret:
-                errors.append("BINGX_API_SECRET is required when DRY_RUN=false")
-        if not self.symbols:
-            errors.append("SYMBOLS must contain at least one symbol (e.g. BTC-USDT)")
-        if self.position_sizing_mode not in ("RISK_PERCENT", "FIXED_MARGIN"):
-            errors.append("POSITION_SIZING_MODE must be RISK_PERCENT or FIXED_MARGIN")
-        if self.min_bars_between_lows > self.max_bars_between_lows:
-            errors.append("MIN_BARS_BETWEEN_LOWS must be <= MAX_BARS_BETWEEN_LOWS")
-        if self.pivot_left_bars < 1 or self.pivot_right_bars < 1:
-            errors.append("PIVOT_LEFT_BARS and PIVOT_RIGHT_BARS must be >= 1")
-        if self.htf_ema_length < 2:
-            errors.append("HTF_EMA_LENGTH must be >= 2")
-        if self.htf_ema_slope_lookback < 1:
-            errors.append("HTF_EMA_SLOPE_LOOKBACK must be >= 1")
-        if errors:
-            raise ValueError("Configuration error(s):\n- " + "\n- ".join(errors))
+def describe() -> str:
+    if is_live():
+        return "LIVE — enviando órdenes reales a BingX"
+    if MODE == "LIVE":
+        return "LIVE pedido pero SIN confirmar (falta LIVE_CONFIRMED o claves) — sigue en SIGNAL"
+    return "SIGNAL — solo avisos, no toca el exchange"

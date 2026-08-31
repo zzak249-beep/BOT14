@@ -1,425 +1,563 @@
 """
-main.py
+Bot RSI doble suelo + salida por SuperTrend — BingX.
 
-Entry point. Polls BingX for closed candles on the configured TIMEFRAME,
-runs the double-bottom (price structure + RSI divergence) + SuperTrend
-signal engine from indicators.py, and trades the result on BingX Perpetual
-Futures with Telegram notifications.
+Escanea, busca el segundo cruce fallido del RSI bajo el nivel de
+disparo, entra en largo y sale cuando gira el SuperTrend.
 
-Long-only, one position per symbol at a time - mirrors the source Pine
-strategy exactly (it only ever calls strategy.entry on the long side).
-
-Safety notes (see README for the full list):
-  - DRY_RUN=true by default: computes and logs/notifies signals without
-    sending any order. Flip to false only after you've watched it run.
-  - An optional hard STOP_LOSS_PCT is placed as a real reduceOnly
-    STOP_MARKET order on the exchange (not just checked locally), so
-    protection survives even if the bot's process is down.
-  - On every cycle (and on startup) the bot re-checks BingX's own position
-    endpoint rather than trusting local state alone.
+DIFERENCIA IMPORTANTE CON EL OTRO BOT: aquí la salida NO es un objetivo
+fijo, es un indicador que se mueve. El SuperTrend se recalcula en cada
+vela, así que el stop se actualiza en el exchange cada vez que sube —
+nunca baja. Si el bot se cae, el último stop enviado sigue vivo en
+BingX: por eso se envía siempre con la orden y no se gestiona solo en
+memoria.
 """
+from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
-import signal
-from datetime import datetime, timezone
+import os
+import time
 
-from bingx_client import BingXAPIError, BingXClient, parse_klines
-from config import Config
-from indicators import StrategyParams, evaluate_htf_trend, generate_signals
-from state_manager import StateManager
-from telegram_notifier import TelegramNotifier
+import httpx
 
-logger = logging.getLogger("main")
+import config
+import journal
+import strategy
+from bingx import BingX, BingXError
+from notify import State, Telegram
+
+logging.basicConfig(
+    level=getattr(logging, getattr(config, "LOG_LEVEL", "INFO"), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+if getattr(config, "LOG_LEVEL", "INFO") != "DEBUG":
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+log = logging.getLogger("bot")
 
 
-def _fmt_ts(open_time_ms):
-    return datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+_DEFAULTS = {
+    "RSI_LEN": 10, "SIG_LEN": 10, "TRIGGER_LEVEL": 50.0, "TARGET_CROSS": 2,
+    "ATR_LEN": 14, "WATCHLIST_MIN": 30, "TIMEFRAMES": ["15m"], "MAX_DAILY_LOSS_R": 3.0, "BTC_CONTEXT": True, "BTC_FILTER": False, "BTC_MIN_24H": -3.0, "ST_PERIOD": 10, "ST_FACTOR": 2.5, "REQUIRE_ST_BULL": True,
+    "SL_SWING_ATR": 0.5, "SL_SWING_LOOKBACK": 20, "USE_TP": False, "RR_TARGET": 2.0,
+    "TIMEFRAME": "15m", "SCAN_INTERVAL_SEC": 90, "MAX_SYMBOLS": 400,
+    "SYMBOL_WHITELIST": [], "EXCLUDE_PREFIXES": ["NC"],
+    "MIN_QUOTE_VOLUME_24H": 3_000_000.0, "MIN_ATR_PCT": 0.5,
+    "MAX_RISK_PCT": 4.0, "MIN_RISK_PCT": 1.5, "MAX_COST_IN_R": 0.20,
+    "COST_ROUNDTRIP_PCT": 0.25, "SCAN_CONCURRENCY": 8,
+    "RISK_PCT": 0.25, "MAX_CONCURRENT": 2, "LEVERAGE": 2,
+    "MAX_CONSECUTIVE_LOSSES": 3, "COOLDOWN_MINUTES": 180,
+    "ENTRY_TYPE": "LIMIT", "LIMIT_OFFSET_PCT": 0.05, "SIGNAL_COOLDOWN_MIN": 60,
+    "DAILY_SUMMARY": True, "DAILY_SUMMARY_HOUR_UTC": 7, "HEARTBEAT_HOURS": 12,
+    "IDLE_ALERT_DAYS": 5, "STATE_PATH": "/data/state_rsi.json", "LOG_LEVEL": "INFO",
+}
 
 
-class SymbolWorker:
-    def __init__(self, symbol, cfg: Config, client: BingXClient, notifier: TelegramNotifier, state_mgr: StateManager):
-        self.symbol = symbol
-        self.cfg = cfg
-        self.client = client
-        self.notifier = notifier
-        self.state_mgr = state_mgr
-        self.state = {"in_position": False}
-        self.last_processed_open_time = None
-        self.params = StrategyParams(
-            rsi_length=cfg.rsi_length,
-            trigger_level=cfg.trigger_level,
-            pivot_left=cfg.pivot_left_bars,
-            pivot_right=cfg.pivot_right_bars,
-            max_bottom_diff_pct=cfg.max_bottom_diff_pct,
-            min_bars_between_lows=cfg.min_bars_between_lows,
-            max_bars_between_lows=cfg.max_bars_between_lows,
-            min_neckline_bounce_pct=cfg.min_neckline_bounce_pct,
-            require_rsi_divergence=cfg.require_rsi_divergence,
-            max_wait_bars=cfg.max_wait_bars,
-            st_atr_period=cfg.st_atr_period,
-            st_factor=cfg.st_factor,
+def ensure_config() -> list[str]:
+    """Un config.py antiguo no puede tumbar un bot con dinero real."""
+    faltan = []
+    for nombre, valor in _DEFAULTS.items():
+        if not hasattr(config, nombre):
+            setattr(config, nombre, valor)
+            faltan.append(nombre)
+    return faltan
+
+
+def fmt_signal(sig: strategy.Signal, live: bool) -> str:
+    cabecera = "🟢 EJECUTADO" if live else "🔔 SEÑAL"
+    base = sig.symbol.split("-")[0]
+    riesgo = (sig.entry - sig.sl) / sig.entry * 100.0
+    tp_txt = f"\nTP <code>{sig.tp:.8g}</code>" if sig.tp else "\nSin TP: sale cuando gire el SuperTrend"
+    return (
+        f"{cabecera} · LARGO <b>{base}</b>  (doble suelo RSI)\n"
+        f"Entrada <code>{sig.entry:.8g}</code>\n"
+        f"SL (SuperTrend) <code>{sig.sl:.8g}</code>  ·  riesgo {riesgo:.2f}%"
+        f"{tp_txt}\n"
+        f"RSI {sig.rsi:.1f} · cruce nº{sig.cross_count} bajo {config.TRIGGER_LEVEL:.0f} · ATR {sig.atr_pct:.2f}%\n"
+        f"Timeframe <b>{getattr(sig, 'timeframe', config.TIMEFRAME)}</b>"
+        + (f"  ·  BTC {sig.btc_24h:+.1f}% 24h" if getattr(sig, "btc_24h", None) is not None else "")
+    )
+
+
+class Bot:
+    def __init__(self) -> None:
+        self.state = State(config.STATE_PATH)
+        self.client = httpx.AsyncClient()
+        self.api = BingX(self.client)
+        self.tg = Telegram(self.client)
+        self.symbols: list[str] = []
+        self.volumes: dict[str, float] = {}
+        self.live = config.is_live()
+        self.last_heartbeat = time.time()
+        self.last_watchlist = 0.0
+        self.btc_24h: float | None = None
+        self.btc_ts = 0.0
+        self.sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
+        self.journal = journal.Journal(
+            os.path.join(os.path.dirname(config.STATE_PATH) or "/data", "operaciones_rsi-st-bot.csv")
         )
 
-    # ------------------------------------------------------------ persistence
-    def _persist(self):
-        all_state = self.state_mgr.load()
-        all_state[self.symbol] = self.state
-        self.state_mgr.save(all_state)
+    async def start(self) -> None:
+        faltan = ensure_config()
+        if faltan:
+            log.error("config.py desactualizado, faltaban: %s", ", ".join(faltan))
+        log.info("Modo: %s", config.describe())
+        await self.tg.send(
+            f"🤖 <b>Bot RSI doble suelo iniciado</b>\n"
+            f"{config.describe()}\n"
+            f"RSI({config.RSI_LEN}) cruzando SMA({config.SIG_LEN}) bajo {config.TRIGGER_LEVEL:.0f}\n"
+            f"Señal en el cruce nº{config.TARGET_CROSS} · salida SuperTrend({config.ST_PERIOD}, {config.ST_FACTOR})\n"
+            f"Timeframe {config.TIMEFRAME} · riesgo {config.RISK_PCT}%"
+        )
+        await self.refresh_symbols()
+        while True:
+            try:
+                await self.reconcile()
+                await self.maybe_watchlist()
+                await self.manage_open()
+                await self.maybe_daily_summary()
+                await self.maybe_heartbeat()
+                await self.scan_once()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Fallo en el ciclo: %s", exc)
+            await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
-    async def reconcile(self):
-        """Startup check: trust BingX's live position over the local state
-        file (which may be stale or absent after a redeploy)."""
-        all_state = self.state_mgr.load()
-        self.state = all_state.get(self.symbol, {"in_position": False})
+    async def refresh_symbols(self) -> None:
         try:
-            positions = await self.client.get_positions(self.symbol)
-            live = next(
-                (p for p in positions if p.get("positionSide", "LONG") == "LONG" and abs(float(p.get("positionAmt", 0) or 0)) > 0),
-                None,
-            )
-            if live:
-                self.state = {
-                    "in_position": True,
-                    "quantity": abs(float(live.get("positionAmt", 0))),
-                    "entry_price": float(live.get("avgPrice", 0) or 0),
-                    "entered_at": self.state.get("entered_at") or datetime.now(timezone.utc).isoformat(),
-                    "stop_order_id": self.state.get("stop_order_id"),
-                    "reconciled": True,
-                }
-                logger.info("[%s] Reconciled open position from exchange: qty=%s entry=%s",
-                            self.symbol, self.state["quantity"], self.state["entry_price"])
-            else:
-                if self.state.get("in_position"):
-                    logger.warning("[%s] Local state said in-position but exchange shows none; clearing.", self.symbol)
-                self.state = {"in_position": False}
-        except BingXAPIError as e:
-            logger.error("[%s] Could not reconcile positions on startup (leaving local state as-is): %s", self.symbol, e)
-        self._persist()
-
-    async def _check_external_close(self):
-        """If the exchange shows the position gone (e.g. the resting
-        stop-loss filled) but local state still thinks we're in it, sync up
-        and notify instead of drifting out of sync."""
-        if not self.state.get("in_position") or self.cfg.dry_run:
+            syms = await self.api.symbols()
+        except Exception as exc:  # noqa: BLE001
+            log.error("No se pudo listar símbolos: %s", exc)
             return
+        if config.SYMBOL_WHITELIST:
+            syms = [s for s in syms if s.split("-")[0].upper() in config.SYMBOL_WHITELIST]
         try:
-            positions = await self.client.get_positions(self.symbol)
-            still_open = any(
-                p.get("positionSide", "LONG") == "LONG" and abs(float(p.get("positionAmt", 0) or 0)) > 0
-                for p in positions
-            )
-        except BingXAPIError as e:
-            if e.code == 109420:  # "position not exist" -> treat as a clean close
-                still_open = False
-            else:
-                logger.warning("[%s] Could not verify position status this cycle: %s", self.symbol, e)
-                return
-        if not still_open:
-            logger.info("[%s] Position is closed on the exchange (stop-loss or manual) - syncing state.", self.symbol)
-            await self.notifier.send(f"ℹ️ <b>{self.symbol}</b>: la posición ya está cerrada en BingX (probablemente saltó el stop-loss).")
-            self.state = {"in_position": False}
-            self._persist()
+            self.volumes = await self.api.tickers_24h()
+            antes = len(syms)
+            syms = [s for s in syms if self.volumes.get(s, 0.0) >= config.MIN_QUOTE_VOLUME_24H]
+            log.info("Liquidez: %d de %d superan %.0f USDT", len(syms), antes, config.MIN_QUOTE_VOLUME_24H)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Sin filtro de liquidez (%s)", exc)
+        self.symbols = syms[: config.MAX_SYMBOLS]
+        log.info("Universo: %d símbolos", len(self.symbols))
 
-    # ------------------------------------------------------------------ sizing
-    async def _get_equity(self):
-        try:
-            bal = await self.client.get_balance()
-            if isinstance(bal, dict) and "balance" in bal and isinstance(bal["balance"], (dict, list)):
-                bal = bal["balance"]
-            if isinstance(bal, list):
-                bal = next((b for b in bal if b.get("asset", "USDT") == "USDT"), bal[0] if bal else {})
-            equity = float(bal.get("equity") or bal.get("balance") or bal.get("availableMargin") or 0)
-            return equity
-        except Exception as e:
-            logger.error("[%s] Failed to fetch balance: %s", self.symbol, e)
+    def in_cooldown(self) -> bool:
+        return time.time() < float(self.state.data.get("cooldown_until", 0))
+
+    async def contexto_btc(self) -> float | None:
+        """Variación de BTC en 24h. Se refresca cada 15 minutos."""
+        if not config.BTC_CONTEXT:
             return None
-
-    def _compute_quantity(self, price, equity):
-        """Returns (qty, margin_usdt), or (None, None) if it can't be sized."""
-        if self.cfg.position_sizing_mode == "FIXED_MARGIN":
-            margin = self.cfg.fixed_margin_usdt
-        else:
-            if not equity:
-                return None, None
-            margin = equity * (self.cfg.risk_percent_equity / 100.0)
-        if price <= 0:
-            return None, None
-        notional = margin * self.cfg.leverage
-        qty = round(notional / price, self.cfg.quantity_precision)
-        return qty, round(margin, 2)
-
-    # ------------------------------------------------------------------- core
-    async def evaluate(self):
-        await self._check_external_close()
-
+        if time.time() - self.btc_ts < 900 and self.btc_24h is not None:
+            return self.btc_24h
         try:
-            raw = await self.client.get_klines(self.symbol, self.cfg.timeframe, self.cfg.klines_lookback)
-            candles = parse_klines(raw)
-        except BingXAPIError as e:
-            logger.error("[%s] Failed to fetch klines: %s", self.symbol, e)
+            velas = await self.api.klines("BTC-USDT", "1h", limit=30)
+            if len(velas) >= 25:
+                self.btc_24h = (velas[-1]["close"] - velas[-25]["close"]) / velas[-25]["close"] * 100.0
+                self.btc_ts = time.time()
+        except Exception:  # noqa: BLE001
+            pass
+        return self.btc_24h
+
+    def dia_actual(self) -> str:
+        return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+
+    def limite_diario_alcanzado(self) -> bool:
+        """
+        Stop de pérdida DIARIA. Distinto del circuit breaker por rachas:
+        seis pérdidas alternadas con dos ganancias pequeñas no disparan
+        una racha de tres, y el día acaba igual de mal. Se reinicia solo
+        al cambiar de día UTC.
+        """
+        if config.MAX_DAILY_LOSS_R <= 0:
+            return False
+        d = self.state.data
+        if d.get("dia_r") != self.dia_actual():
+            d["dia_r"] = self.dia_actual()
+            d["r_hoy"] = 0.0
+            self.state.save()
+            return False
+        return float(d.get("r_hoy", 0.0)) <= -abs(config.MAX_DAILY_LOSS_R)
+
+    def sumar_r_dia(self, r: float) -> None:
+        d = self.state.data
+        if d.get("dia_r") != self.dia_actual():
+            d["dia_r"] = self.dia_actual()
+            d["r_hoy"] = 0.0
+        d["r_hoy"] = float(d.get("r_hoy", 0.0)) + r
+        self.state.save()
+
+    async def _velas(self, sym: str, tf: str | None = None) -> list[dict] | None:
+        async with self.sem:
+            try:
+                return await self.api.klines(sym, tf or config.TIMEFRAME, limit=400)
+            except Exception:  # noqa: BLE001
+                return None
+
+    async def scan_once(self) -> None:
+        if self.in_cooldown():
+            return
+        btc = await self.contexto_btc()
+        if config.BTC_FILTER and btc is not None and btc < config.BTC_MIN_24H:
+            log.info("BTC %.1f%% en 24h: por debajo del mínimo, no se abre", btc)
             return
 
-        min_bars = max(self.cfg.rsi_length, self.cfg.st_atr_period) * 3 + self.cfg.max_bars_between_lows + self.cfg.pivot_left_bars + self.cfg.pivot_right_bars
-        if len(candles) < min_bars:
-            logger.warning("[%s] Not enough candle history yet (%d/%d bars)", self.symbol, len(candles), min_bars)
+        if self.limite_diario_alcanzado():
+            if self.state.data.get("aviso_dia") != self.dia_actual():
+                self.state.data["aviso_dia"] = self.dia_actual()
+                self.state.save()
+                await self.tg.send(
+                    f"🛑 <b>Límite de pérdida diaria alcanzado</b>\n"
+                    f"{float(self.state.data.get('r_hoy', 0)):.2f} R hoy "
+                    f"(límite {config.MAX_DAILY_LOSS_R} R).\n"
+                    f"No se abren más posiciones hasta mañana (UTC)."
+                )
+            return
+        abiertas = len(self.state.data.get("open", {}))
+        # NO se corta el escaneo aunque no haya hueco: avisar y ejecutar
+        # son cosas distintas. Si el bot no puede entrar, la señal sigue
+        # existiendo y quieres verla — para operarla a mano o para saber
+        # qué se está perdiendo.
+        hay_hueco = abiertas < config.MAX_CONCURRENT
+
+        candidatos = 0
+        motivos: dict[str, int] = {}
+        for sym in self.symbols:
+            if sym in self.state.data.get("open", {}):
+                continue
+            # Cada timeframe se evalúa por separado: el patrón puede
+            # completarse en 5m y no en 15m, o al revés.
+            sig = None
+            motivo = "sin datos"
+            tf_señal = config.TIMEFRAME
+            for tf in config.TIMEFRAMES:
+                velas = await self._velas(sym, tf)
+                if not velas:
+                    continue
+                s_tf, m_tf = strategy.evaluate(sym, velas)
+                if s_tf is not None:
+                    sig, motivo, tf_señal = s_tf, m_tf, tf
+                    break
+                motivo = m_tf
+            if sig is None:
+                # Se agrupa por CLASE de motivo, no por el texto exacto:
+                # "sin señal (contador en 1...)" y "(contador en 0...)"
+                # son el mismo caso y separarlos escondería el patrón.
+                clave = motivo.split("(")[0].strip()
+                motivos[clave] = motivos.get(clave, 0) + 1
+                log.debug("%s: %s", sym, motivo)
+                continue
+            candidatos += 1
+            sig.timeframe = tf_señal
+            sig.btc_24h = btc
+            ejecutada = await self.handle_signal(sig, hay_hueco)
+            if ejecutada:
+                abiertas += 1
+                hay_hueco = abiertas < config.MAX_CONCURRENT
+
+        detalle = " · ".join(f"{k}: {v}" for k, v in sorted(motivos.items(), key=lambda x: -x[1])[:5])
+        log.info("Ciclo completo · %d símbolos · %d señales | %s", len(self.symbols), candidatos, detalle)
+
+        # Si el embudo se corta SIEMPRE en el mismo sitio, eso no es el
+        # mercado: es un filtro mal calibrado. Se avisa una vez al día.
+        if motivos:
+            top = max(motivos.items(), key=lambda x: x[1])
+            if top[1] >= len(self.symbols) * 0.9:
+                hoy = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+                if self.state.data.get("warned_funnel") != hoy:
+                    self.state.data["warned_funnel"] = hoy
+                    self.state.save()
+                    await self.tg.send(
+                        f"🔻 <b>El embudo se corta siempre en el mismo punto</b>\n"
+                        f"<code>{top[0]}</code> descarta {top[1]} de {len(self.symbols)} símbolos.\n"
+                        f"Si es «señal, pero el SuperTrend sigue bajista», el filtro "
+                        f"<code>REQUIRE_ST_BULL</code> está bloqueando la estrategia: un doble "
+                        f"suelo ocurre POR DEFINICIÓN en caída, cuando el SuperTrend está bajista."
+                    )
+
+    async def handle_signal(self, sig: strategy.Signal, hay_hueco: bool = True) -> bool:
+        """
+        Devuelve si se ABRIÓ posición. El aviso se manda siempre (con
+        enfriamiento por símbolo), ejecute o no: son dos cosas
+        independientes y mezclarlas hacía que en LIVE, con el hueco
+        lleno, no te enteraras de las señales.
+        """
+        log.info("SEÑAL %s entrada=%.8g sl=%.8g rsi=%.1f", sig.symbol, sig.entry, sig.sl, sig.rsi)
+
+        # AVISO — siempre, con enfriamiento para no repetir cada ciclo.
+        ultimos = self.state.data.setdefault("last_signal", {})
+        previo = float(ultimos.get(sig.symbol, 0) or 0)
+        if time.time() - previo >= config.SIGNAL_COOLDOWN_MIN * 60:
+            ultimos[sig.symbol] = time.time()
+            self.state.save()
+            nota = ""
+            if self.live and not hay_hueco:
+                nota = f"\n<i>Sin hueco libre ({config.MAX_CONCURRENT} posición máx.): el bot no la abre.</i>"
+            elif not self.live:
+                nota = "\n<i>Modo SIGNAL: el bot no la abre.</i>"
+            entregado = await self.tg.send(fmt_signal(sig, live=False) + nota)
+            if not entregado:
+                log.error("SEÑAL %s NO entregada por Telegram", sig.symbol)
+
+        if not self.live or not hay_hueco:
+            return False
+
+        client_id = f"rsi{sig.symbol.split('-')[0][:6]}{int(time.time())}"
+        try:
+            equity = await self.api.balance_usdt()
+            if equity <= 0:
+                await self.tg.send(f"⚠️ {sig.symbol} sin ejecutar: saldo 0")
+                return False
+            qty = self.api.round_qty(sig.symbol, strategy.position_size(equity, sig.entry, sig.sl))
+            minimo = self.api.min_qty(sig.symbol)
+            if qty <= 0 or (minimo > 0 and qty < minimo):
+                riesgo_min = minimo * abs(sig.entry - sig.sl)
+                pct = (riesgo_min / equity * 100.0) if equity > 0 else 0.0
+                await self.tg.send(
+                    f"⚠️ <b>{sig.symbol}</b> sin ejecutar: tamaño {qty} bajo el lote mínimo ({minimo}).\n"
+                    f"Harían falta <b>{pct:.2f}%</b> de riesgo (ahora {config.RISK_PCT}%)."
+                )
+                return False
+            vivas = await self.api.open_positions()
+            if any(str(p.get("symbol")) == sig.symbol and float(p.get("positionAmt", 0) or 0) != 0 for p in vivas):
+                return False
+
+            await self.api.set_leverage(sig.symbol, "LONG", config.LEVERAGE)
+            sl_r = self.api.round_price(sig.symbol, sig.sl)
+            tp_r = self.api.round_price(sig.symbol, sig.tp) if sig.tp else sl_r * 100
+            if config.ENTRY_TYPE == "LIMIT":
+                precio = self.api.round_price(sig.symbol, sig.entry * (1 - config.LIMIT_OFFSET_PCT / 100.0))
+                await self.api.limit_order(sig.symbol, "BUY", qty, precio, sl_r, tp_r, client_id)
+            else:
+                await self.api.market_order(sig.symbol, "BUY", qty, sl_r, tp_r, client_id)
+        except BingXError as exc:
+            await self.tg.send(f"❌ BingX rechazó {sig.symbol}: {exc}")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            if await self.api.order_exists(sig.symbol, client_id):
+                await self.tg.send(f"⚠️ {sig.symbol}: fallo de red pero la orden SÍ existe. Se registra.")
+            else:
+                await self.tg.send(f"❌ Error en {sig.symbol}: {exc}")
+                return False
+
+        self.state.data.setdefault("open", {})[sig.symbol] = {
+            "side": "BUY", "entry": sig.entry, "sl": sig.sl, "sl_inicial": sig.sl, "qty": qty,
+            "opened_at": time.time(),
+        }
+        self.journal.abrir(sig, qty, "LIVE")
+        self.state.data["last_trade_ts"] = time.time()
+        self.state.save()
+        await self.tg.send(fmt_signal(sig, live=True))
+        return True
+
+    async def maybe_watchlist(self) -> None:
+        """
+        Aviso periódico con las que están cerca del patrón.
+
+        Las señales llegan cuando ya se dispararon. Esto enseña lo que
+        viene: las que tienen el contador en 1 de 2 ya tocaron suelo una
+        vez y están a un cruce de disparar. Es la diferencia entre
+        enterarte y verlo venir.
+        """
+        if config.WATCHLIST_MIN <= 0:
+            return
+        if time.time() - self.last_watchlist < config.WATCHLIST_MIN * 60:
+            return
+        self.last_watchlist = time.time()
+
+        cerca = []
+        for sym in self.symbols:
+            velas = await self._velas(sym)
+            if not velas:
+                continue
+            w = strategy.watch_status(velas)
+            if not w or not w.bajo_umbral:
+                continue
+            if w.cross_count >= 1 and w.atr_pct >= config.MIN_ATR_PCT:
+                cerca.append((sym, w))
+
+        if not cerca:
+            log.info("Vigilancia: ninguna cerca del patrón")
             return
 
-        closed = candles[:-1]  # drop the still-forming candle
-        latest = closed[-1]
-        if self.last_processed_open_time == latest["open_time"]:
-            return  # already evaluated this closed bar
+        cerca.sort(key=lambda t: (-t[1].cross_count, t[1].rsi))
+        lineas = [f"👀 <b>Tocaron suelo — vigilando</b> ({len(cerca)})\n"]
+        for sym, w in cerca[:12]:
+            base = sym.split("-")[0]
+            marca = "🟡" if w.cross_count >= config.TARGET_CROSS - 1 else "·"
+            st = "ST alcista" if w.st_alcista else "ST bajista"
+            lineas.append(
+                f"{marca} <b>{base}</b>  RSI {w.rsi:.0f}/{w.rsi_sig:.0f}  "
+                f"cruce {w.cross_count} de {config.TARGET_CROSS}  ·  {st}  ·  ATR {w.atr_pct:.2f}%"
+            )
+        lineas.append(
+            f"\n🟡 a un cruce de disparar · · primer suelo hecho\n"
+            f"<i>El aviso de señal llega cuando se completa el patrón.</i>"
+        )
+        await self.tg.send("\n".join(lineas))
 
-        highs = [c["high"] for c in closed]
-        lows = [c["low"] for c in closed]
-        closes = [c["close"] for c in closed]
+    async def reconcile(self) -> None:
+        """
+        Detecta las posiciones que se cerraron EN EL EXCHANGE (stop o
+        take profit) y que el bot no vio.
 
-        signals = generate_signals(highs, lows, closes, self.params)
-        self.last_processed_open_time = latest["open_time"]
-        i = len(closed) - 1
+        Sin esto, cuando salta el SL la posición sigue "abierta" en el
+        estado para siempre: bloquea el hueco de MAX_CONCURRENT y el
+        circuit breaker no cuenta ni una pérdida. En SIGNAL no se nota;
+        en LIVE el bot se queda mudo y bloqueado tras las primeras
+        operaciones.
+        """
+        if not self.live:
+            return
+        abiertas = self.state.data.get("open", {})
+        if not abiertas:
+            return
+        try:
+            posiciones = await self.api.open_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudieron leer las posiciones: %s", exc)
+            return
+        vivos = {
+            str(p.get("symbol", "")) for p in posiciones
+            if float(p.get("positionAmt", 0) or 0) != 0
+        }
+        for symbol, pos in list(abiertas.items()):
+            if symbol in vivos:
+                continue
+            velas = await self._velas(symbol)
+            ultimo = velas[-1]["close"] if velas else float(pos["entry"])
+            gano = ultimo > float(pos["entry"])
+            riesgo = abs(float(pos["entry"]) - float(pos.get("sl_inicial", pos["sl"])))
+            r_real = (ultimo - float(pos["entry"])) / riesgo if riesgo > 0 else 0.0
+            minutos = int((time.time() - float(pos.get("opened_at", time.time()))) / 60)
+            self.journal.cerrar(symbol, "sl/tp", ultimo, r_real, minutos)
+            self.sumar_r_dia(r_real)
+            await self.tg.send(
+                f"{'✅' if gano else '🛑'} <b>{symbol.split('-')[0]}</b> cerrada en el exchange\n"
+                f"Entrada {pos['entry']:.8g} → {ultimo:.8g}  ({r_real:+.2f} R)"
+            )
+            self.register_close(symbol, gano)
 
-        logger.info(
-            "[%s] %s close=%.6f rsi=%s direction=%s in_position=%s",
-            self.symbol,
-            _fmt_ts(latest["open_time"]),
-            latest["close"],
-            f"{signals['rsi'][i]:.2f}" if signals["rsi"][i] is not None else "n/a",
-            signals["direction"][i],
-            self.state.get("in_position"),
+    async def manage_open(self) -> None:
+        """
+        Sube el stop siguiendo al SuperTrend y cierra cuando gira.
+
+        El stop SOLO se mueve a favor. Reenviarlo al exchange en cada
+        actualización es deliberado: si el bot se cae, el último stop
+        enviado sigue protegiendo la posición.
+        """
+        abiertas = self.state.data.get("open", {})
+        if not abiertas:
+            return
+        for symbol, pos in list(abiertas.items()):
+            velas = await self._velas(symbol)
+            if not velas:
+                continue
+
+            if strategy.exit_signal(velas):
+                log.info("%s: SuperTrend girado, cierre", symbol)
+                if self.live:
+                    try:
+                        await self.api.close_position(symbol, "BUY", float(pos.get("qty", 0)))
+                    except Exception as exc:  # noqa: BLE001
+                        await self.tg.send(f"⚠️ No se pudo cerrar {symbol}: {exc}")
+                        continue
+                precio = velas[-1]["close"]
+                gano = precio > float(pos["entry"])
+                await self.tg.send(
+                    f"{'✅' if gano else '🛑'} <b>{symbol.split('-')[0]}</b> cerrada por SuperTrend\n"
+                    f"Entrada {pos['entry']:.8g} → {precio:.8g}"
+                )
+                riesgo = abs(float(pos["entry"]) - float(pos.get("sl_inicial", pos["sl"])))
+                r_real = (precio - float(pos["entry"])) / riesgo if riesgo > 0 else 0.0
+                minutos = int((time.time() - float(pos.get("opened_at", time.time()))) / 60)
+                self.journal.cerrar(symbol, "supertrend", precio, r_real, minutos)
+                self.sumar_r_dia(r_real)
+                self.register_close(symbol, gano)
+                continue
+
+            # Trailing del SuperTrend
+            c = velas[:-1]
+            st, dirs = strategy.supertrend(
+                [x["high"] for x in c], [x["low"] for x in c], [x["close"] for x in c],
+                config.ST_FACTOR, config.ST_PERIOD,
+            )
+            if not st or dirs[-1] != -1:
+                continue
+            nuevo = st[-1]
+            if nuevo > float(pos.get("sl", 0)):
+                pos["sl"] = nuevo
+                self.state.save()
+                log.info("%s: stop del SuperTrend subido a %.8g", symbol, nuevo)
+                # El stop que hay en BingX es el que se envió con la
+                # entrada. Actualizarlo requeriría cancelar y reemitir la
+                # orden condicional, y una cancelación fallida dejaría la
+                # posición DESPROTEGIDA unos segundos. Se prefiere el
+                # stop original (más lejos, peor precio) a la ventana sin
+                # red: el cierre por giro del SuperTrend lo hace el bot
+                # igualmente en el ciclo siguiente.
+
+    def register_close(self, symbol: str, won: bool) -> None:
+        d = self.state.data
+        d["closed_trades"] = d.get("closed_trades", 0) + 1
+        if won:
+            d["wins"] = d.get("wins", 0) + 1
+            d["consecutive_losses"] = 0
+        else:
+            d["losses"] = d.get("losses", 0) + 1
+            d["consecutive_losses"] = d.get("consecutive_losses", 0) + 1
+            if d["consecutive_losses"] >= config.MAX_CONSECUTIVE_LOSSES:
+                d["cooldown_until"] = time.time() + config.COOLDOWN_MINUTES * 60
+                d["consecutive_losses"] = 0
+                asyncio.create_task(self.tg.send(
+                    f"⏸️ <b>Circuit breaker</b> · {config.MAX_CONSECUTIVE_LOSSES} pérdidas seguidas, "
+                    f"pausa de {config.COOLDOWN_MINUTES} min."
+                ))
+        d.get("open", {}).pop(symbol, None)
+        self.state.save()
+
+    def stats_text(self) -> str:
+        d = self.state.data
+        n = d.get("closed_trades", 0)
+        w = d.get("wins", 0)
+        wr = (w / n * 100.0) if n else 0.0
+        return (
+            f"Cerradas: <b>{n}</b> · aciertos {w} ({wr:.0f}%)\n"
+            f"Abiertas: {len(d.get('open', {}))} · racha: {d.get('consecutive_losses', 0)}"
         )
 
-        if not self.state.get("in_position") and signals["special_buy"][i]:
-            htf = await self._check_htf_trend()
-            if htf["allowed"]:
-                await self._enter_long(latest["close"], signals, i, latest["open_time"], htf)
-            else:
-                await self._notify_filtered(latest["close"], signals, i, latest["open_time"], htf)
-        elif self.state.get("in_position") and signals["st_sell"][i]:
-            await self._exit_long(latest["close"], "Giro de SuperTrend a bajista", signals, i, latest["open_time"])
-
-    async def _check_htf_trend(self):
-        """Higher-timeframe trend gate: skips new longs when a HTF EMA is
-        dropping too fast. Fails closed (blocks) on any fetch/data problem -
-        see indicators.evaluate_htf_trend for the reasoning."""
-        if not self.cfg.use_htf_trend_filter:
-            return {"allowed": True, "trend_ok": None, "ema": None, "slope_pct": None}
-        try:
-            raw = await self.client.get_klines(self.symbol, self.cfg.htf_timeframe, self.cfg.klines_lookback)
-            htf_candles = parse_klines(raw)
-            htf_closes = [c["close"] for c in htf_candles[:-1]]  # drop the still-forming HTF candle too
-            info = evaluate_htf_trend(htf_closes, self.cfg.htf_ema_length, self.cfg.htf_ema_slope_lookback, self.cfg.htf_max_down_slope_pct)
-            return {"allowed": info["trend_ok"], **info}
-        except BingXAPIError as e:
-            logger.warning("[%s] HTF trend check failed (%s) - blocking this entry to be safe.", self.symbol, e)
-            return {"allowed": False, "trend_ok": False, "ema": None, "slope_pct": None}
-
-    async def _notify_filtered(self, price, signals, i, open_time, htf):
-        l1 = signals["setup_l1_price"][i]
-        l2 = signals["setup_l2_price"][i]
-        slope = htf.get("slope_pct")
-        slope_txt = f"{slope:+.2f}%" if slope is not None else "n/d"
-        lines = [
-            f"⛔ <b>{self.symbol}</b>: doble suelo detectado pero FILTRADO",
-            f"Precio: <code>{price}</code>  ·  Suelo 1: <code>{round(l1, self.cfg.price_precision) if l1 is not None else 'n/d'}</code>  ·  Suelo 2: <code>{round(l2, self.cfg.price_precision) if l2 is not None else 'n/d'}</code>",
-            f"Motivo: tendencia {self.cfg.htf_timeframe} débil (EMA{self.cfg.htf_ema_length} pendiente {slope_txt})",
-            "",
-            "El bot no entra por el filtro de tendencia superior, pero la señal de precio es real - la evaluación queda en tus manos si querés entrar igual.",
-            f"🕐 {_fmt_ts(open_time)} · vela {self.cfg.timeframe} cerrada",
-        ]
-        await self.notifier.send("\n".join(lines))
-
-    async def _enter_long(self, price, signals, i, open_time, htf=None):
-        equity = None
-        if self.cfg.position_sizing_mode != "FIXED_MARGIN":
-            equity = await self._get_equity()
-        qty, margin = self._compute_quantity(price, equity)
-        if not qty or qty <= 0:
-            logger.error("[%s] Could not size a position (equity=%s); skipping entry.", self.symbol, equity)
-            await self.notifier.send(f"⚠️ <b>{self.symbol}</b>: señal de compra pero falló el cálculo de tamaño (equity={equity}).")
+    async def maybe_daily_summary(self) -> None:
+        if not config.DAILY_SUMMARY:
             return
+        ahora = dt.datetime.now(dt.timezone.utc)
+        hoy = ahora.strftime("%Y-%m-%d")
+        if ahora.hour != config.DAILY_SUMMARY_HOUR_UTC or self.state.data.get("last_summary") == hoy:
+            return
+        self.state.data["last_summary"] = hoy
+        self.state.save()
+        await self.tg.send(
+            f"📊 <b>Resumen diario RSI</b> · {hoy}\n{config.describe()}\n\n"
+            f"{self.stats_text()}\nUniverso: {len(self.symbols)} símbolos"
+        )
 
-        rsi_val = signals["rsi"][i]
-        st_val = signals["supertrend"][i]
-        l1 = signals["setup_l1_price"][i]
-        l2 = signals["setup_l2_price"][i]
-        neckline = signals["setup_neckline"][i]
-        l1_rsi = signals["setup_l1_rsi"][i]
-        l2_rsi = signals["setup_l2_rsi"][i]
-        rsi_display = f"{rsi_val:.1f}" if rsi_val is not None else "n/d"
-        st_display = round(st_val, self.cfg.price_precision) if st_val is not None else "n/d"
-
-        lines = [
-            f"🟢 <b>COMPRA — {self.symbol}</b> ({self.cfg.timeframe})",
-            "Doble suelo confirmado — ruptura de neckline",
-            "",
-            f"Precio: <code>{price}</code>",
-            f"Suelo 1: <code>{round(l1, self.cfg.price_precision) if l1 is not None else 'n/d'}</code> (RSI {l1_rsi:.1f})" if l1_rsi is not None else f"Suelo 1: <code>{round(l1, self.cfg.price_precision) if l1 is not None else 'n/d'}</code>",
-            f"Suelo 2: <code>{round(l2, self.cfg.price_precision) if l2 is not None else 'n/d'}</code> (RSI {l2_rsi:.1f})" if l2_rsi is not None else f"Suelo 2: <code>{round(l2, self.cfg.price_precision) if l2 is not None else 'n/d'}</code>",
-            f"Neckline roto: <code>{round(neckline, self.cfg.price_precision) if neckline is not None else 'n/d'}</code>"
-            + (" · divergencia alcista RSI ✔" if (l1_rsi is not None and l2_rsi is not None and l2_rsi > l1_rsi) else ""),
-            f"RSI actual: {rsi_display}",
-            f"SuperTrend (ref. de salida): <code>{st_display}</code>",
-        ]
-
-        if htf and htf.get("trend_ok") is not None:
-            slope = htf.get("slope_pct")
-            slope_txt = f"{slope:+.2f}%" if slope is not None else "n/d"
-            lines.append(f"Tendencia {self.cfg.htf_timeframe}: alcista ✔ (EMA{self.cfg.htf_ema_length} {slope_txt})")
-
-        stop_price = None
-        if self.cfg.stop_loss_pct > 0:
-            stop_price = round(price * (1 - self.cfg.stop_loss_pct / 100.0), self.cfg.price_precision)
-            lines.append(f"Stop sugerido: <code>{stop_price}</code> (-{self.cfg.stop_loss_pct:g}%)")
-
-        lines += [
-            "",
-            f"Qty sugerida: <code>{qty}</code>",
-            f"Leverage: {self.cfg.leverage}x · Margen: {margin} USDT ({self.cfg.position_sizing_mode})",
-            "",
-            f"🕐 {_fmt_ts(open_time)} · vela {self.cfg.timeframe} cerrada",
-            "🧪 DRY RUN — no se envió orden, señal solo informativa" if self.cfg.dry_run else "✅ Enviando orden a BingX...",
-        ]
-        await self.notifier.send("\n".join(lines))
-
-        order_result = None
-        stop_order_id = None
-        if not self.cfg.dry_run:
-            try:
-                await self.client.set_margin_mode(self.symbol, self.cfg.margin_mode)
-            except BingXAPIError as e:
-                logger.warning("[%s] set_margin_mode: %s", self.symbol, e)
-            try:
-                await self.client.set_leverage(self.symbol, "LONG", self.cfg.leverage)
-            except BingXAPIError as e:
-                logger.warning("[%s] set_leverage: %s", self.symbol, e)
-            try:
-                order_result = await self.client.place_market_order(self.symbol, "BUY", "LONG", qty)
-                logger.info("[%s] Entry order placed: %s", self.symbol, order_result)
-            except BingXAPIError as e:
-                logger.error("[%s] Entry order FAILED: %s", self.symbol, e)
-                await self.notifier.send(f"⚠️ <b>{self.symbol}</b>: la orden de entrada FALLÓ: {e}")
-                return
-
-            if stop_price is not None:
-                try:
-                    sl_result = await self.client.place_stop_market_order(self.symbol, "SELL", "LONG", qty, stop_price)
-                    stop_order_id = (sl_result or {}).get("order", {}).get("orderId") if isinstance(sl_result, dict) else None
-                    logger.info("[%s] Stop-loss resting order placed at %s (id=%s)", self.symbol, stop_price, stop_order_id)
-                except BingXAPIError as e:
-                    logger.error("[%s] Stop-loss order FAILED to place: %s", self.symbol, e)
-                    await self.notifier.send(f"⚠️ <b>{self.symbol}</b>: entró, pero la orden de stop-loss FALLÓ: {e}")
-
-        self.state = {
-            "in_position": True,
-            "quantity": qty,
-            "entry_price": price,
-            "entered_at": datetime.now(timezone.utc).isoformat(),
-            "stop_order_id": stop_order_id,
-        }
-        self._persist()
-
-    async def _exit_long(self, price, reason, signals, i, open_time):
-        qty = self.state.get("quantity", 0)
-        entry = self.state.get("entry_price", 0) or 0
-        stop_order_id = self.state.get("stop_order_id")
-        pnl_pct = ((price - entry) / entry * 100.0) if entry else 0.0
-
-        rsi_val = signals["rsi"][i]
-        st_val = signals["supertrend"][i]
-        rsi_display = f"{rsi_val:.1f}" if rsi_val is not None else "n/d"
-        st_display = round(st_val, self.cfg.price_precision) if st_val is not None else "n/d"
-
-        lines = [
-            f"🔴 <b>CIERRE — {self.symbol}</b> ({self.cfg.timeframe})",
-            f"Motivo: {reason}",
-            "",
-            f"Entrada: <code>{entry}</code>",
-            f"Salida: <code>{price}</code>",
-            f"PnL estimado: {pnl_pct:+.2f}%",
-            "",
-            f"SuperTrend: <code>{st_display}</code> · RSI: {rsi_display}",
-            "",
-            f"🕐 {_fmt_ts(open_time)} · vela {self.cfg.timeframe} cerrada",
-            "🧪 DRY RUN — no se envió orden, señal solo informativa" if self.cfg.dry_run else "✅ Enviando orden a BingX...",
-        ]
-        await self.notifier.send("\n".join(lines))
-
-        if not self.cfg.dry_run:
-            if stop_order_id:
-                try:
-                    await self.client.cancel_order(self.symbol, stop_order_id)
-                except BingXAPIError as e:
-                    logger.warning("[%s] Could not cancel resting stop order %s (may already be filled/gone): %s", self.symbol, stop_order_id, e)
-            try:
-                result = await self.client.close_position_market(self.symbol, "LONG", qty)
-                logger.info("[%s] Close order placed: %s", self.symbol, result)
-            except BingXAPIError as e:
-                logger.error("[%s] Exit order FAILED: %s", self.symbol, e)
-                await self.notifier.send(f"⚠️ <b>{self.symbol}</b>: la orden de salida FALLÓ: {e} — revisá la posición manualmente.")
-                return
-
-        self.state = {"in_position": False}
-        self._persist()
+    async def maybe_heartbeat(self) -> None:
+        if config.HEARTBEAT_HOURS <= 0:
+            return
+        if time.time() - self.last_heartbeat < config.HEARTBEAT_HOURS * 3600:
+            return
+        self.last_heartbeat = time.time()
+        await self.tg.send(f"💓 Vivo (RSI) · {self.stats_text()}")
 
 
-async def run():
-    cfg = Config()
-    cfg.validate()
-
-    logging.basicConfig(
-        level=getattr(logging, cfg.log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
-    logger.info(
-        "Starting RSI double-dip + SuperTrend bot | symbols=%s | timeframe=%s | DRY_RUN=%s",
-        cfg.symbols, cfg.timeframe, cfg.dry_run,
-    )
-
-    client = BingXClient(cfg.api_key, cfg.api_secret, cfg.base_url, cfg.recv_window_ms)
-    notifier = TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id)
-    state_mgr = StateManager(cfg.state_file_path)
-    workers = [SymbolWorker(sym, cfg, client, notifier, state_mgr) for sym in cfg.symbols]
-
-    stop_event = asyncio.Event()
-
-    def _handle_signal(*_):
-        logger.info("Shutdown signal received, stopping after the current cycle...")
-        stop_event.set()
-
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            pass  # not available on some platforms (e.g. Windows)
-
-    await notifier.send(
-        f"🤖 Bot iniciado — {', '.join(cfg.symbols)} @ {cfg.timeframe} | "
-        f"{'DRY RUN (solo señales)' if cfg.dry_run else 'EN VIVO'}"
-    )
-
-    if not cfg.dry_run:
-        for w in workers:
-            await w.reconcile()
-
+async def main() -> None:
+    bot = Bot()
     try:
-        while not stop_event.is_set():
-            for w in workers:
-                try:
-                    await w.evaluate()
-                except Exception as e:  # a bug in one symbol must not kill the others
-                    logger.exception("[%s] Unhandled error in evaluate(): %s", w.symbol, e)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=cfg.poll_interval_seconds)
-            except asyncio.TimeoutError:
-                pass
+        await bot.start()
     finally:
-        await client.close()
-        await notifier.send("🛑 Bot detenido.")
+        await bot.client.aclose()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())

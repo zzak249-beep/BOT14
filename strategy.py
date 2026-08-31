@@ -1,188 +1,312 @@
 """
-strategy.py
------------
-Réplica en Python de la estrategia del Pine Script original:
-"ProBorsa: RSI & SuperTrend Özel Dip Stratejisi"
+Motor RSI "doble suelo" + salida por SuperTrend.
 
-Lógica (idéntica al script de TradingView):
-  1. RSI (suavizado de Wilder / ta.rma) de longitud `rsi_length`.
-  2. Señal = media móvil simple del RSI, longitud `signal_length`.
-  3. Cada vez que el RSI cruza al alza su señal ESTANDO por debajo de
-     `trigger_level`, se incrementa un contador. Si el RSI sube por encima
-     de `trigger_level`, el contador se reinicia a 0.
-  4. Señal de COMPRA ("doble suelo") cuando el contador alcanza
-     `target_cross_count` (2 = patrón W) en el mismo cruce que lo dispara.
-  5. Señal de VENTA cuando el SuperTrend (ATR `atr_period`, factor
-     `st_factor`) cambia de tendencia alcista a bajista.
+Traducción literal del Pine de ProBorsa (RSI & SuperTrend Özel Dip
+Stratejisi). Si cambias uno, cambia el otro.
 
-Todas las funciones trabajan sobre un DataFrame con columnas:
-  'open', 'high', 'low', 'close' (una fila = una vela, orden cronológico ascendente).
+LA IDEA
+El RSI cruza al alza su propia media móvil. Si eso pasa POR DEBAJO de
+un nivel de disparo (50 por defecto), se cuenta como un intento. El
+primer intento suele fallar; el SEGUNDO es el que se opera. Eso es lo
+que dibuja una figura de doble suelo (W): el precio hace mínimo, rebota
+sin fuerza, vuelve a caer y entonces sí gira.
+
+El contador se REINICIA en cuanto el RSI sube por encima del nivel de
+disparo: si el mercado ya se recuperó, el intento anterior dejó de
+contar.
+
+SALIDA: cuando el SuperTrend cambia de dirección. No hay stop fijo — y
+eso hay que tenerlo muy presente, porque significa que el riesgo por
+operación NO está acotado de antemano.
+
+ADVERTENCIA IMPORTANTE
+Esta estrategia no tiene ni una sola operación medida en este proyecto.
+El Pine original viene con RSI de 10 (en vez de 14) y multiplicador
+2.5, ajustes que su autor describe como hechos para dar más señales y
+salidas más rentables — es decir, parámetros ya optimizados sobre algún
+histórico. Mídela antes de ponerle dinero.
 """
+from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+import logging
+from dataclasses import dataclass
 
+import config
 
-def rma(series: pd.Series, length: int) -> pd.Series:
-    """Wilder's RMA — equivalente exacto de ta.rma() en Pine Script.
-
-    Semilla: media simple de los primeros `length` valores.
-    A partir de ahí: rma[i] = alpha*src[i] + (1-alpha)*rma[i-1], alpha = 1/length.
-    """
-    result = pd.Series(np.nan, index=series.index, dtype="float64")
-    if len(series) < length:
-        return result
-    seed = series.iloc[:length].mean()
-    result.iloc[length - 1] = seed
-    alpha = 1.0 / length
-    prev = seed
-    for i in range(length, len(series)):
-        prev = alpha * series.iloc[i] + (1 - alpha) * prev
-        result.iloc[i] = prev
-    return result
+log = logging.getLogger("strategy")
 
 
-def compute_rsi(close: pd.Series, length: int) -> pd.Series:
-    """RSI de Wilder, replicando exactamente la fórmula del Pine Script:
-    down==0 ? 100 : up==0 ? 0 : 100 - 100/(1+up/down)
-    """
-    change = close.diff()
-    up = rma(change.clip(lower=0), length)
-    down = rma((-change).clip(lower=0), length)
+@dataclass
+class Signal:
+    symbol: str
+    side: str            # siempre "BUY": la estrategia es solo de largos
+    entry: float
+    sl: float
+    tp: float | None
+    rsi: float
+    cross_count: int
+    st_value: float
+    atr_pct: float
+    timeframe: str = ""
+    btc_24h: float | None = None
 
-    out = pd.Series(np.nan, index=close.index, dtype="float64")
-    for i in range(len(close)):
-        u, d = up.iloc[i], down.iloc[i]
-        if pd.isna(u) or pd.isna(d):
-            continue
-        if d == 0:
-            out.iloc[i] = 100.0
-        elif u == 0:
-            out.iloc[i] = 0.0
-        else:
-            out.iloc[i] = 100 - (100 / (1 + u / d))
+
+def sma(values: list[float], length: int) -> list[float]:
+    out: list[float] = []
+    acc = 0.0
+    for i, v in enumerate(values):
+        acc += v
+        if i >= length:
+            acc -= values[i - length]
+        out.append(acc / min(i + 1, length))
     return out
 
 
-def _true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    tr.iloc[0] = df["high"].iloc[0] - df["low"].iloc[0]
-    return tr
+def rma(values: list[float], length: int) -> list[float]:
+    """Media de Wilder, que es la que usa el RSI de Pine."""
+    if not values:
+        return []
+    out = [values[0]]
+    for v in values[1:]:
+        out.append((out[-1] * (length - 1) + v) / length)
+    return out
 
 
-def supertrend(df: pd.DataFrame, period: int, multiplier: float):
-    """Devuelve (linea_supertrend, tendencia_alcista_bool) para cada vela.
+def rsi_series(closes: list[float], length: int) -> list[float]:
+    if len(closes) < 2:
+        return []
+    subidas = [0.0]
+    bajadas = [0.0]
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i - 1]
+        subidas.append(max(ch, 0.0))
+        bajadas.append(max(-ch, 0.0))
+    up = rma(subidas, length)
+    dn = rma(bajadas, length)
+    out: list[float] = []
+    for u, d in zip(up, dn):
+        if d == 0:
+            out.append(100.0)
+        elif u == 0:
+            out.append(0.0)
+        else:
+            out.append(100.0 - (100.0 / (1.0 + u / d)))
+    return out
 
-    Réplica del algoritmo estándar de SuperTrend (ATR suavizado con RMA,
-    igual que ta.atr() en Pine). Nota: TradingView no publica el código
-    fuente exacto de su función incorporada ta.supertrend(), así que esta
-    es una reimplementación fiel al algoritmo estándar ampliamente documentado;
-    puede haber diferencias mínimas de 1 vela en casos límite. Se recomienda
-    validar en DRY_RUN antes de operar en real.
+
+def atr_series(highs: list[float], lows: list[float], closes: list[float], length: int) -> list[float]:
+    if len(closes) < 2:
+        return []
+    trs = [highs[0] - lows[0]]
+    for i in range(1, len(closes)):
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+    return rma(trs, length)
+
+
+def supertrend(
+    highs: list[float], lows: list[float], closes: list[float], factor: float, period: int
+) -> tuple[list[float], list[int]]:
     """
-    atr = rma(_true_range(df), period)
-    hl2 = (df["high"] + df["low"]) / 2
-    upper_basic = hl2 + multiplier * atr
-    lower_basic = hl2 - multiplier * atr
-
-    n = len(df)
-    final_upper = pd.Series(np.nan, index=df.index, dtype="float64")
-    final_lower = pd.Series(np.nan, index=df.index, dtype="float64")
-    trend_up = pd.Series(True, index=df.index, dtype="object")
-
-    first_valid = atr.first_valid_index()
-    if first_valid is None:
-        return pd.Series(np.nan, index=df.index), trend_up
-
-    start = df.index.get_loc(first_valid)
-    final_upper.iloc[start] = upper_basic.iloc[start]
-    final_lower.iloc[start] = lower_basic.iloc[start]
-    trend_up.iloc[start] = df["close"].iloc[start] >= (final_upper.iloc[start] + final_lower.iloc[start]) / 2
-
-    for i in range(start + 1, n):
-        if (upper_basic.iloc[i] < final_upper.iloc[i - 1]) or (df["close"].iloc[i - 1] > final_upper.iloc[i - 1]):
-            final_upper.iloc[i] = upper_basic.iloc[i]
-        else:
-            final_upper.iloc[i] = final_upper.iloc[i - 1]
-
-        if (lower_basic.iloc[i] > final_lower.iloc[i - 1]) or (df["close"].iloc[i - 1] < final_lower.iloc[i - 1]):
-            final_lower.iloc[i] = lower_basic.iloc[i]
-        else:
-            final_lower.iloc[i] = final_lower.iloc[i - 1]
-
-        prev_trend_up = trend_up.iloc[i - 1]
-        if prev_trend_up and df["close"].iloc[i] < final_lower.iloc[i]:
-            trend_up.iloc[i] = False
-        elif (not prev_trend_up) and df["close"].iloc[i] > final_upper.iloc[i]:
-            trend_up.iloc[i] = True
-        else:
-            trend_up.iloc[i] = prev_trend_up
-
-    st_line = pd.Series(np.where(trend_up, final_lower, final_upper), index=df.index, dtype="float64")
-    st_line.iloc[:start] = np.nan
-    trend_up.iloc[:start] = np.nan
-    return st_line, trend_up
-
-
-def compute_signals(
-    df: pd.DataFrame,
-    rsi_length: int = 10,
-    signal_length: int = 10,
-    trigger_level: float = 50.0,
-    target_cross_count: int = 2,
-    atr_period: int = 10,
-    st_factor: float = 2.5,
-) -> pd.DataFrame:
-    """Calcula todos los indicadores y señales para cada vela del DataFrame.
-
-    Devuelve un DataFrame con, entre otras, las columnas:
-      - 'special_buy'  (bool): señal de compra "doble suelo"
-      - 'sell_signal'  (bool): señal de venta (giro bajista del SuperTrend)
+    SuperTrend igual que ta.supertrend de Pine.
+    Dirección: -1 alcista (la línea va por debajo), +1 bajista.
     """
-    rsi = compute_rsi(df["close"], rsi_length)
-    rsi_signal = rsi.rolling(signal_length).mean()
+    a = atr_series(highs, lows, closes, period)
+    if not a:
+        return [], []
+    st: list[float] = []
+    dirs: list[int] = []
+    upper_prev = 0.0
+    lower_prev = 0.0
+    st_prev = 0.0
+    dir_prev = 1
+    for i in range(len(closes)):
+        hl2 = (highs[i] + lows[i]) / 2.0
+        upper = hl2 + factor * a[i]
+        lower = hl2 - factor * a[i]
+        if i == 0:
+            st.append(upper)
+            dirs.append(1)
+            upper_prev, lower_prev, st_prev, dir_prev = upper, lower, upper, 1
+            continue
+        lower = lower if (lower > lower_prev or closes[i - 1] < lower_prev) else lower_prev
+        upper = upper if (upper < upper_prev or closes[i - 1] > upper_prev) else upper_prev
+        if st_prev == upper_prev:
+            d = -1 if closes[i] > upper else 1
+        else:
+            d = 1 if closes[i] < lower else -1
+        valor = lower if d == -1 else upper
+        st.append(valor)
+        dirs.append(d)
+        upper_prev, lower_prev, st_prev, dir_prev = upper, lower, valor, d
+    return st, dirs
 
-    bull_cross = (rsi.shift(1) <= rsi_signal.shift(1)) & (rsi > rsi_signal)
+
+def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
+    """
+    Devuelve (señal, motivo). El motivo dice por qué NO hay señal, que en
+    un escáner vale más que el silencio.
+    """
+    need = max(config.RSI_LEN, config.SIG_LEN, config.ST_PERIOD) * 4 + 20
+    if len(candles) < need:
+        return None, "pocas velas"
+
+    c = candles[:-1]  # la última está en curso
+    closes = [x["close"] for x in c]
+    highs = [x["high"] for x in c]
+    lows = [x["low"] for x in c]
+
+    rsi = rsi_series(closes, config.RSI_LEN)
+    if len(rsi) < config.SIG_LEN + 2:
+        return None, "sin rsi"
+    rsi_sig = sma(rsi, config.SIG_LEN)
+    a = atr_series(highs, lows, closes, 14)
+    st, dirs = supertrend(highs, lows, closes, config.ST_FACTOR, config.ST_PERIOD)
+    if not st or not a:
+        return None, "sin supertrend"
+
+    atr_pct = a[-1] / closes[-1] * 100.0 if closes[-1] > 0 else 0.0
+    if atr_pct < config.MIN_ATR_PCT:
+        return None, f"sin amplitud ({atr_pct:.2f}%)"
+
+    # ── El contador, recorrido sobre todo el histórico disponible ──
+    # Se recalcula entero en cada evaluación en vez de guardarlo entre
+    # ciclos: así el estado del bot no puede desincronizarse del gráfico
+    # si se reinicia, que es de donde salen los fallos más difíciles de
+    # encontrar.
+    cross_count = 0
+    señal_idx = -1
+    for i in range(1, len(rsi)):
+        if rsi[i] > config.TRIGGER_LEVEL:
+            cross_count = 0
+            continue
+        cruce = rsi[i] > rsi_sig[i] and rsi[i - 1] <= rsi_sig[i - 1]
+        if cruce and rsi[i] < config.TRIGGER_LEVEL:
+            cross_count += 1
+            if cross_count == config.TARGET_CROSS:
+                señal_idx = i
+                cross_count = 0
+
+    if señal_idx != len(rsi) - 1:
+        return None, f"sin señal (contador en {cross_count} de {config.TARGET_CROSS}, RSI {rsi[-1]:.0f})"
+
+    entrada = closes[-1]
+
+    # El SuperTrend bajista deja su línea POR ENCIMA del precio: no
+    # sirve de stop. Dos salidas posibles, ambas defendibles.
+    if dirs[-1] == 1:
+        if config.REQUIRE_ST_BULL:
+            return None, "señal, pero el SuperTrend sigue bajista"
+        # Fiel al original: se entra igual, con el stop bajo el mínimo
+        # reciente. Sin esto la posición quedaría sin protección real
+        # hasta el próximo giro, que puede tardar días.
+        ventana = lows[-config.SL_SWING_LOOKBACK:]
+        stop = min(ventana) - a[-1] * config.SL_SWING_ATR
+    else:
+        stop = st[-1]
+
+    if stop >= entrada:
+        return None, "stop por encima del precio"
+
+    riesgo_pct = (entrada - stop) / entrada * 100.0
+    if riesgo_pct > config.MAX_RISK_PCT:
+        return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
+
+    # Coste en múltiplos de R: lo que la operación pierde de salida.
+    coste_r = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
+    if riesgo_pct < config.MIN_RISK_PCT or coste_r > config.MAX_COST_IN_R:
+        return None, f"stop demasiado cerca ({riesgo_pct:.2f}%, coste {coste_r:.2f}R)"
+
+    tp = entrada + (entrada - stop) * config.RR_TARGET if config.USE_TP else None
+
+    return (
+        Signal(
+            symbol=symbol,
+            side="BUY",
+            entry=entrada,
+            sl=stop,
+            tp=tp,
+            rsi=rsi[-1],
+            cross_count=config.TARGET_CROSS,
+            st_value=st[-1],
+            atr_pct=atr_pct,
+        ),
+        "ok",
+    )
+
+
+def exit_signal(candles: list[dict]) -> bool:
+    """SuperTrend girando a bajista: es la salida del Pine original."""
+    if len(candles) < config.ST_PERIOD * 4:
+        return False
+    c = candles[:-1]
+    _, dirs = supertrend(
+        [x["high"] for x in c], [x["low"] for x in c], [x["close"] for x in c],
+        config.ST_FACTOR, config.ST_PERIOD,
+    )
+    return len(dirs) >= 2 and dirs[-1] == 1 and dirs[-2] == -1
+
+
+def position_size(equity: float, entry: float, sl: float) -> float:
+    riesgo_unidad = abs(entry - sl)
+    if riesgo_unidad <= 0 or entry <= 0:
+        return 0.0
+    return (equity * config.RISK_PCT / 100.0) / riesgo_unidad
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ESTADO DE VIGILANCIA
+# Para el aviso periódico: no solo las que YA dan señal, sino en qué
+# punto del patrón está cada una. Un símbolo con el contador en 1 de 2
+# ya tocó suelo una vez y está a un cruce de disparar — eso es lo que
+# se quiere ver venir, no enterarse cuando ya pasó.
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Watch:
+    symbol: str
+    rsi: float
+    rsi_sig: float
+    cross_count: int
+    st_alcista: bool
+    atr_pct: float
+    bajo_umbral: bool
+    listo: bool
+
+
+def watch_status(candles: list[dict]) -> Watch | None:
+    """Dónde está este símbolo dentro del patrón, dispare o no."""
+    need = max(config.RSI_LEN, config.SIG_LEN, config.ST_PERIOD) * 4 + 20
+    if len(candles) < need:
+        return None
+
+    c = candles[:-1]
+    closes = [x["close"] for x in c]
+    highs = [x["high"] for x in c]
+    lows = [x["low"] for x in c]
+
+    rsi = rsi_series(closes, config.RSI_LEN)
+    if len(rsi) < config.SIG_LEN + 2:
+        return None
+    rsi_sig = sma(rsi, config.SIG_LEN)
+    a = atr_series(highs, lows, closes, config.ATR_LEN)
+    _, dirs = supertrend(highs, lows, closes, config.ST_FACTOR, config.ST_PERIOD)
+    if not a or not dirs:
+        return None
 
     cross_count = 0
-    special_buy = pd.Series(False, index=df.index)
-    cross_count_series = pd.Series(0, index=df.index)
-    for i in range(len(df)):
-        r = rsi.iloc[i]
-        if pd.isna(r) or pd.isna(rsi_signal.iloc[i]):
-            cross_count_series.iloc[i] = cross_count
+    for i in range(1, len(rsi)):
+        if rsi[i] > config.TRIGGER_LEVEL:
+            cross_count = 0
             continue
-        if r > trigger_level:
-            cross_count = 0
-        if bool(bull_cross.iloc[i]) and r < trigger_level:
+        if rsi[i] > rsi_sig[i] and rsi[i - 1] <= rsi_sig[i - 1] and rsi[i] < config.TRIGGER_LEVEL:
             cross_count += 1
-        if bool(bull_cross.iloc[i]) and (r < trigger_level) and (cross_count == target_cross_count):
-            special_buy.iloc[i] = True
-            cross_count = 0
-        cross_count_series.iloc[i] = cross_count
+            if cross_count == config.TARGET_CROSS:
+                cross_count = 0 if i != len(rsi) - 1 else config.TARGET_CROSS
 
-    st_line, trend_up = supertrend(df, atr_period, st_factor)
-    sell_signal = (trend_up.shift(1) == True) & (trend_up == False)  # noqa: E712
-
-    return pd.DataFrame(
-        {
-            "close": df["close"],
-            "rsi": rsi,
-            "rsi_signal": rsi_signal,
-            "bull_cross": bull_cross,
-            "cross_count": cross_count_series,
-            "special_buy": special_buy,
-            "supertrend": st_line,
-            "trend_up": trend_up,
-            "sell_signal": sell_signal,
-        },
-        index=df.index,
+    atr_pct = a[-1] / closes[-1] * 100.0 if closes[-1] > 0 else 0.0
+    return Watch(
+        symbol="", rsi=rsi[-1], rsi_sig=rsi_sig[-1], cross_count=cross_count,
+        st_alcista=dirs[-1] == -1, atr_pct=atr_pct,
+        bajo_umbral=rsi[-1] < config.TRIGGER_LEVEL,
+        listo=cross_count >= config.TARGET_CROSS,
     )
