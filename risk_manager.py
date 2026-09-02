@@ -1,127 +1,61 @@
 """
-Risk Manager v2 — SL/TP + sizing + validación R:R + precisión por contrato.
+risk_manager.py — Tamaño de posición y cálculo de SL/TP.
+
+Replica la lógica de riesgo del script Pine:
+
+    entry_qty = strategy.equity * (qty_pct / 100) / close
+    sl/tp     = por ATR (atr_mult_sl/tp) o por porcentaje fijo
 """
-from __future__ import annotations
-import logging
-from typing import Optional, Tuple
-from strategy import Signal
-from utils import floor_qty
-import config as cfg
 
-logger = logging.getLogger(__name__)
+import math
+from dataclasses import dataclass
 
 
-def calculate_sl_tp(
-    signal:      Signal,
-    entry:       float,
-    contract:    dict,
-) -> Tuple[float, float]:
-    """
-    Calcula SL y TP para una señal.
-    Prioridad TP: nivel fib válido → ATR fallback.
-    Prioridad SL: estructura (swing) → ATR fallback.
-    """
-    atr     = signal.atr
-    is_long = signal.action == "BUY"
+@dataclass
+class SizingResult:
+    quantity: float
+    notional: float
+    ok: bool
+    reason: str = ""
 
-    # ── STOP LOSS ────────────────────────────────────────────
-    if cfg.SL_METHOD == "STRUCTURE":
+
+def round_step(value: float, precision: int) -> float:
+    """Redondea hacia abajo (floor) al número de decimales del contrato,
+    para nunca mandar una cantidad ligeramente por encima de lo que
+    BingX acepta."""
+    factor = 10 ** precision
+    return math.floor(value * factor) / factor
+
+
+def compute_position_size(equity: float, qty_pct: float, price: float,
+                           quantity_precision: int, trade_min_quantity: float,
+                           trade_min_usdt: float) -> SizingResult:
+    if price <= 0 or equity <= 0:
+        return SizingResult(0.0, 0.0, False, "precio o equity inválidos")
+
+    raw_qty = (equity * (qty_pct / 100.0)) / price
+    qty = round_step(raw_qty, quantity_precision)
+    notional = qty * price
+
+    if qty <= 0:
+        return SizingResult(0.0, 0.0, False, "cantidad redondeada a 0")
+    if trade_min_quantity and qty < trade_min_quantity:
+        return SizingResult(qty, notional, False, f"por debajo de tradeMinQuantity ({trade_min_quantity})")
+    if trade_min_usdt and notional < trade_min_usdt:
+        return SizingResult(qty, notional, False, f"nocional por debajo de tradeMinUSDT ({trade_min_usdt})")
+
+    return SizingResult(qty, notional, True)
+
+
+def compute_sl_tp(entry_price: float, is_long: bool, atr_value: float | None, params) -> tuple[float, float]:
+    """Devuelve (stop_loss_price, take_profit_price)."""
+    if params.USE_ATR_SL and atr_value and atr_value > 0:
+        sl_dist = atr_value * params.ATR_MULT_SL
+        tp_dist = atr_value * params.ATR_MULT_TP
         if is_long:
-            sl = (signal.sw_low1 - atr * 0.1
-                  if signal.sw_low1 and signal.sw_low1 < entry
-                  else entry - atr * cfg.SL_ATR_MULT)
-        else:
-            sl = (signal.sw_high1 + atr * 0.1
-                  if signal.sw_high1 and signal.sw_high1 > entry
-                  else entry + atr * cfg.SL_ATR_MULT)
-    else:
-        sl = (entry - atr * cfg.SL_ATR_MULT if is_long
-              else entry + atr * cfg.SL_ATR_MULT)
+            return entry_price - sl_dist, entry_price + tp_dist
+        return entry_price + sl_dist, entry_price - tp_dist
 
-    # Seguridad dirección
-    if is_long  and sl >= entry: sl = entry - atr * cfg.SL_ATR_MULT
-    if not is_long and sl <= entry: sl = entry + atr * cfg.SL_ATR_MULT
-
-    # ── TAKE PROFIT ──────────────────────────────────────────
-    raw_tp: Optional[float] = None
-    if cfg.TP_METHOD == "FIB_TARGET":
-        raw_tp = signal.fib_target
-    elif cfg.TP_METHOD == "FIB_HALF":
-        raw_tp = signal.fib_tgt50
-
-    if raw_tp and is_long  and raw_tp > entry + atr * 0.5:
-        tp = raw_tp
-    elif raw_tp and not is_long and raw_tp < entry - atr * 0.5:
-        tp = raw_tp
-    else:
-        tp = (entry + atr * cfg.TP_ATR_MULT if is_long
-              else entry - atr * cfg.TP_ATR_MULT)
-
-    # Seguridad dirección
-    if is_long  and tp <= entry: tp = entry + atr * cfg.TP_ATR_MULT
-    if not is_long and tp >= entry: tp = entry - atr * cfg.TP_ATR_MULT
-
-    return round(sl, 8), round(tp, 8)
-
-
-def rr_ratio(entry: float, sl: float, tp: float) -> float:
-    risk   = abs(entry - sl)
-    reward = abs(entry - tp)
-    return round(reward / risk, 2) if risk > 0 else 0.0
-
-
-def is_rr_valid(entry: float, sl: float, tp: float) -> bool:
-    return rr_ratio(entry, sl, tp) >= cfg.MIN_RR
-
-
-def calculate_quantity(
-    balance:  float,
-    entry:    float,
-    sl:       float,
-    contract: dict,
-) -> float:
-    """
-    Sizing por riesgo fijo:
-        qty = (balance × RISK_PCT% × LEVERAGE) / |entry − SL|
-
-    Aplica:
-      - Máximo posición = balance × MAX_POSITION_PCT%
-      - Mínimo del contrato (tradeMinQuantity)
-      - Mínimo notional (tradeMinUSDT)
-      - Redondeo al step size del contrato
-    """
-    sl_dist = abs(entry - sl)
-    if sl_dist <= 0 or entry <= 0:
-        return 0.0
-
-    # Qty por riesgo
-    risk_usdt = balance * cfg.RISK_PCT / 100
-    qty       = (risk_usdt * cfg.LEVERAGE) / sl_dist
-
-    # Cap por posición máxima
-    max_usdt = balance * cfg.MAX_POSITION_PCT / 100
-    max_qty  = (max_usdt * cfg.LEVERAGE) / entry
-    qty      = min(qty, max_qty)
-
-    # Precisión del contrato
-    step = float(contract.get("tradeMinQuantity", 0.001))
-    qty  = floor_qty(qty, step)
-
-    # Validaciones mínimas
-    min_qty      = float(contract.get("tradeMinQuantity", 0))
-    min_notional = float(contract.get("tradeMinUSDT", 5))
-
-    if min_qty > 0 and qty < min_qty:
-        logger.debug(f"qty {qty:.6f} < min {min_qty:.6f}")
-        return 0.0
-    if qty * entry < min_notional:
-        logger.debug(f"notional {qty*entry:.2f} < min {min_notional:.2f}")
-        return 0.0
-
-    return qty
-
-
-def breakeven_price(entry: float, sl: float) -> float:
-    """Precio de SL de breakeven (entrada más pequeño buffer)."""
-    buf = abs(entry - sl) * 0.05  # 5% del risk como buffer
-    return entry + buf if entry > sl else entry - buf
+    if is_long:
+        return entry_price * (1 - params.SL_PERCENT), entry_price * (1 + params.TP_PERCENT)
+    return entry_price * (1 + params.SL_PERCENT), entry_price * (1 - params.TP_PERCENT)

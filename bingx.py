@@ -157,6 +157,26 @@ class BingX:
                 return float(bal.get("availableMargin", bal.get("balance", 0)) or 0)
         return 0.0
 
+    async def set_margin_mode(self, symbol: str, modo: str = "ISOLATED") -> None:
+        """
+        Fija el modo de margen del símbolo.
+
+        AISLADO por defecto, y no es un detalle: con margen CRUZADO toda
+        la cuenta respalda cada posición, así que una cascada puede
+        liquidar el saldo entero antes de que salte el stop. Con varios
+        bots compartiendo cuenta el problema se multiplica — una
+        posición que amenaza liquidación consume balance común y acerca
+        a las otras a la suya, aunque estén yendo bien.
+
+        Si el símbolo ya está en ese modo, BingX devuelve error y se
+        ignora: no es un fallo, es que ya estaba puesto.
+        """
+        try:
+            await self._private("POST", "/openApi/swap/v2/trade/marginType",
+                                {"symbol": symbol, "marginType": modo})
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s: margen ya en %s o no se pudo cambiar (%s)", symbol, modo, exc)
+
     async def set_leverage(self, symbol: str, side: str, leverage: int) -> None:
         await self._private(
             "POST",

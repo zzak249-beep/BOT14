@@ -1,218 +1,241 @@
 """
-bingx_client.py
+bingx_client.py — Cliente REST para BingX Perpetual Futures (USDT-M).
 
-Minimal async client for BingX USDT-M Perpetual Futures (swap v2 API),
-built directly on aiohttp (no ccxt dependency) - matches the auth pattern
-already proven in production:
+Notas de implementación importantes (aprendidas de bots anteriores en
+esta misma cuenta, ver README):
 
-  * HMAC-SHA256 signature over the query string built in INSERTION order
-    (NOT alphabetically sorted - BingX's signature check fails on sorted
-    params even though most public examples sort them).
-  * API key sent via the `X-BX-APIKEY` header.
-  * Every order call sends an explicit `quantity`; exits use
-    `reduceOnly=true` with an explicit quantity rather than
-    `closePosition=true` + `quantity=0`.
-
-Endpoints used (verify against https://bingx-api.github.io/docs/#/swapV2/introduce
-before going live - BingX does revise paths/params over time):
-  GET  /openApi/swap/v2/quote/klines
-  GET  /openApi/swap/v3/user/balance
-  GET  /openApi/swap/v2/user/positions
-  POST /openApi/swap/v2/trade/marginType
-  POST /openApi/swap/v2/trade/leverage
-  POST /openApi/swap/v2/trade/order
-  DELETE /openApi/swap/v2/trade/order
+1. TODO va en el query string de la URL, incluida la firma, incluso en
+   peticiones POST. El body se manda siempre vacío. Si se deja que
+   `requests` serialice el dict por su cuenta (params=... o data=...)
+   puede re-codificarlo de forma distinta a como se firmó -> error de
+   firma 100001. Por eso aquí se construye la URL final a mano y se
+   pasa tal cual, sin params/data adicionales.
+2. Cuenta en modo Hedge: para abrir se usa side=BUY/SELL con
+   positionSide=LONG/SHORT; para cerrar se manda el side contrario
+   manteniendo el mismo positionSide (NUNCA reduceOnly ni
+   positionSide=BOTH).
+3. Los klines se devuelven como lista de objetos con claves nombradas
+   ("open","close","high","low","volume","time") y NO como arrays
+   posicionales — nótese que "close" va antes que "high" en la
+   respuesta real de BingX. Aquí se parsea siempre por nombre de
+   clave para no repetir ese bug.
+4. Se manda siempre recvWindow para evitar firmas rechazadas por
+   desfases de reloj.
+5. Símbolos en formato "BASE-QUOTE" (ej. "BTC-USDT"). En DEMO_MODE se
+   usa el sufijo "-VST" (saldo de práctica de BingX) en vez de
+   "-USDT", sobre el mismo API.
 """
+
+from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 import time
+from typing import Any, Optional
+from urllib.parse import quote_plus
 
-import aiohttp
+import requests
 
-logger = logging.getLogger("bingx_client")
+logger = logging.getLogger("wavelet_bot.bingx")
+
+# Códigos de error de negocio de BingX que el bot necesita reconocer
+# explícitamente (el resto se trata como error genérico).
+ERR_SIGNATURE_FAILED = 100001
+ERR_INSUFFICIENT_BALANCE = 100202
+ERR_INVALID_PARAMETER = 100400
+ERR_PRICE_DEVIATION = 100440
+ERR_POSITION_NOT_EXIST = 109420
 
 
 class BingXAPIError(Exception):
-    def __init__(self, code, msg, raw=None):
+    def __init__(self, code: int, msg: str, path: str):
         self.code = code
         self.msg = msg
-        self.raw = raw
-        super().__init__(f"BingX API error {code}: {msg}")
-
-
-def parse_klines(raw):
-    """Normalizes a BingX klines response into an ascending-by-time list of
-    dicts: {open_time, open, high, low, close, volume}.
-
-    Defensive on purpose: BingX has historically returned newest-first, and
-    candle shape has varied between a list-of-dicts and list-of-lists across
-    endpoints/SDKs, so both are handled here rather than assumed."""
-    parsed = []
-    for item in raw:
-        if isinstance(item, dict):
-            t = item.get("time", item.get("openTime"))
-            parsed.append(
-                {
-                    "open_time": int(t),
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"]),
-                    "volume": float(item.get("volume", 0) or 0),
-                }
-            )
-        elif isinstance(item, (list, tuple)) and len(item) >= 5:
-            parsed.append(
-                {
-                    "open_time": int(item[0]),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]) if len(item) > 5 else 0.0,
-                }
-            )
-    parsed.sort(key=lambda c: c["open_time"])
-    return parsed
+        self.path = path
+        super().__init__(f"BingX [{path}] code={code} msg={msg}")
 
 
 class BingXClient:
-    def __init__(self, api_key, api_secret, base_url="https://open-api.bingx.com", recv_window_ms=5000):
+    def __init__(self, api_key: str, api_secret: str, base_url: str, recv_window_ms: int = 5000,
+                 timeout: float = 15.0, max_retries: int = 3):
         self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_secret = api_secret.encode("utf-8")
         self.base_url = base_url.rstrip("/")
         self.recv_window_ms = recv_window_ms
-        self._session = None
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._session = requests.Session()
+        self._session.headers.update({"X-BX-APIKEY": self.api_key})
 
-    async def _ensure_session(self):
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
+    # ── Firma ────────────────────────────────────────────────────────
+    @staticmethod
+    def _build_query_string(params: dict[str, Any]) -> str:
+        # Orden ALFABÉTICO por clave: verificado con el vector de prueba
+        # oficial de BingX (REST API.md) — con orden de inserción
+        # arbitrario la firma NO coincide con la esperada por el
+        # servidor. Además de firmar, esta es la misma cadena que se
+        # manda, así que ambas quedan siempre consistentes entre sí.
+        parts = []
+        for key, value in sorted(params.items()):
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            elif isinstance(value, float):
+                # format(x, "f") por defecto trunca a 6 decimales, lo que
+                # PIERDE precisión real en cantidades pequeñas (monedas de
+                # precio alto). 8 decimales cubre la máxima precisión real
+                # de cualquier contrato BingX sin exponer ruido de coma
+                # flotante binaria (con más decimales sí aparece, ej.
+                # 49250.123456 -> "...000001" de más con 12 decimales).
+                value = f"{value:.8f}".rstrip("0").rstrip(".")
+                if value == "" or value == "-":
+                    value = "0"
+            parts.append(f"{key}={quote_plus(str(value))}")
+        return "&".join(parts)
 
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
+    def _sign(self, query_string: str) -> str:
+        return hmac.new(self.api_secret, query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def _sign(self, params: dict) -> str:
-        # CRITICAL: insertion order, never sorted() - see module docstring.
-        query_string = "&".join(f"{k}={v}" for k, v in params.items())
-        return hmac.new(
-            self.api_secret.encode("utf-8"),
-            query_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-    async def _request(self, method: str, path: str, params: dict = None, signed: bool = True):
+    def _request(self, method: str, path: str, params: Optional[dict[str, Any]] = None,
+                 signed: bool = True) -> Any:
         params = dict(params or {})
         if signed:
-            params["timestamp"] = str(int(time.time() * 1000))
-            params["recvWindow"] = str(self.recv_window_ms)
-            params["signature"] = self._sign(params)
+            params["timestamp"] = int(time.time() * 1000)
+            params["recvWindow"] = self.recv_window_ms
+
+        query_string = self._build_query_string(params)
+
+        if signed:
+            signature = self._sign(query_string)
+            query_string = f"{query_string}&signature={signature}"
 
         url = f"{self.base_url}{path}"
-        headers = {"X-BX-APIKEY": self.api_key} if self.api_key else {}
-        session = await self._ensure_session()
+        if query_string:
+            url = f"{url}?{query_string}"
 
-        try:
-            async with session.request(
-                method, url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                text = await resp.text()
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    raise BingXAPIError(-1, f"Non-JSON response (HTTP {resp.status}) from {path}: {text[:300]}")
-        except aiohttp.ClientError as e:
-            raise BingXAPIError(-2, f"Network error calling {path}: {e}")
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = self._session.request(method, url, timeout=self.timeout)
+                data = resp.json()
+                code = data.get("code")
+                if code not in (0, None):
+                    raise BingXAPIError(code, data.get("msg", ""), path)
+                return data.get("data", data)
+            except BingXAPIError:
+                raise  # error de negocio de BingX: no tiene sentido reintentar igual
+            except (requests.RequestException, ValueError) as exc:
+                last_exc = exc
+                wait = min(2 ** attempt, 8)
+                logger.warning("Fallo de red en %s (intento %d/%d): %s — reintento en %ds",
+                                path, attempt, self.max_retries, exc, wait)
+                time.sleep(wait)
+        raise RuntimeError(f"No se pudo completar {path} tras {self.max_retries} intentos: {last_exc}")
 
-        code = data.get("code")
-        if code not in (0, None):
-            raise BingXAPIError(code, data.get("msg", "unknown error"), raw=data)
-        return data.get("data", data)
+    # ── Mercado ──────────────────────────────────────────────────────
+    def get_contracts(self) -> list[dict]:
+        """Lista de contratos USDT-M con precisión de cantidad/precio y mínimos."""
+        return self._request("GET", "/openApi/swap/v2/quote/contracts", signed=False)
 
-    # ---------------------------------------------------------------- market
-    async def get_klines(self, symbol: str, interval: str, limit: int = 500):
-        data = await self._request(
-            "GET",
-            "/openApi/swap/v2/quote/klines",
+    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list[dict]:
+        """
+        Devuelve velas ordenadas cronológicamente ascendente (la más
+        antigua primero, la más reciente al final), cada una como dict
+        con claves: open, high, low, close, volume, time (ms).
+        """
+        raw = self._request(
+            "GET", "/openApi/swap/v2/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
             signed=False,
         )
-        # some deployments wrap candles under data["list"] or return the list directly
-        if isinstance(data, dict):
-            data = data.get("list") or data.get("klines") or []
+        candles = [
+            {
+                "time": int(c["time"]),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "volume": float(c["volume"]),
+            }
+            for c in raw
+        ]
+        candles.sort(key=lambda c: c["time"])
+        return candles
+
+    # ── Cuenta ───────────────────────────────────────────────────────
+    def get_balance(self) -> dict:
+        """Balance de la cuenta USDT-M (equity, disponible, etc.)."""
+        data = self._request("GET", "/openApi/swap/v2/user/balance", {})
+        # La respuesta trae {"balance": {...}} en algunas cuentas y
+        # el dict plano en otras; se normaliza aquí.
+        if isinstance(data, dict) and "balance" in data:
+            return data["balance"]
         return data
 
-    # --------------------------------------------------------------- account
-    async def get_balance(self):
-        return await self._request("GET", "/openApi/swap/v3/user/balance", {})
-
-    async def get_positions(self, symbol: str = None):
+    def get_positions(self, symbol: Optional[str] = None) -> list[dict]:
         params = {"symbol": symbol} if symbol else {}
-        data = await self._request("GET", "/openApi/swap/v2/user/positions", params)
-        return data if isinstance(data, list) else []
+        data = self._request("GET", "/openApi/swap/v2/user/positions", params)
+        return data or []
 
-    async def set_margin_mode(self, symbol: str, margin_type: str = "ISOLATED"):
-        return await self._request(
-            "POST", "/openApi/swap/v2/trade/marginType", {"symbol": symbol, "marginType": margin_type}
-        )
+    def set_leverage(self, symbol: str, side: str, leverage: int) -> None:
+        """side: 'LONG' o 'SHORT' (modo Hedge)."""
+        self._request("POST", "/openApi/swap/v2/trade/leverage", {
+            "symbol": symbol, "side": side, "leverage": leverage,
+        })
 
-    async def set_leverage(self, symbol: str, position_side: str, leverage: int):
-        # `side` here means POSITION side (LONG/SHORT/BOTH), not order side.
-        return await self._request(
-            "POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "side": position_side, "leverage": leverage}
-        )
+    # ── Trading ──────────────────────────────────────────────────────
+    def place_market_order(self, symbol: str, side: str, position_side: str, quantity: float) -> dict:
+        return self._request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol,
+            "side": side,                # BUY / SELL
+            "positionSide": position_side,  # LONG / SHORT
+            "type": "MARKET",
+            "quantity": quantity,
+        })
 
-    # --------------------------------------------------------------- trading
-    async def place_market_order(self, symbol: str, side: str, position_side: str, quantity: float):
-        return await self._request(
-            "POST",
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol": symbol,
-                "side": side,  # BUY / SELL
-                "positionSide": position_side,  # LONG / SHORT (hedge mode)
-                "type": "MARKET",
-                "quantity": quantity,
-            },
-        )
+    def place_stop_market(self, symbol: str, side: str, position_side: str,
+                           stop_price: float, close_position: bool = True,
+                           quantity: Optional[float] = None) -> dict:
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "STOP_MARKET",
+            "stopPrice": stop_price,
+        }
+        if close_position:
+            params["closePosition"] = True
+        elif quantity is not None:
+            params["quantity"] = quantity
+        return self._request("POST", "/openApi/swap/v2/trade/order", params)
 
-    async def place_stop_market_order(self, symbol: str, side: str, position_side: str, quantity: float, stop_price: float):
-        return await self._request(
-            "POST",
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol": symbol,
-                "side": side,
-                "positionSide": position_side,
-                "type": "STOP_MARKET",
-                "quantity": quantity,
-                "stopPrice": stop_price,
-                "reduceOnly": "true",
-            },
-        )
+    def place_take_profit_market(self, symbol: str, side: str, position_side: str,
+                                  stop_price: float, close_position: bool = True,
+                                  quantity: Optional[float] = None) -> dict:
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": stop_price,
+        }
+        if close_position:
+            params["closePosition"] = True
+        elif quantity is not None:
+            params["quantity"] = quantity
+        return self._request("POST", "/openApi/swap/v2/trade/order", params)
 
-    async def close_position_market(self, symbol: str, position_side: str, quantity: float):
-        """Closes a hedge-mode position with an explicit reduceOnly market
-        order (never closePosition=true + quantity=0)."""
-        side = "SELL" if position_side == "LONG" else "BUY"
-        return await self._request(
-            "POST",
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol": symbol,
-                "side": side,
-                "positionSide": position_side,
-                "type": "MARKET",
-                "quantity": quantity,
-                "reduceOnly": "true",
-            },
-        )
+    def cancel_all_open_orders(self, symbol: str) -> dict:
+        return self._request("DELETE", "/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
 
-    async def cancel_order(self, symbol: str, order_id):
-        return await self._request(
-            "DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": order_id}
-        )
+    def close_position_market(self, symbol: str, side: str, position_side: str) -> dict:
+        """Cierre de emergencia a mercado (no depende de que el SL/TP se haya ejecutado)."""
+        return self._request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "MARKET",
+            "closePosition": True,
+        })

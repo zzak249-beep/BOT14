@@ -1,162 +1,165 @@
 """
-Configuración del bot RSI doble suelo + SuperTrend.
+config.py — Carga de configuración desde variables de entorno.
 
-MODE=SIGNAL por defecto. Esta estrategia no tiene ni una operación
-medida: los parámetros del Pine original (RSI 10 en vez de 14,
-multiplicador 2.5) son ajustes que su autor hizo para dar más señales y
-salidas más rentables, o sea que vienen ya optimizados sobre algún
-histórico que no es el tuyo. Mídela antes de ponerle dinero.
+Todos los parámetros replican 1:1 los `input.*()` del script Pine
+"Wavelet MRA Haar 5m — BingX". Los valores por defecto son los mismos
+que trae el script original.
+
+El parseo numérico es defensivo (strip + separación de comentarios en
+línea) porque en Railway es fácil que una variable quede con espacios,
+comillas o un `# comentario` pegado al valor y rompa `int()`/`float()`.
 """
+
+import logging
 import os
 
-
-def _bool(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "si", "sí")
+logger = logging.getLogger("wavelet_bot.config")
 
 
-def _float(name: str, default: float) -> float:
+def _clean(raw: str) -> str:
+    # Corta cualquier comentario tipo "10  # diez por ciento" y quita
+    # espacios/comillas sueltas antes de intentar convertir el valor.
+    value = raw.split("#", 1)[0].strip()
+    return value.strip("'").strip('"')
+
+
+def _get_str(key: str, default: str) -> str:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    return _clean(raw)
+
+
+def _get_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    return _clean(raw).lower() in ("1", "true", "yes", "on", "si", "sí")
+
+
+def _get_int(key: str, default: int) -> int:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == "":
+        return default
     try:
-        return float(os.getenv(name, default))
-    except (TypeError, ValueError):
+        return int(float(_clean(raw)))
+    except ValueError:
+        logger.warning("No se pudo parsear %s=%r como int, uso default=%s", key, raw, default)
         return default
 
 
-def _int(name: str, default: int) -> int:
+def _get_float(key: str, default: float) -> float:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == "":
+        return default
     try:
-        return int(os.getenv(name, default))
-    except (TypeError, ValueError):
+        return float(_clean(raw))
+    except ValueError:
+        logger.warning("No se pudo parsear %s=%r como float, uso default=%s", key, raw, default)
         return default
 
 
-MODE = os.getenv("MODE", "SIGNAL").strip().upper()
-LIVE_CONFIRMED = _bool("LIVE_CONFIRMED", False)
+class Config:
+    # ── Credenciales BingX ──────────────────────────────────────────
+    # Nombres fijos y sin alias para evitar el mismatch
+    # BINGX_SECRET_KEY / BINGX_API_SECRET que ya ha dado problemas antes.
+    BINGX_API_KEY = _get_str("BINGX_API_KEY", "")
+    BINGX_API_SECRET = _get_str("BINGX_API_SECRET", "")
+    BINGX_BASE_URL = _get_str("BINGX_BASE_URL", "https://open-api.bingx.com")
+    BINGX_RECV_WINDOW_MS = _get_int("BINGX_RECV_WINDOW_MS", 5000)
 
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
-BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
+    # Si es True, todos los símbolos se piden como BASE-VST en vez de
+    # BASE-USDT: BingX ofrece el mismo API con saldo de práctica (VST)
+    # sobre exactamente la misma infraestructura, ideal para probar el
+    # bot antes de arriesgar capital real. No cambia ninguna otra lógica.
+    DEMO_MODE = _get_bool("DEMO_MODE", False)
 
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
+    # ── Telegram ─────────────────────────────────────────────────────
+    TELEGRAM_BOT_TOKEN = _get_str("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = _get_str("TELEGRAM_CHAT_ID", "")
 
-# ── Estrategia (mismos valores que el Pine original) ──────────────────
-RSI_LEN = _int("RSI_LEN", 10)
-SIG_LEN = _int("SIG_LEN", 10)
-TRIGGER_LEVEL = _float("TRIGGER_LEVEL", 50.0)
-# 2 = doble suelo (W). Con 1 se opera el primer intento, que es
-# justamente el que el autor considera que falla.
-TARGET_CROSS = _int("TARGET_CROSS", 2)
-ATR_LEN = _int("ATR_LEN", 14)
-ST_PERIOD = _int("ST_PERIOD", 10)
-ST_FACTOR = _float("ST_FACTOR", 2.5)
-# TENSIÓN REAL DEL PINE ORIGINAL, descubierta al probar el motor:
-# un doble suelo ocurre POR DEFINICIÓN durante una caída, así que en el
-# momento de la señal el SuperTrend casi siempre está bajista y su línea
-# queda POR ENCIMA del precio — no sirve como stop. El Pine no lo nota
-# porque su salida solo se dispara en el INSTANTE del giro a bajista:
-# si ya estaba bajista, la posición se queda abierta sin protección
-# hasta el siguiente giro, que puede tardar días.
-#   true  = exigir SuperTrend ya alcista. Menos señales, stop coherente.
-#   false = fiel al original. Entra igual, y el stop lo pone el mínimo
-#           reciente porque el SuperTrend no puede.
-REQUIRE_ST_BULL = _bool("REQUIRE_ST_BULL", True)
-SL_SWING_ATR = _float("SL_SWING_ATR", 0.5)
-SL_SWING_LOOKBACK = _int("SL_SWING_LOOKBACK", 20)
+    # ── Interruptor maestro ─────────────────────────────────────────
+    # Si es False, el bot calcula señales, las manda por Telegram y las
+    # loguea, pero NUNCA manda órdenes reales a BingX. Útil para correr
+    # el bot en paralelo un tiempo antes de activarlo con dinero real.
+    LIVE_TRADING = _get_bool("LIVE_TRADING", True)
 
-# ── Objetivo ──────────────────────────────────────────────────────────
-# El Pine original NO tiene objetivo: sale solo cuando gira el
-# SuperTrend. Aquí es opcional para poder comparar las dos variantes.
-USE_TP = _bool("USE_TP", False)
-RR_TARGET = _float("RR_TARGET", 2.0)
+    # ── Universo de símbolos ────────────────────────────────────────
+    # "ALL" -> escanea todos los perpetuos USDT-M activos en BingX.
+    # o lista separada por comas, ej: "BTC-USDT,ETH-USDT,SOL-USDT"
+    SYMBOLS = _get_str("SYMBOLS", "ALL")
+    TIMEFRAME = _get_str("TIMEFRAME", "5m")  # debe existir como intervalo válido de BingX
 
-# ── Universo y filtros ────────────────────────────────────────────────
-TIMEFRAME = os.getenv("TIMEFRAME", "15m").strip()
-# Varios timeframes a la vez. El patrón se busca en cada uno por
-# separado y la señal dice en cuál salió.
-# AVISO SOBRE 5m: los stops del SuperTrend son proporcionalmente más
-# pequeños cuanto menor es el timeframe, y el coste de operar NO baja.
-# Con MIN_RISK_PCT=1.5 la mayoría de señales de 5m se descartarán por
-# "stop demasiado cerca" — eso no es un fallo, es el filtro haciendo su
-# trabajo. Si en 5m no sale nada, la respuesta no es bajar el mínimo:
-# es que en ese timeframe el coste se come el movimiento.
-TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", TIMEFRAME).split(",") if t.strip()]
-SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 90)
-MAX_SYMBOLS = _int("MAX_SYMBOLS", 400)
-SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
-EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC").split(",") if p.strip()]
-MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 3_000_000.0)
-# El stop lo pone el SuperTrend, que puede quedar lejísimos. Sin este
-# tope, una sola operación puede llevarse un múltiplo del riesgo previsto.
-MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
-MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
-# EL FILTRO QUE FALTABA. El stop lo pone el SuperTrend o el mínimo
-# reciente, y a veces queda MUY cerca: un riesgo del 0.69% con 0.25% de
-# coste significa que la operación empieza perdiendo 0.36R antes de que
-# el precio se mueva. Es el mismo error que ya se corrigió en el otro
-# bot: no basta con acotar el stop por arriba, hay que acotarlo también
-# por ABAJO en relación al coste.
-MIN_RISK_PCT = _float("MIN_RISK_PCT", 1.5)
-MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
-SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
+    POLL_INTERVAL_SECONDS = _get_int("POLL_INTERVAL_SECONDS", 30)
+    SYMBOL_BATCH_SIZE = _get_int("SYMBOL_BATCH_SIZE", 5)  # símbolos procesados en paralelo por tanda
+    SYMBOL_BATCH_DELAY_SECONDS = _get_float("SYMBOL_BATCH_DELAY_SECONDS", 1.0)
 
-# ── Riesgo ────────────────────────────────────────────────────────────
-RISK_PCT = _float("RISK_PCT", 0.25)
-MAX_CONCURRENT = _int("MAX_CONCURRENT", 2)
-LEVERAGE = _int("LEVERAGE", 2)
-MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
-# LÍMITE DE PÉRDIDA DIARIA, en múltiplos de R.
-# El estudio de Taiwán sobre 450.000 traders encuentra que menos del 1%
-# gana de forma consistente, y que los que lo consiguen comparten un
-# rasgo concreto: stops duros de pérdida DIARIA, no solo por operación.
-# El circuit breaker por rachas no cubre esto — tres pérdidas seguidas
-# saltan, pero seis alternadas con dos ganancias pequeñas no, y el día
-# acaba igual de mal.
-MAX_DAILY_LOSS_R = _float("MAX_DAILY_LOSS_R", 3.0)
+    # ── Parámetros Wavelet (idénticos al script Pine) ───────────────
+    LOOKBACK_ENERGY = _get_int("LOOKBACK_ENERGY", 40)
+    K_DOMINANCE = _get_float("K_DOMINANCE", 1.5)
+    COOLDOWN_BARS = _get_int("COOLDOWN_BARS", 4)
 
-# ── Contexto de mercado (BTC como referencia) ─────────────────────────
-# No es un filtro adivinatorio: es un REGISTRO. En cada operación se
-# apunta cómo iba BTC, porque el régimen actual (dominancia 56-59%,
-# índice de altseason por debajo de 40, rallies de alts aislados y
-# especulativos) hace que una estrategia SOLO DE LARGOS en alts esté
-# comprando contra la corriente relativa. Dentro de un mes, con el
-# diario delante, podrás ver si tus resultados dependen de eso — en
-# vez de suponerlo.
-BTC_CONTEXT = _bool("BTC_CONTEXT", True)
-# Filtro OPCIONAL y apagado: no abrir largos si BTC cae fuerte, porque
-# las alts caen más. Apagado a propósito: sin datos propios que lo
-# respalden, activarlo sería añadir una creencia al sistema.
-BTC_FILTER = _bool("BTC_FILTER", False)
-BTC_MIN_24H = _float("BTC_MIN_24H", -3.0)
-COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 180)
-ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
-LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
+    USE_VOL_FILTER = _get_bool("USE_VOL_FILTER", False)
+    VOL_LEN = _get_int("VOL_LEN", 20)
+    VOL_MULT = _get_float("VOL_MULT", 1.2)
 
-# ── Avisos ────────────────────────────────────────────────────────────
-# Enfriamiento por símbolo en modo SIGNAL: sin esto la misma señal se
-# repite en cada ciclo mientras no cambie la vela.
-SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
-# Aviso periódico con las que están CERCA del patrón (contador en 1 de
-# 2). Las señales avisan cuando ya pasó; esto deja verlo venir. 0 lo
-# desactiva.
-WATCHLIST_MIN = _int("WATCHLIST_MIN", 30)
+    # ── Riesgo (idéntico al script Pine) ────────────────────────────
+    QTY_PCT = _get_float("QTY_PCT", 10.0)  # % del equity en NOCIONAL por operación
+    LEVERAGE = _get_int("LEVERAGE", 10)
 
-DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
-DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
-HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
-IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
+    USE_ATR_SL = _get_bool("USE_ATR_SL", True)
+    ATR_LENGTH = _get_int("ATR_LENGTH", 14)
+    ATR_MULT_SL = _get_float("ATR_MULT_SL", 1.5)
+    ATR_MULT_TP = _get_float("ATR_MULT_TP", 2.5)
+    SL_PERCENT = _get_float("SL_PERCENT", 1.0) / 100
+    TP_PERCENT = _get_float("TP_PERCENT", 2.0) / 100
 
-STATE_PATH = os.getenv("STATE_PATH", "/data/state_rsi.json")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    # ── Salvaguardas propias del bot (no están en el Pine original) ─
+    # Límite de posiciones simultáneas abiertas POR ESTE BOT. Con 10%
+    # de nocional por operación y varios símbolos pudiendo señalar a la
+    # vez, esto evita sobreexponer la cuenta si escaneas "ALL".
+    MAX_CONCURRENT_POSITIONS = _get_int("MAX_CONCURRENT_POSITIONS", 5)
 
-COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
+    # Si ya existe una posición abierta en ese símbolo (de este bot o de
+    # cualquier otro proceso en la misma cuenta BingX), no se vuelve a
+    # entrar. Coordina de forma segura con tus otros bots en la misma cuenta.
+    SKIP_IF_SYMBOL_HAS_POSITION = _get_bool("SKIP_IF_SYMBOL_HAS_POSITION", True)
 
+    MIN_BALANCE_USDT = _get_float("MIN_BALANCE_USDT", 0.0)  # 0 = sin mínimo
 
-def is_live() -> bool:
-    return MODE == "LIVE" and LIVE_CONFIRMED and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
+    # ── Servidor de salud (para Railway healthcheck / monitoreo) ────
+    HEALTH_PORT = _get_int("PORT", _get_int("HEALTH_PORT", 8080))
 
+    LOG_LEVEL = _get_str("LOG_LEVEL", "INFO")
 
-def describe() -> str:
-    if is_live():
-        return "LIVE — enviando órdenes reales a BingX"
-    if MODE == "LIVE":
-        return "LIVE pedido pero SIN confirmar (falta LIVE_CONFIRMED o claves) — sigue en SIGNAL"
-    return "SIGNAL — solo avisos, no toca el exchange"
+    @classmethod
+    def validate(cls):
+        """Falla rápido y con mensaje claro en vez de un 100001 críptico."""
+        missing = []
+        if not cls.BINGX_API_KEY:
+            missing.append("BINGX_API_KEY")
+        if not cls.BINGX_API_SECRET:
+            missing.append("BINGX_API_SECRET")
+        if not cls.TELEGRAM_BOT_TOKEN:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not cls.TELEGRAM_CHAT_ID:
+            missing.append("TELEGRAM_CHAT_ID")
+        if missing:
+            raise RuntimeError(
+                "Faltan variables de entorno obligatorias: " + ", ".join(missing)
+            )
+
+    @classmethod
+    def summary(cls) -> str:
+        modo = "DEMO (VST)" if cls.DEMO_MODE else "REAL"
+        trading = "ACTIVO (envía órdenes reales)" if cls.LIVE_TRADING else "DESACTIVADO (solo señales)"
+        return (
+            f"Wavelet MRA Haar 5m — BingX\n"
+            f"Modo cuenta: {modo} | Trading: {trading}\n"
+            f"Símbolos: {cls.SYMBOLS} | Timeframe: {cls.TIMEFRAME}\n"
+            f"qty_pct={cls.QTY_PCT}% | leverage={cls.LEVERAGE}x | "
+            f"max_posiciones_simultaneas={cls.MAX_CONCURRENT_POSITIONS}\n"
+            f"k_dominance={cls.K_DOMINANCE} | lookback_energy={cls.LOOKBACK_ENERGY} | "
+            f"cooldown_bars={cls.COOLDOWN_BARS}\n"
+            f"SL/TP: {'ATR x' + str(cls.ATR_MULT_SL) + '/' + str(cls.ATR_MULT_TP) if cls.USE_ATR_SL else str(cls.SL_PERCENT*100) + '%/' + str(cls.TP_PERCENT*100) + '%'}"
+        )

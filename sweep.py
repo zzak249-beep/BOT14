@@ -1,7 +1,7 @@
 """
 Barrido de umbrales con validación fuera de muestra.
 
-    python sweep.py CATE-USDT,JIMOTHY-USDT,BTR-USDT 5m 120
+    python sweep.py BTC-USDT,ETH-USDT,SOL-USDT 5m 120
 
 RESPONDE A: "el bot no abre nunca, ¿qué aflojo?"
 
@@ -43,8 +43,15 @@ import strategy
 
 # Combinaciones a probar. Pocas y con sentido, no una rejilla enorme:
 # cuantas más pruebas, más fácil encontrar un ganador por azar.
-CLAVES = ("MIN_RISK_PCT", "TARGET_CROSS", "MAX_COST_IN_R")
-COMBINACIONES = [(1.5, 2, 0.20), (1.0, 2, 0.20), (1.5, 1, 0.20), (2.0, 2, 0.25), (1.0, 1, 0.30), (2.5, 2, 0.15)]
+CLAVES = ("DOMINANCE_THRESHOLD", "SL_ATR", "TP_ATR")
+COMBINACIONES = [
+    (1.30, 1.5, 2.5),   # actual
+    (1.00, 1.5, 2.5),   # umbral más permisivo
+    (1.60, 1.5, 2.5),   # más exigente
+    (1.30, 1.0, 2.0),   # stop y objetivo más cortos
+    (1.30, 2.0, 3.5),   # más anchos
+    (1.30, 1.5, 4.0),   # dejar correr más
+]
 
 
 def evaluar(velas_por_symbol: dict[str, list[dict]], mitad: str) -> tuple[float, int]:

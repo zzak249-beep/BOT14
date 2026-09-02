@@ -53,6 +53,8 @@ class Trade:
     entry_ts: int
     entry: float
     sl: float
+    tp: float = 0.0
+    side: str = "BUY"
     exit_ts: int = 0
     exit: float = 0.0
     r: float = 0.0
@@ -117,24 +119,41 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
         vela = velas[i]
 
         if abierta:
-            # Salida por stop, o por giro del SuperTrend.
-            if vela["low"] <= abierta.sl:
+            riesgo0 = abs(abierta.entry - abierta.sl)
+            largo = abierta.side == "BUY"
+            toca_sl = vela["low"] <= abierta.sl if largo else vela["high"] >= abierta.sl
+            toca_tp = vela["high"] >= abierta.tp if largo else vela["low"] <= abierta.tp
+            venc = (vela["time"] - abierta.entry_ts) / 60000 >= config.MAX_TRADE_MINUTES
+
+            # Si en la misma vela se tocan SL y TP, se supone el PEOR
+            # caso. Suponer el mejor es la forma más común de inflar un
+            # backtest sin darse cuenta.
+            if toca_sl:
                 abierta.exit = abierta.sl
-                abierta.exit_ts = vela["time"]
-                abierta.r = -1.0
                 abierta.motivo = "stop"
-                res.trades.append(abierta)
-                abierta = None
-            elif strategy.exit_signal(velas[: i + 1]):
-                riesgo = abierta.entry - abierta.sl
-                abierta.exit = vela["close"]
-                abierta.exit_ts = vela["time"]
-                abierta.r = (vela["close"] - abierta.entry) / riesgo if riesgo > 0 else 0.0
-                # El coste se descuenta SIEMPRE, en R, igual que en vivo.
-                abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo / abierta.entry * 100.0)
-                abierta.motivo = "supertrend"
-                res.trades.append(abierta)
-                abierta = None
+                abierta.r = -1.0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+            elif toca_tp:
+                abierta.exit = abierta.tp
+                abierta.motivo = "objetivo"
+                bruto = (abierta.tp - abierta.entry) if largo else (abierta.entry - abierta.tp)
+                abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+            elif venc:
+                precio = vela["close"]
+                bruto = (precio - abierta.entry) if largo else (abierta.entry - precio)
+                a_favor = bruto > 0
+                if config.TIME_EXIT_ONLY_LOSING and a_favor:
+                    i += 1
+                    continue
+                abierta.exit = precio
+                abierta.motivo = "tiempo"
+                abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+            else:
+                i += 1
+                continue
+
+            abierta.exit_ts = vela["time"]
+            res.trades.append(abierta)
+            abierta = None
             i += 1
             continue
 
@@ -143,7 +162,7 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
             clave = motivo.split("(")[0].strip()
             res.descartes[clave] = res.descartes.get(clave, 0) + 1
         else:
-            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl)
+            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl, sig.tp, sig.side)
         i += 1
 
     return res
@@ -199,6 +218,61 @@ def report(res: Result, mensual: bool = False) -> str:
     return "\n".join(out)
 
 
+def significancia(rs: list[float], n_simbolos: int) -> str:
+    """
+    ¿La expectativa observada es distinguible de cero, teniendo en
+    cuenta cuántos símbolos se han probado?
+
+    Probar 300 símbolos es hacer 300 apuestas: por puro azar, algunos
+    van a salir bien. La literatura sobre data snooping (Harvey, Liu y
+    Zhu) recomienda exigir t >= 3.0 en vez del 2.0 habitual cuando se
+    ha buscado mucho. Y con un universo grande, ni siquiera 3.0 basta:
+    aquí se calcula además el umbral de Bonferroni para el número de
+    símbolos realmente probados.
+
+    Un estudio sobre 447 anomalías publicadas encontró que el 85% no
+    explicaba nada, y que el 93% de las que sí lo hacían no sobrevivían
+    al umbral de t >= 3.
+    """
+    n = len(rs)
+    if n < 10:
+        return "Muestra demasiado corta para hablar de significancia."
+    media = sum(rs) / n
+    var = sum((r - media) ** 2 for r in rs) / (n - 1)
+    sd = var ** 0.5
+    if sd == 0:
+        return "Sin dispersión: revisa los datos."
+    t = media / (sd / (n ** 0.5))
+
+    # Bonferroni aproximado: z necesario para alpha=0.05 repartido
+    # entre los símbolos probados.
+    import math
+    alpha = 0.05 / max(1, n_simbolos)
+    # aproximación de la inversa normal (Beasley-Springer-Moro simplificada)
+    z = math.sqrt(2.0) * _erfinv(1 - alpha)
+
+    veredicto = (
+        "PASA incluso ajustando por multiplicidad" if abs(t) >= z else
+        "pasa t>=3 (umbral de data snooping) pero NO Bonferroni" if abs(t) >= 3.0 else
+        "pasa el t>=2 clásico, NO el t>=3 de data snooping" if abs(t) >= 2.0 else
+        "no distinguible de cero"
+    )
+    return (
+        f"t-estadístico: {t:+.2f}   (n={n})\n"
+        f"  umbral clásico 2.00 · data snooping 3.00 · "
+        f"Bonferroni {n_simbolos} símbolos: {z:.2f}\n"
+        f"  -> {veredicto}"
+    )
+
+
+def _erfinv(y: float) -> float:
+    """Inversa de la función error, aproximación suficiente aquí."""
+    a = 0.147
+    ln = __import__("math").log(1 - y * y)
+    t1 = 2 / (__import__("math").pi * a) + ln / 2
+    return (1 if y >= 0 else -1) * (((t1 * t1 - ln / a) ** 0.5) - t1) ** 0.5
+
+
 async def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
@@ -214,6 +288,7 @@ async def main() -> int:
 
     total_r = 0.0
     total_ops = 0
+    todas_las_r: list[float] = []
     async with httpx.AsyncClient() as client:
         for sym in symbols:
             try:
@@ -228,11 +303,14 @@ async def main() -> int:
             print(report(res, mensual))
             total_r += sum(x.r for x in res.trades)
             total_ops += len(res.trades)
+            todas_las_r.extend(x.r for x in res.trades)
 
     if total_ops:
         print(f"\n{'='*58}")
         print(f"AGREGADO: {total_ops} operaciones · {total_r:+.1f} R · "
               f"{total_r/total_ops:+.3f} R por operación")
+        print(significancia(todas_las_r, len(symbols)))
+        print()
         print("Con menos de 100 operaciones repartidas en varios meses,")
         print("esto sigue siendo una pista, no una conclusión.")
     return 0
