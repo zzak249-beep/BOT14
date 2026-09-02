@@ -31,7 +31,7 @@ COLUMNAS = [
     "entrada_esperada", "entrada_real", "deslizamiento_pct",
     "sl", "tp", "qty", "riesgo_pct",
     "atr_pct", "er_corto", "er_largo", "estiron",
-    "coste_estimado_r", "btc_24h",
+    "coste_estimado_r", "btc_24h", "funding",
     "salida", "precio_salida", "r_real", "minutos",
 ]
 
@@ -79,6 +79,7 @@ class Journal:
                 "estiron": f"{getattr(sig, 'stretch', 0):.2f}",
                 "coste_estimado_r": "",
                 "btc_24h": (f"{sig.btc_24h:.2f}" if getattr(sig, "btc_24h", None) is not None else ""),
+                "funding": (f"{sig.funding:.4f}" if getattr(sig, "funding", None) is not None else ""),
                 "salida": "", "precio_salida": "", "r_real": "", "minutos": "",
             }
             with self.path.open("a", newline="") as f:

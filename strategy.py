@@ -71,6 +71,7 @@ class Signal:
     coste_r: float
     timeframe: str = ""
     btc_24h: float | None = None
+    funding: float | None = None
 
 
 def sma(values: list[float], length: int) -> list[float]:
@@ -129,7 +130,8 @@ def regime(closes: list[float], lookback: int, normalizar: bool) -> tuple[float,
 
 
 def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
-    need = config.LOOKBACK_ENERGY + 32
+    need = max(config.LOOKBACK_ENERGY + 32,
+                (config.HTF_MA_LEN + 20) if config.USE_HTF_FILTER else 0)
     if len(candles) < need:
         return None, "pocas velas"
 
@@ -166,6 +168,16 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
             return None, "cruce contra la escala gruesa"
         return None, f"sin cruce (ratio {ratio:.2f})"
 
+    # (3) Tendencia de fondo: una media larga sobre el MISMO feed
+    # equivale a mirar el timeframe superior sin pedir otro histórico.
+    # Con SMA(200) en 5m se está mirando algo más de 16 horas.
+    if config.USE_HTF_FILTER and len(closes) > config.HTF_MA_LEN:
+        ma_larga = sma(closes, config.HTF_MA_LEN)[-1]
+        if largo and closes[-1] < ma_larga:
+            return None, "largo por debajo de la media larga"
+        if corto and closes[-1] > ma_larga:
+            return None, "corto por encima de la media larga"
+
     if config.USE_VOL_FILTER:
         vols = [x["volume"] for x in c]
         vsma = sma(vols, config.VOL_LEN)
@@ -199,6 +211,25 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
                atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r),
         "ok",
     )
+
+
+def trailing_stop(candles: list[dict], side: str, stop_actual: float) -> float:
+    """
+    Stop que solo se mueve a favor. Se ofrece porque las fuentes
+    coinciden en que un trailing supera a la salida por cruce contrario
+    —captura la continuación una vez ganado el edge inicial— pero viene
+    apagado: es una hipótesis que hay que medir, no una certeza.
+    """
+    c = candles[:-1]
+    a = atr_series([x["high"] for x in c], [x["low"] for x in c],
+                   [x["close"] for x in c], config.ATR_LEN)
+    if not a:
+        return stop_actual
+    if side == "BUY":
+        cand = max(x["high"] for x in c[-3:]) - a[-1] * config.TRAIL_ATR
+        return max(stop_actual, cand)
+    cand = min(x["low"] for x in c[-3:]) + a[-1] * config.TRAIL_ATR
+    return min(stop_actual, cand)
 
 
 def position_size(equity: float, entry: float, sl: float) -> float:

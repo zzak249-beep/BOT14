@@ -115,6 +115,28 @@ class BingX:
                 out[sym] = 0.0
         return out
 
+    async def funding_rates(self) -> dict[str, float]:
+        """
+        Tasa de funding actual por símbolo, en %. Una sola llamada.
+
+        BingX devuelve lastFundingRate en tanto por uno (0.0001 = 0.01%).
+        Si el endpoint cambia de versión, esto devuelve vacío y el bot
+        sigue funcionando: el funding es contexto, no criterio.
+        """
+        try:
+            data = await self._public("/openApi/swap/v2/quote/premiumIndex")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudo leer el funding: %s", exc)
+            return {}
+        out: dict[str, float] = {}
+        for item in data or []:
+            sym = str(item.get("symbol", ""))
+            try:
+                out[sym] = float(item.get("lastFundingRate", 0) or 0) * 100.0
+            except (TypeError, ValueError):
+                continue
+        return out
+
     async def klines(self, symbol: str, interval: str, limit: int = 300) -> list[dict]:
         data = await self._public(
             "/openApi/swap/v3/quote/klines",
