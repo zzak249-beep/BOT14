@@ -3,7 +3,61 @@
 Descomposición multiescala causal + cruce sobre la aproximación, con el
 filtro de régimen **corregido**.
 
-**Arranca en SIGNAL.** Lee lo que viene antes de cambiarlo.
+---
+
+## Por qué no abría ni una operación (`wavelet-2.0`)
+
+Logs del 03-09-2026, ciclo tras ciclo:
+
+```
+326 símbolos · 0 señales | sin amplitud: 316 · sin dominancia: 10 · sin cruce: 1
+```
+
+El primer filtro mataba el 97% del universo, y por aritmética:
+
+| Puerta | Fórmula | ATR exigido en 5m |
+|---|---|---|
+| `MIN_COST_COVER=6` × coste 0,25% | ATR ≥ coste × cobertura | **1,50%** |
+| `MAX_COST_IN_R=0,20` con SL 1,5 ATR | ATR ≥ coste/(máx·SL) | 0,83% |
+| `MIN_ATR_PCT` | — | 0,50% |
+
+Un ATR del **1,5% en una vela de 5 minutos** casi no existe: la propia
+lista de vigilancia del bot mostraba 0,62% / 0,68% / 1,03% como los más
+volátiles de 326 símbolos. El filtro no estaba estricto: estaba cerrado.
+Y había dos puertas midiendo lo mismo con números incompatibles.
+
+**Ahora hay un solo umbral, calculado y anunciado:**
+
+```
+ATR mínimo efectivo = max(MIN_ATR_PCT,
+                          COST_ROUNDTRIP_PCT × MIN_COST_COVER,
+                          COST_ROUNDTRIP_PCT / (MAX_COST_IN_R × SL_ATR))
+```
+
+Con los valores nuevos (coste 0,15% · cobertura 2× · máx 0,25 R) sale
+**0,40%**, alcanzable a diario por parte del universo. El número se
+manda por Telegram al arrancar y cada ciclo se registra la mediana y el
+p90 del ATR real frente a él:
+
+```
+Ciclo 34s · 318 símbolos · 2 señales | sin dominancia: 210 · sin cruce: 96
+ | ATR% med 0.41 p90 0.88 máx 1.640 · umbral 0.40 → pasan 163
+```
+
+Si el embudo vuelve a cortarse siempre en el mismo sitio, llega un aviso
+a Telegram con los números. Eso es lo que faltaba.
+
+### Lo demás que estaba roto en la ruta LIVE
+
+| Fallo | Consecuencia | Arreglo |
+|---|---|---|
+| Órdenes LÍMITE dadas por llenadas | El único hueco quedaba bloqueado para siempre y la reconciliación inventaba un cierre | Estado `pending` real: se confirma con el precio de entrada del exchange o se cancela al vencer el TTL |
+| R de los cortos con el signo del largo | Cada corto ganador se apuntaba como pérdida y alimentaba el circuit breaker al revés | Signo por lado, y salida estimada en SL/TP si el precio ya los cruzó |
+| Firma HMAC sobre una cadena distinta de la enviada | Rechazos en las órdenes con SL/TP (JSON con llaves y comillas) | La cadena se construye una vez, se firma y se envía esa misma |
+| `positionSide=LONG` en cuenta unidireccional | BingX rechaza **todas** las órdenes | Detección del modo, `BOTH` cuando toca |
+| Capital = margen disponible | "saldo 0" con la cuenta llena, porque otro bot ocupaba el margen | Capital y disponible separados, con aviso explícito |
+| Tamaño bajo el lote mínimo → señal descartada | Con 135 USDT casi ningún símbolo entraba | Se sube al mínimo del contrato mientras el riesgo no pase de `MAX_RISK_PER_TRADE_PCT` |
+| 326 símbolos leídos de uno en uno, y otra vez para la vigilancia | Ciclos de ~160 s con `SCAN_INTERVAL_SEC=60` | Una pasada en paralelo que sirve para señal, vigilancia y diagnóstico |
 
 ---
 
