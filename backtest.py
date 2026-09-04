@@ -137,6 +137,12 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
                 abierta.motivo = "objetivo"
                 bruto = (abierta.tp - abierta.entry) if largo else (abierta.entry - abierta.tp)
                 abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+            elif strategy.exit_cross(velas[max(0, i - ventana): i + 1], abierta.side):
+                precio = vela["close"]
+                bruto = (precio - abierta.entry) if largo else (abierta.entry - precio)
+                abierta.exit = precio
+                abierta.motivo = "cruce"
+                abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
             elif venc:
                 precio = vela["close"]
                 bruto = (precio - abierta.entry) if largo else (abierta.entry - precio)
@@ -250,6 +256,9 @@ def significancia(rs: list[float], n_simbolos: int) -> str:
     alpha = 0.05 / max(1, n_simbolos)
     # aproximación de la inversa normal (Beasley-Springer-Moro simplificada)
     z = math.sqrt(2.0) * _erfinv(1 - alpha)
+    # Con un solo símbolo, Bonferroni da 1.96 — MENOS que el umbral
+    # clásico de 2.0. Nunca puede ser el listón más bajo de los tres.
+    z = max(z, 3.0)
 
     veredicto = (
         "PASA incluso ajustando por multiplicidad" if abs(t) >= z else

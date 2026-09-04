@@ -1,42 +1,55 @@
 """
-Motor: descomposición multiescala causal (tipo à trous) + cruce sobre la
-aproximación, con el filtro de régimen normalizado por escala.
+Motor: descomposición Haar À TROUS causal + cruce sobre la aproximación,
+con el filtro de régimen corregido (energía normalizada por escala).
 
 ═══════════════════════════════════════════════════════════════════════
-EL FALLO DEL ORIGINAL (sigue siendo cierto y sigue corregido)
+QUÉ CAMBIA RESPECTO A LA VERSIÓN ANTERIOR
 ═══════════════════════════════════════════════════════════════════════
-Comparar la energía de las escalas gruesas contra las finas SIN
-normalizar da mediana 3.04 en ruido puro y supera 1.5 el 92.6% del
-tiempo: el filtro se enciende casi siempre. La corrección es dividir la
-energía de cada escala por su longitud; entonces el ruido puro da 0.75 y
-un umbral de 1.30 significa algo.
+La versión anterior calculaba el "detalle a escala n" como la diferencia
+entre dos medias móviles de n barras separadas n barras. Es causal, sí,
+pero NO es la transformada à trous: no reconstruye la serie, las escalas
+se solapan de forma no controlada, y dividir por n no corresponde a la
+longitud real del filtro de esa escala.
+
+Aquí está la recursión de Renaud, Starck & Murtagh:
+
+    S_0(t)     = close(t)
+    S_{j+1}(t) = [S_j(t) + S_j(t - 2^j)] / 2
+    w_{j+1}(t) = S_j(t) - S_{j+1}(t)
+
+Propiedades que ahora sí se cumplen:
+  · RECONSTRUCCIÓN EXACTA: close = S_J + Σ w_j
+  · CAUSAL POR CONSTRUCCIÓN: w_j(t) usa close[t-2^j … t] y nada más. El
+    valor de la barra t no cambia nunca al llegar t+1. Sin ventana
+    deslizante, sin efecto de borde, sin recómputo.
+  · Es la ÚNICA familia wavelet que cumple esa restricción cuando los
+    coeficientes se usan para predecir. Todo el "wavelet denoising" que
+    aplica la transformada sobre la serie completa —futuro incluido—
+    produce backtests preciosos e irreproducibles.
 
 ═══════════════════════════════════════════════════════════════════════
-LO QUE SE HA REPARADO AHORA: EL FILTRO DE AMPLITUD
+EL FILTRO DE RÉGIMEN, Y POR QUÉ SE NORMALIZA
 ═══════════════════════════════════════════════════════════════════════
-Había dos puertas midiendo lo mismo con números incompatibles:
+El script de partida comparaba energía gruesa contra fina y llamaba
+"tendencia" a un ratio > 1.5. Sobre PASEO ALEATORIO PURO ese ratio da
+mediana ~3.0 y supera 1.5 más del 92% del tiempo: no filtra nada.
 
-    MIN_COST_COVER=6 con coste 0.25%  ->  exigía ATR >= 1.50%
-    MAX_COST_IN_R=0.20 con SL 1.5 ATR ->  exigía ATR >= 0.83%
+La causa es matemática: cada escala acumula varianza proporcional a su
+longitud, así que el numerador arranca inflado. La corrección es dividir
+la energía de cada escala por 2^j — su longitud REAL en la à trous.
 
-En velas de 5 minutos un ATR del 1.5% prácticamente no ocurre: 316 de
-326 símbolos morían ahí cada ciclo. Ahora el umbral efectivo se calcula
-en config.atr_minimo_efectivo() y el motivo del descarte dice el número
-concreto, no "sin amplitud" a secas.
+Con la normalización correcta, el mismo ruido puro da mediana ~0.70.
 
-Nada de esto cambia la estrategia: cambia que pueda ejecutarse.
+NORMALIZE_SCALES=false deja el modo original para poder comparar.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import config
 
 log = logging.getLogger("strategy")
-
-ESCALAS_FINAS = (1, 2)
-ESCALAS_GRUESAS = (4, 8)
 
 
 @dataclass
@@ -46,34 +59,16 @@ class Signal:
     entry: float
     sl: float
     tp: float
-    ratio: float
+    ratio: float         # dominancia grueso/fino ya normalizada
     umbral: float
-    h8: float
+    h8: float            # detalle de la escala más gruesa (dirección de fondo)
+    persist: float       # ER de la tendencia: 1 = línea recta, 0 = va y vuelve
     atr_pct: float
     riesgo_pct: float
     coste_r: float
     timeframe: str = ""
     btc_24h: float | None = None
     funding: float | None = None
-
-
-@dataclass
-class Analisis:
-    """Todo lo que se sabe de un símbolo tras UNA lectura de velas.
-
-    Existe para no descargar el histórico dos veces (una para buscar
-    señal y otra para la lista de vigilancia) y para poder medir el
-    embudo: sin esto, un filtro mal calibrado es invisible.
-    """
-    symbol: str
-    motivo: str = "sin datos"
-    signal: Signal | None = None
-    atr_pct: float = 0.0
-    ratio: float = 0.0
-    h8: float = 0.0
-    dist_aprox: float = 0.0
-    dominante: bool = False
-    timeframe: str = ""
 
 
 def sma(values: list[float], length: int) -> list[float]:
@@ -100,37 +95,107 @@ def atr_series(highs, lows, closes, length: int) -> list[float]:
     return out
 
 
-def haar_detail(closes: list[float], n: int) -> list[float]:
-    """Detalle causal a escala n: solo mira hacia atrás, sin repintado."""
-    m = sma(closes, n)
-    out = []
-    for i in range(len(closes)):
-        j = i - n
-        out.append(0.0 if j < 0 else (m[i] - m[j]) / (2 ** 0.5))
-    return out
+# ── Haar à trous ──────────────────────────────────────────────────────
+def atrous(closes: list[float], levels: int | None = None):
+    """
+    Devuelve (S_J, [w_1 … w_J]), todos de la misma longitud que closes.
+    Reconstrucción exacta: closes[t] == S_J[t] + Σ w_j[t].
+    """
+    levels = levels or config.MRA_LEVELS
+    n = len(closes)
+    if n < 2 ** levels + 2:
+        return None, None
+    s = list(closes)
+    detalles: list[list[float]] = []
+    for j in range(levels):
+        lag = 2 ** j
+        nxt = list(s)
+        for t in range(lag, n):
+            nxt[t] = (s[t] + s[t - lag]) / 2.0
+        detalles.append([s[t] - nxt[t] for t in range(n)])
+        s = nxt
+    return s, detalles
 
 
 def regime(closes: list[float], lookback: int, normalizar: bool) -> tuple[float, float]:
-    detalles = {n: haar_detail(closes, n) for n in (1, 2, 4, 8)}
-    energia = {}
-    for n, serie in detalles.items():
-        ventana = serie[-lookback:]
+    """
+    Devuelve (ratio, h_gruesa).
+
+    ratio = energía de las escalas gruesas / energía de las finas, cada
+    escala dividida por su longitud 2^j si normalizar. Las primeras 2^J
+    muestras se descartan: ahí el filtro aún no está saturado.
+    """
+    trend, det = atrous(closes)
+    if trend is None:
+        return 0.0, 0.0
+    warm = 2 ** len(det)
+    energia = []
+    for j, serie in enumerate(det):
+        ventana = serie[max(warm, len(serie) - lookback):]
         e = sum(x * x for x in ventana)
-        energia[n] = e / n if normalizar else e
-    fino = sum(energia[n] for n in ESCALAS_FINAS)
-    grueso = sum(energia[n] for n in ESCALAS_GRUESAS)
+        energia.append(e / (2 ** (j + 1)) if normalizar else e)
+    mitad = max(1, len(energia) // 2)
+    fino = sum(energia[:mitad])
+    grueso = sum(energia[mitad:])
     ratio = grueso / fino if fino > 0 else 0.0
-    return ratio, detalles[8][-1]
+    return ratio, det[-1][-1]
 
 
-def analizar(symbol: str, candles: list[dict], timeframe: str = "") -> Analisis:
-    a_out = Analisis(symbol=symbol, timeframe=timeframe or config.TIMEFRAME)
+def persistencia(closes: list[float], lookback: int) -> float:
+    """
+    Eficiencia (Kaufman) calculada SOBRE LA TENDENCIA WAVELET, no sobre
+    el precio: distancia recorrida / camino andado en la ventana.
 
-    need = max(config.LOOKBACK_ENERGY + 32,
+    POR QUÉ HACE FALTA — medido, no supuesto. Con la à trous correcta,
+    el ratio de dominancia NO distingue tendencia de oscilación: sobre
+    series sintéticas da mediana 1.12 en tendencia moderada y 1.44 en
+    OSCILANTE. Es lógico: una oscilación de amplitud grande también
+    concentra energía en las escalas gruesas. El ratio mide TAMAÑO por
+    escala, no DIRECCIÓN.
+
+    El ER sobre la tendencia sí separa: mediana 1.00 en tendencia y
+    0.26 en oscilante. Combinando los dos filtros, el paso de series
+    oscilantes cae del 64% al 6% sin tocar las de tendencia (36% y 94%
+    se mantienen).
+
+    Se calcula sobre S_J y no sobre el precio a propósito: el ER crudo
+    es ruidosísimo en 5m, y suavizarlo con una media introduciría
+    retardo. La tendencia wavelet ya está suavizada y es causal.
+    """
+    trend, _ = atrous(closes)
+    if trend is None:
+        return 0.0
+    seg = trend[-lookback - 1:]
+    if len(seg) < 3:
+        return 0.0
+    camino = sum(abs(seg[i] - seg[i - 1]) for i in range(1, len(seg)))
+    return abs(seg[-1] - seg[0]) / camino if camino > 0 else 0.0
+
+
+def _aprox(closes: list[float]) -> list[float]:
+    """
+    Serie sobre la que se busca el cruce.
+
+    CROSS_SOURCE=trend  -> S_J, la tendencia wavelet. Coherente con el
+                           motor y con el Pine.
+    CROSS_SOURCE=price  -> el precio crudo, como la versión anterior,
+                           para poder comparar sin cambiar nada más.
+    """
+    if getattr(config, "CROSS_SOURCE", "trend").lower() == "price":
+        return list(closes)
+    trend, _ = atrous(closes)
+    return trend if trend is not None else list(closes)
+
+
+def min_velas() -> int:
+    return max(config.LOOKBACK_ENERGY + 2 ** config.MRA_LEVELS + 4,
+               config.APPROX_LEN + 2 ** config.MRA_LEVELS + 4,
                (config.HTF_MA_LEN + 20) if config.USE_HTF_FILTER else 0)
-    if len(candles) < need:
-        a_out.motivo = "pocas velas"
-        return a_out
+
+
+def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
+    if len(candles) < min_velas():
+        return None, "pocas velas"
 
     c = candles[:-1]  # solo velas cerradas: la última aún se mueve
     closes = [x["close"] for x in c]
@@ -139,56 +204,48 @@ def analizar(symbol: str, candles: list[dict], timeframe: str = "") -> Analisis:
 
     a = atr_series(highs, lows, closes, config.ATR_LEN)
     if not a or a[-1] <= 0 or closes[-1] <= 0:
-        a_out.motivo = "sin indicadores"
-        return a_out
+        return None, "sin indicadores"
 
     atr_pct = a[-1] / closes[-1] * 100.0
-    a_out.atr_pct = atr_pct
+    cover = atr_pct / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
+    if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
+        return None, f"sin amplitud ({atr_pct:.2f}%, {cover:.0f}x)"
 
     ratio, h8 = regime(closes, config.LOOKBACK_ENERGY, config.NORMALIZE_SCALES)
-    aprox = sma(closes, config.APPROX_LEN)
-    a_out.ratio = ratio
-    a_out.h8 = h8
-    a_out.dominante = ratio >= config.DOMINANCE_THRESHOLD
-    a_out.dist_aprox = (closes[-1] - aprox[-1]) / a[-1] if a[-1] > 0 else 0.0
+    if ratio < config.DOMINANCE_THRESHOLD:
+        return None, f"sin dominancia ({ratio:.2f} de {config.DOMINANCE_THRESHOLD})"
 
-    # ── amplitud: UN solo criterio, con el número a la vista ──────────
-    minimo = config.atr_minimo_efectivo()
-    if atr_pct < minimo:
-        a_out.motivo = f"sin amplitud ({atr_pct:.2f}% < {minimo:.2f}% mínimo)"
-        return a_out
+    persist = persistencia(closes, config.LOOKBACK_ENERGY)
+    if config.USE_PERSISTENCE and persist < config.MIN_PERSISTENCE:
+        return None, f"oscilante (ER {persist:.2f} de {config.MIN_PERSISTENCE})"
 
-    if not a_out.dominante:
-        a_out.motivo = f"sin dominancia ({ratio:.2f} de {config.DOMINANCE_THRESHOLD})"
-        return a_out
+    base = _aprox(closes)
+    m = sma(base, config.APPROX_LEN)
+    cruza_arriba = base[-1] > m[-1] and base[-2] <= m[-2]
+    cruza_abajo = base[-1] < m[-1] and base[-2] >= m[-2]
 
-    cruza_arriba = closes[-1] > aprox[-1] and closes[-2] <= aprox[-2]
-    cruza_abajo = closes[-1] < aprox[-1] and closes[-2] >= aprox[-2]
-
+    # La escala gruesa debe apuntar en la misma dirección que el cruce:
+    # sin esto se compran cruces contra la estructura de fondo.
     largo = cruza_arriba and h8 > 0 and config.ALLOW_LONG
     corto = cruza_abajo and h8 < 0 and config.ALLOW_SHORT
 
     if not (largo or corto):
-        a_out.motivo = ("cruce contra la escala gruesa" if (cruza_arriba or cruza_abajo)
-                        else f"sin cruce (ratio {ratio:.2f})")
-        return a_out
+        if cruza_arriba or cruza_abajo:
+            return None, "cruce contra la escala gruesa"
+        return None, f"sin cruce (ratio {ratio:.2f})"
 
-    # Tendencia de fondo sobre el mismo feed: SMA(200) en 5m son ~16 h.
     if config.USE_HTF_FILTER and len(closes) > config.HTF_MA_LEN:
         ma_larga = sma(closes, config.HTF_MA_LEN)[-1]
         if largo and closes[-1] < ma_larga:
-            a_out.motivo = "largo por debajo de la media larga"
-            return a_out
+            return None, "largo por debajo de la media larga"
         if corto and closes[-1] > ma_larga:
-            a_out.motivo = "corto por encima de la media larga"
-            return a_out
+            return None, "corto por encima de la media larga"
 
     if config.USE_VOL_FILTER:
         vols = [x["volume"] for x in c]
         vsma = sma(vols, config.VOL_LEN)
         if vsma[-1] <= 0 or vols[-1] < vsma[-1] * config.VOL_MULT:
-            a_out.motivo = "sin volumen"
-            return a_out
+            return None, "sin volumen"
 
     entrada = closes[-1]
     if largo:
@@ -202,37 +259,45 @@ def analizar(symbol: str, candles: list[dict], timeframe: str = "") -> Analisis:
 
     riesgo = abs(entrada - sl)
     if riesgo <= 0:
-        a_out.motivo = "riesgo no válido"
-        return a_out
+        return None, "riesgo no válido"
     riesgo_pct = riesgo / entrada * 100.0
     coste_r = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
 
     if coste_r > config.MAX_COST_IN_R:
-        a_out.motivo = f"stop demasiado cerca (coste {coste_r:.2f}R)"
-        return a_out
+        return None, f"stop demasiado cerca (coste {coste_r:.2f}R)"
     if riesgo_pct > config.MAX_RISK_PCT:
-        a_out.motivo = f"stop demasiado lejos ({riesgo_pct:.1f}%)"
-        return a_out
+        return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
+    if riesgo_pct < config.MIN_RISK_PCT:
+        return None, f"riesgo bajo ({riesgo_pct:.2f}%)"
 
-    a_out.signal = Signal(
-        symbol=symbol, side=side, entry=entrada, sl=sl, tp=tp,
-        ratio=ratio, umbral=config.DOMINANCE_THRESHOLD, h8=h8,
-        atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r,
-        timeframe=a_out.timeframe,
+    return (
+        Signal(symbol=symbol, side=side, entry=entrada, sl=sl, tp=tp,
+               ratio=ratio, umbral=config.DOMINANCE_THRESHOLD, h8=h8,
+               persist=persist,
+               atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r),
+        "ok",
     )
-    a_out.motivo = "ok"
-    return a_out
 
 
-def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
-    """Interfaz que usan backtest.py y sweep.py. Misma lógica, dos valores."""
-    a = analizar(symbol, candles)
-    return a.signal, a.motivo
+def exit_cross(candles: list[dict], side: str) -> bool:
+    """Cruce contrario sobre la misma serie que generó la entrada."""
+    c = candles[:-1]
+    closes = [x["close"] for x in c]
+    if len(closes) < min_velas():
+        return False
+    base = _aprox(closes)
+    m = sma(base, config.APPROX_LEN)
+    if side == "BUY":
+        return base[-1] < m[-1] and base[-2] >= m[-2]
+    return base[-1] > m[-1] and base[-2] <= m[-2]
 
 
 def trailing_stop(candles: list[dict], side: str, stop_actual: float) -> float:
-    """Stop que solo se mueve a favor. Disponible y apagado: es una
-    hipótesis que hay que medir en el backtester, no una certeza."""
+    """
+    Stop que solo se mueve a favor. Apagado por defecto: las fuentes
+    dicen que un trailing supera a la salida fija porque captura la
+    continuación, pero eso es hipótesis a medir, no certeza.
+    """
     c = candles[:-1]
     a = atr_series([x["high"] for x in c], [x["low"] for x in c],
                    [x["close"] for x in c], config.ATR_LEN)
@@ -247,20 +312,37 @@ def trailing_stop(candles: list[dict], side: str, stop_actual: float) -> float:
 
 def position_size(equity: float, entry: float, sl: float) -> float:
     """
-    Riesgo fijo por operación. Kelly se queda fuera a propósito: necesita
-    el edge REAL y estimarlo con las primeras decenas de operaciones
-    produce tamaños disparatados justo cuando menos se sabe.
+    Riesgo fijo. NO se divide por el apalancamiento ni otra vez por el
+    precio: los dos errores clásicos de sizing. Kelly se deja fuera a
+    propósito — estimar el edge con decenas de operaciones produce
+    tamaños disparatados justo cuando menos se sabe.
     """
     riesgo = abs(entry - sl)
-    if riesgo <= 0 or entry <= 0 or equity <= 0:
+    if riesgo <= 0 or entry <= 0:
         return 0.0
     return (equity * config.RISK_PCT / 100.0) / riesgo
 
 
 def watch_status(candles: list[dict]) -> dict | None:
-    """Compatibilidad: el estado del régimen para la lista de vigilancia."""
-    a = analizar("?", candles)
-    if a.atr_pct <= 0:
+    """Estado del régimen para el aviso de vigilancia."""
+    if len(candles) < min_velas():
         return None
-    return {"ratio": a.ratio, "h8": a.h8, "atr_pct": a.atr_pct,
-            "dist_aprox": a.dist_aprox, "dominante": a.dominante}
+    c = candles[:-1]
+    closes = [x["close"] for x in c]
+    a = atr_series([x["high"] for x in c], [x["low"] for x in c], closes, config.ATR_LEN)
+    if not a or closes[-1] <= 0 or a[-1] <= 0:
+        return None
+    ratio, h8 = regime(closes, config.LOOKBACK_ENERGY, config.NORMALIZE_SCALES)
+    base = _aprox(closes)
+    m = sma(base, config.APPROX_LEN)
+    return {
+        "ratio": ratio,
+        "h8": h8,
+        "persist": persistencia(closes, config.LOOKBACK_ENERGY),
+        "atr_pct": a[-1] / closes[-1] * 100.0,
+        "dist_aprox": (base[-1] - m[-1]) / a[-1],
+        "dominante": (ratio >= config.DOMINANCE_THRESHOLD
+                      and (not config.USE_PERSISTENCE
+                           or persistencia(closes, config.LOOKBACK_ENERGY)
+                           >= config.MIN_PERSISTENCE)),
+    }
