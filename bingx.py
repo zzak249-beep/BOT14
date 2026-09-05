@@ -262,6 +262,12 @@ class BingX:
         precio que le quede al libro.
         """
         position_side = "LONG" if side == "BUY" else "SHORT"
+        # POST-ONLY: la orden se RECHAZA si cruzaría el spread, en vez de
+        # ejecutarse como taker. Sin esto, una limitada agresiva paga la
+        # comisión alta sin que te enteres, y el coste que asume la
+        # estrategia deja de ser el coste real. Un rechazo por post-only
+        # no es un error: es la orden negándose a pagar de más.
+        tif = "PostOnly" if config.POST_ONLY else "GTC"
         return await self._private(
             "POST",
             "/openApi/swap/v2/trade/order",
@@ -272,7 +278,7 @@ class BingX:
                 "type": "LIMIT",
                 "price": price,
                 "quantity": quantity,
-                "timeInForce": "GTC",
+                "timeInForce": tif,
                 "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
                 "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl,
                 "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp,
@@ -337,6 +343,43 @@ class BingX:
         except Exception:  # noqa: BLE001
             pass
         return False
+
+    async def realized_pnl_hoy(self) -> float | None:
+        """
+        PnL REALIZADO de toda la cuenta desde las 00:00 UTC, en USDT.
+
+        Incluye lo que hayan cerrado OTROS bots sobre la misma cuenta.
+        Es la única forma de aplicar un límite de pérdida diaria real
+        sin que los bots se comuniquen entre sí: un límite por bot deja
+        que dos pierdan el doble de lo declarado.
+
+        Devuelve None si el endpoint no responde — en ese caso el bot
+        cae al contador propio en vez de quedarse sin freno.
+        """
+        import datetime as _dt
+        inicio = int(_dt.datetime.now(_dt.timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        try:
+            data = await self._private(
+                "GET", "/openApi/swap/v2/user/income",
+                {"startTime": inicio, "limit": 1000},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudo leer el PnL de la cuenta: %s", exc)
+            return None
+        if isinstance(data, dict):
+            data = data.get("income", data.get("data", []))
+        if not isinstance(data, list):
+            return None
+        total = 0.0
+        for x in data:
+            tipo = str(x.get("incomeType", "")).upper()
+            if tipo in ("REALIZED_PNL", "REALIZEDPNL", "COMMISSION", "FUNDING_FEE"):
+                try:
+                    total += float(x.get("income", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+        return total
 
     async def open_positions(self) -> list[dict]:
         data = await self._private("GET", "/openApi/swap/v2/user/positions")

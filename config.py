@@ -119,6 +119,22 @@ USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
 TIME_EXIT_ONLY_LOSING = _bool("TIME_EXIT_ONLY_LOSING", True)
 
 # ── Coste y liquidez ──────────────────────────────────────────────────
+# ── Coste: comisiones separadas y TCA ─────────────────────────────────
+# Una limitada POST-ONLY nunca cruza el spread, así que la entrada paga
+# comisión MAKER. Sin post-only, una limitada que cruza se ejecuta como
+# taker y pagas la tarifa alta sin enterarte. La salida (SL/TP son
+# STOP_MARKET) siempre es taker.
+POST_ONLY = _bool("POST_ONLY", True)
+FEE_MAKER_PCT = _float("FEE_MAKER_PCT", 0.02)
+FEE_TAKER_PCT = _float("FEE_TAKER_PCT", 0.05)
+
+# Coste medido por símbolo a partir del diario, en vez de una constante
+# para los 400. Con menos de MIN_TCA_SAMPLES operaciones se usa la
+# estimación: tres fills no son una medición.
+USE_TCA = _bool("USE_TCA", True)
+MIN_TCA_SAMPLES = _int("MIN_TCA_SAMPLES", 10)
+TCA_BLACKLIST_MULT = _float("TCA_BLACKLIST_MULT", 2.0)
+
 COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
 MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
 MIN_COST_COVER = _float("MIN_COST_COVER", 6.0)
@@ -146,6 +162,26 @@ MARGIN_MODE = os.getenv("MARGIN_MODE", "ISOLATED").strip().upper()
 MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
 COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 120)
 MAX_DAILY_LOSS_R = _float("MAX_DAILY_LOSS_R", 3.0)
+# El límite diario aplicado a TODA LA CUENTA, no solo a este bot. Con
+# dos bots en real sobre la misma cuenta, un límite por bot permite
+# perder el doble de lo declarado sin que ninguno se pare.
+ACCOUNT_DAILY_LOSS = _bool("ACCOUNT_DAILY_LOSS", True)
+
+# ── Freno de drawdown ─────────────────────────────────────────────────
+# Sin throttle se compone el error: en drawdown se sigue arriesgando el
+# mismo porcentaje de un capital menor. Al superar DD_BRAKE_PCT desde el
+# pico, el riesgo se multiplica por DD_BRAKE_FACTOR y no se restaura
+# hasta recuperar hasta DD_RESUME_PCT.
+USE_DD_BRAKE = _bool("USE_DD_BRAKE", True)
+DD_BRAKE_PCT = _float("DD_BRAKE_PCT", 10.0)
+DD_RESUME_PCT = _float("DD_RESUME_PCT", 5.0)
+DD_BRAKE_FACTOR = _float("DD_BRAKE_FACTOR", 0.5)
+
+# ── Ranking de candidatos ─────────────────────────────────────────────
+# Con 400 símbolos y un hueco, ejecutar la PRIMERA señal que dispara
+# hace que el orden del universo decida qué operas: azar disfrazado de
+# sistema. Se recogen todas las del ciclo y se ejecuta la mejor.
+RANK_CANDIDATES = _bool("RANK_CANDIDATES", True)
 COOLDOWN_BARS = _int("COOLDOWN_BARS", 4)
 ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
 LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)

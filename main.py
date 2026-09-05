@@ -24,6 +24,7 @@ import config
 import funding
 import journal
 import strategy
+import tca
 from bingx import BingX, BingXError
 from notify import State, Telegram
 
@@ -46,6 +47,11 @@ _DEFAULTS = {
     "USE_VOL_FILTER": True, "VOL_LEN": 20, "VOL_MULT": 1.2,
     "MRA_LEVELS": 4, "CROSS_SOURCE": "trend",
     "USE_PERSISTENCE": True, "MIN_PERSISTENCE": 0.60, "RECV_WINDOW": 5000,
+    "POST_ONLY": True, "FEE_MAKER_PCT": 0.02, "FEE_TAKER_PCT": 0.05,
+    "USE_TCA": True, "MIN_TCA_SAMPLES": 10, "TCA_BLACKLIST_MULT": 2.0,
+    "ACCOUNT_DAILY_LOSS": True, "RANK_CANDIDATES": True,
+    "USE_DD_BRAKE": True, "DD_BRAKE_PCT": 10.0, "DD_RESUME_PCT": 5.0,
+    "DD_BRAKE_FACTOR": 0.5,
     "USE_HTF_FILTER": True, "HTF_MA_LEN": 200,
     "USE_TRAILING": False, "TRAIL_ATR": 2.0, "TRAIL_START_R": 1.0,
     "SL_ATR": 1.5, "TP_ATR": 2.5, "MAX_TRADE_MINUTES": 120,
@@ -87,7 +93,10 @@ def fmt_signal(sig: strategy.Signal, live: bool) -> str:
         f"{cabecera} · {lado} <b>{nombre}</b>  (wavelet MRA)",
         f"Entrada <code>{sig.entry:.8g}</code>",
         f"SL <code>{sig.sl:.8g}</code>  ·  TP <code>{sig.tp:.8g}</code>",
-        f"Riesgo {sig.riesgo_pct:.2f}%  ·  coste {sig.coste_r:.2f} R",
+        f"Riesgo {sig.riesgo_pct:.2f}%  ·  coste {sig.coste_r:.2f} R "
+        + (f"({sig.coste_pct:.3f}% medido en {sig.coste_ops} ops)"
+           if getattr(sig, "coste_ops", 0) else
+           f"({getattr(sig, 'coste_pct', config.COST_ROUNDTRIP_PCT):.3f}% estimado)"),
         f"Dominancia {sig.ratio:.2f} (umbral {sig.umbral:.2f}) · "
         f"ER tendencia {getattr(sig, 'persist', 0):.2f} · h8 {sig.h8:+.4f}",
         f"ATR {sig.atr_pct:.2f}% · {getattr(sig, 'timeframe', config.TIMEFRAME)}"
@@ -116,6 +125,8 @@ class Bot:
         self._pendientes_aviso: list = []
         # Signal de cada limitada en vuelo (no cabe en el JSON del estado)
         self._sig_pendiente: dict = {}
+        self.riesgo_factor = 1.0      # freno de drawdown
+        self.cuenta_r_hoy: float | None = None
         self.last_funding_alert = 0.0
         self.btc_ts = 0.0
         self.sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
@@ -135,7 +146,16 @@ class Bot:
             + ("(normalizada por escala)" if config.NORMALIZE_SCALES else "(SIN normalizar — modo original)") + chr(10)
             + f"Cruce sobre SMA({config.APPROX_LEN}) con la escala gruesa a favor" + chr(10)
             + f"Timeframe {config.TIMEFRAME} · riesgo {config.RISK_PCT}% · "
-            + f"SL {config.SL_ATR} ATR / TP {config.TP_ATR} ATR"
+            + f"SL {config.SL_ATR} ATR / TP {config.TP_ATR} ATR" + chr(10)
+            + f"Entrada {config.ENTRY_TYPE}"
+            + (" POST-ONLY" if config.POST_ONLY else " (taker si cruza)")
+            + f" · comisión ida y vuelta {tca.comision_ida_vuelta():.3f}%" + chr(10)
+            + ("TCA por símbolo activo" if config.USE_TCA else "TCA apagado")
+            + f" · límite diario "
+            + ("de CUENTA" if config.ACCOUNT_DAILY_LOSS else "por bot")
+            + f" {config.MAX_DAILY_LOSS_R}R"
+            + (f" · freno de drawdown al {config.DD_BRAKE_PCT}%"
+               if config.USE_DD_BRAKE else "")
         )
         await self.refresh_symbols()
         while True:
@@ -216,6 +236,96 @@ class Bot:
         d["r_hoy"] = float(d.get("r_hoy", 0.0)) + r
         self.state.save()
 
+    async def actualizar_freno(self) -> None:
+        """
+        Freno de drawdown sobre el tamaño.
+
+        RISK_PCT es un porcentaje del saldo, así que en drawdown se
+        sigue arriesgando lo mismo de un capital menor — el error se
+        compone. Al caer más de DD_BRAKE_PCT desde el pico, el riesgo se
+        multiplica por DD_BRAKE_FACTOR, y NO se restaura hasta recuperar
+        hasta DD_RESUME_PCT del pico. La histéresis es a propósito: sin
+        ella el factor parpadearía en el umbral.
+        """
+        if not config.USE_DD_BRAKE or not self.live:
+            self.riesgo_factor = 1.0
+            return
+        try:
+            saldo = await self.api.balance_usdt()
+        except Exception:  # noqa: BLE001
+            return
+        if saldo <= 0:
+            return
+        d = self.state.data
+        pico = float(d.get("equity_pico", 0) or 0)
+        if saldo > pico:
+            pico = saldo
+            d["equity_pico"] = pico
+            self.state.save()
+        dd = (pico - saldo) / pico * 100.0 if pico > 0 else 0.0
+        frenado = bool(d.get("freno_activo", False))
+
+        if not frenado and dd >= config.DD_BRAKE_PCT:
+            d["freno_activo"] = True
+            self.state.save()
+            await self.tg.send(
+                f"🛞 <b>Freno de drawdown activado</b>" + chr(10)
+                + f"Caída del {dd:.1f}% desde el pico ({pico:.2f} → {saldo:.2f} USDT)." + chr(10)
+                + f"Riesgo por operación: {config.RISK_PCT}% → "
+                  f"{config.RISK_PCT * config.DD_BRAKE_FACTOR}%." + chr(10)
+                + f"<i>Se restaura al recuperar hasta un {config.DD_RESUME_PCT}% del pico.</i>"
+            )
+        elif frenado and dd <= config.DD_RESUME_PCT:
+            d["freno_activo"] = False
+            self.state.save()
+            await self.tg.send(
+                f"🟢 <b>Freno liberado</b> · drawdown {dd:.1f}%, riesgo de vuelta "
+                f"al {config.RISK_PCT}%."
+            )
+        self.riesgo_factor = (config.DD_BRAKE_FACTOR
+                              if d.get("freno_activo") else 1.0)
+
+    async def limite_cuenta_alcanzado(self) -> bool:
+        """
+        Límite de pérdida diaria sobre TODA LA CUENTA.
+
+        MAX_DAILY_LOSS_R es por bot. Con dos bots en real sobre la misma
+        cuenta, eso permite perder el doble de lo declarado sin que
+        ninguno se pare. Aquí se lee el PnL realizado de la cuenta desde
+        las 00:00 UTC y se convierte a R con el riesgo de referencia.
+
+        La conversión es aproximada: cada operación arriesga
+        RISK_PCT del saldo, así que 1R ≈ saldo x RISK_PCT/100. Si los
+        bots usan riesgos distintos, esto sobreestima o subestima. Es
+        deliberadamente conservador y mejor que no tener freno.
+        """
+        if not config.ACCOUNT_DAILY_LOSS or not self.live:
+            return False
+        pnl = await self.api.realized_pnl_hoy()
+        if pnl is None:
+            return False   # sin datos: manda el contador propio
+        try:
+            saldo = await self.api.balance_usdt()
+        except Exception:  # noqa: BLE001
+            return False
+        riesgo_ref = saldo * config.RISK_PCT / 100.0
+        if riesgo_ref <= 0:
+            return False
+        self.cuenta_r_hoy = pnl / riesgo_ref
+        if self.cuenta_r_hoy > -abs(config.MAX_DAILY_LOSS_R):
+            return False
+        if self.state.data.get("aviso_cuenta") != self.dia_actual():
+            self.state.data["aviso_cuenta"] = self.dia_actual()
+            self.state.save()
+            await self.tg.send(
+                f"🛑 <b>Límite diario DE LA CUENTA alcanzado</b>" + chr(10)
+                + f"{pnl:+.2f} USDT realizados hoy = {self.cuenta_r_hoy:.2f} R "
+                  f"(límite {config.MAX_DAILY_LOSS_R} R)." + chr(10)
+                + "<i>Incluye lo cerrado por los demás bots de esta cuenta. "
+                  "No se abre nada más hasta mañana (UTC).</i>"
+            )
+        return True
+
     async def _velas(self, sym: str, tf: str | None = None) -> list[dict] | None:
         async with self.sem:
             try:
@@ -229,6 +339,10 @@ class Bot:
         btc = await self.contexto_btc()
         if config.BTC_FILTER and btc is not None and btc < config.BTC_MIN_24H:
             log.info("BTC %.1f%% en 24h: por debajo del mínimo, no se abre", btc)
+            return
+
+        await self.actualizar_freno()
+        if await self.limite_cuenta_alcanzado():
             return
 
         if self.limite_diario_alcanzado():
@@ -254,6 +368,7 @@ class Bot:
         hay_hueco = abiertas < config.MAX_CONCURRENT
 
         candidatos = 0
+        senales: list[strategy.Signal] = []
         motivos: dict[str, int] = {}
         for sym in self.symbols:
             if (sym in self.state.data.get("open", {})
@@ -285,10 +400,28 @@ class Bot:
             sig.timeframe = tf_señal
             sig.btc_24h = btc
             sig.funding = self.funding.get(sym)
+            senales.append(sig)
+
+        # RANKING. Con 400 símbolos y un hueco, ejecutar la primera que
+        # dispara hace que el ORDEN DEL UNIVERSO decida qué operas: azar
+        # disfrazado de sistema. Se ordena por coste ascendente (el
+        # único término cierto), luego persistencia y dominancia.
+        if config.RANK_CANDIDATES and len(senales) > 1:
+            senales.sort(key=strategy.calidad)
+            mejor = senales[0]
+            log.info("Ranking: %d candidatas, mejor %s (coste %.2fR)",
+                     len(senales), mejor.symbol, mejor.coste_r)
+
+        for sig in senales:
             ejecutada = await self.handle_signal(sig, hay_hueco)
             if ejecutada:
                 abiertas += 1
                 hay_hueco = abiertas < config.MAX_CONCURRENT
+
+        if config.RANK_CANDIDATES and len(senales) > 1:
+            resto = ", ".join(
+                f"{x.symbol.split('-')[0]} {x.coste_r:.2f}R" for x in senales[1:6])
+            log.info("Descartadas por ranking: %s", resto)
 
         await self.volcar_avisos()
         detalle = " · ".join(f"{k}: {v}" for k, v in sorted(motivos.items(), key=lambda x: -x[1])[:5])
@@ -354,14 +487,17 @@ class Bot:
             if equity <= 0:
                 await self.tg.send(f"⚠️ {sig.symbol} sin ejecutar: saldo 0")
                 return False
-            qty = self.api.round_qty(sig.symbol, strategy.position_size(equity, sig.entry, sig.sl))
+            qty = self.api.round_qty(
+                sig.symbol,
+                strategy.position_size(equity, sig.entry, sig.sl, self.riesgo_factor))
             minimo = self.api.min_qty(sig.symbol)
             if qty <= 0 or (minimo > 0 and qty < minimo):
                 riesgo_min = minimo * abs(sig.entry - sig.sl)
                 pct = (riesgo_min / equity * 100.0) if equity > 0 else 0.0
                 await self.tg.send(
                     f"⚠️ <b>{sig.symbol}</b> sin ejecutar: tamaño {qty} bajo el lote mínimo ({minimo}).\n"
-                    f"Harían falta <b>{pct:.2f}%</b> de riesgo (ahora {config.RISK_PCT}%)."
+                    f"Harían falta <b>{pct:.2f}%</b> de riesgo "
+                    f"(ahora {config.RISK_PCT * self.riesgo_factor:.2f}%)."
                 )
                 return False
             vivas = await self.api.open_positions()
@@ -392,6 +528,21 @@ class Bot:
             else:
                 await self.api.market_order(sig.symbol, sig.side, qty, sl_r, tp_r, client_id)
         except BingXError as exc:
+            texto = str(exc).lower()
+            if config.POST_ONLY and ("post" in texto or "immediately match" in texto
+                                     or "would match" in texto or "maker" in texto):
+                # La limitada habría cruzado el spread. Rechazarla es lo
+                # correcto: ejecutarla habría pagado comisión taker y el
+                # coste real ya no sería el que asume la estrategia.
+                log.info("%s: post-only rechazada (habría cruzado)", sig.symbol)
+                if self.aviso_en_frio(sig.symbol, "postonly"):
+                    await self.tg.send(
+                        f"↩️ <b>{sig.symbol.split('-')[0]}</b> no abierta: la limitada "
+                        f"habría cruzado el spread y pagado comisión taker.\n"
+                        f"<i>POST_ONLY la rechaza a propósito. Si pasa mucho, sube "
+                        f"LIMIT_OFFSET_PCT (ahora {config.LIMIT_OFFSET_PCT}%).</i>"
+                    )
+                return False
             await self.tg.send(f"❌ BingX rechazó {sig.symbol}: {exc}")
             return False
         except Exception as exc:  # noqa: BLE001
@@ -815,10 +966,17 @@ class Bot:
             return
         self.state.data["last_summary"] = hoy
         self.state.save()
+        extra = ""
+        if self.riesgo_factor != 1.0:
+            extra = (f"\n🛞 Freno activo: riesgo al "
+                     f"{config.RISK_PCT * self.riesgo_factor:.2f}%")
+        if self.cuenta_r_hoy is not None:
+            extra += f"\nCuenta hoy: {self.cuenta_r_hoy:+.2f} R (todos los bots)"
         await self.tg.send(
             f"📊 <b>Resumen diario · Wavelet MRA</b> · {hoy}\n{config.describe()}\n\n"
-            f"{self.stats_text()}\nUniverso: {len(self.symbols)} símbolos"
+            f"{self.stats_text()}\nUniverso: {len(self.symbols)} símbolos" + extra
         )
+        await self.tg.send(tca.informe())
 
     async def maybe_heartbeat(self) -> None:
         if config.HEARTBEAT_HOURS <= 0:

@@ -48,6 +48,7 @@ import logging
 from dataclasses import dataclass
 
 import config
+import tca
 
 log = logging.getLogger("strategy")
 
@@ -66,6 +67,8 @@ class Signal:
     atr_pct: float
     riesgo_pct: float
     coste_r: float
+    coste_pct: float = 0.0   # coste usado: medido si lo hay, estimado si no
+    coste_ops: int = 0       # operaciones sobre las que se midió (0 = estimado)
     timeframe: str = ""
     btc_24h: float | None = None
     funding: float | None = None
@@ -206,8 +209,15 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     if not a or a[-1] <= 0 or closes[-1] <= 0:
         return None, "sin indicadores"
 
+    # COSTE MEDIDO para ESTE símbolo, no la constante global.
+    if tca.sospechoso(symbol):
+        c_med, n_med = tca.medido(symbol)
+        return None, f"coste real prohibitivo ({c_med:.3f}% en {n_med} ops)"
+    coste_pct = tca.coste(symbol)
+    coste_pct_med, coste_ops = tca.medido(symbol)
+
     atr_pct = a[-1] / closes[-1] * 100.0
-    cover = atr_pct / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
+    cover = atr_pct / coste_pct if coste_pct > 0 else 0.0
     if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
         return None, f"sin amplitud ({atr_pct:.2f}%, {cover:.0f}x)"
 
@@ -261,7 +271,7 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     if riesgo <= 0:
         return None, "riesgo no válido"
     riesgo_pct = riesgo / entrada * 100.0
-    coste_r = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
+    coste_r = coste_pct / riesgo_pct if riesgo_pct > 0 else 99.0
 
     if coste_r > config.MAX_COST_IN_R:
         return None, f"stop demasiado cerca (coste {coste_r:.2f}R)"
@@ -274,7 +284,9 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
         Signal(symbol=symbol, side=side, entry=entrada, sl=sl, tp=tp,
                ratio=ratio, umbral=config.DOMINANCE_THRESHOLD, h8=h8,
                persist=persist,
-               atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r),
+               atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r,
+               coste_pct=coste_pct,
+               coste_ops=coste_ops if coste_ops >= config.MIN_TCA_SAMPLES else 0),
         "ok",
     )
 
@@ -310,7 +322,8 @@ def trailing_stop(candles: list[dict], side: str, stop_actual: float) -> float:
     return min(stop_actual, cand)
 
 
-def position_size(equity: float, entry: float, sl: float) -> float:
+def position_size(equity: float, entry: float, sl: float,
+                  factor: float = 1.0) -> float:
     """
     Riesgo fijo. NO se divide por el apalancamiento ni otra vez por el
     precio: los dos errores clásicos de sizing. Kelly se deja fuera a
@@ -320,7 +333,7 @@ def position_size(equity: float, entry: float, sl: float) -> float:
     riesgo = abs(entry - sl)
     if riesgo <= 0 or entry <= 0:
         return 0.0
-    return (equity * config.RISK_PCT / 100.0) / riesgo
+    return (equity * config.RISK_PCT * factor / 100.0) / riesgo
 
 
 def watch_status(candles: list[dict]) -> dict | None:
@@ -346,3 +359,17 @@ def watch_status(candles: list[dict]) -> dict | None:
                            or persistencia(closes, config.LOOKBACK_ENERGY)
                            >= config.MIN_PERSISTENCE)),
     }
+
+
+def calidad(sig: Signal) -> tuple:
+    """
+    Clave de orden para elegir ENTRE candidatos del mismo ciclo.
+
+    Menos coste primero (es el único término cierto de la ecuación),
+    luego más persistencia y más dominancia. Nada de esto pretende
+    predecir cuál ganará: solo evita que el orden alfabético del
+    universo decida por ti cuando hay un hueco y veinte señales.
+    """
+    return (round(sig.coste_r, 3),
+            -round(getattr(sig, "persist", 0.0), 3),
+            -round(sig.ratio, 3))

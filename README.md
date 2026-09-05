@@ -126,3 +126,76 @@ mejores de n sesga casi tanto como elegir el mejor de n^k.
 
 Servicio aparte, volumen en `/data`, y para LIVE los dos cerrojos:
 `MODE=LIVE` **y** `LIVE_CONFIRMED=true`.
+
+
+---
+
+## v2 — las cinco mejoras
+
+### 1. Post-only (`POST_ONLY=true`)
+Una limitada sin `postOnly` que cruza el spread se ejecuta como **taker**
+y paga la tarifa alta sin avisar. Ahora se rechaza en vez de cruzar.
+Comisión ida y vuelta: **0.070%** con post-only (0.02 maker entrada +
+0.05 taker salida) contra **0.100%** sin él. El rechazo no es un error:
+llega a Telegram con la sugerencia de subir `LIMIT_OFFSET_PCT` si pasa
+muy a menudo.
+
+### 2. Ranking de candidatos (`RANK_CANDIDATES=true`)
+Con 400 símbolos y un hueco, ejecutar la primera que dispara hacía que
+el **orden del universo** decidiera qué operas. Ahora se recogen todas
+las del ciclo y se ordenan por coste en R ascendente, luego
+persistencia y dominancia. Verificado: entre dos con el mismo coste,
+gana la de más persistencia.
+
+### 3. TCA por símbolo (`tca.py`, `USE_TCA=true`)
+`COST_ROUNDTRIP_PCT` era **una constante para los 400 símbolos**. Ahora
+se mide desde el diario:
+
+```
+coste = comisión_entrada + comisión_salida + 2 x deslizamiento_mediano
+```
+
+El deslizamiento se mide contra el **arrival price** — el precio del
+momento de la señal, que es el que supone el backtest. Con menos de
+`MIN_TCA_SAMPLES` (10) operaciones se usa la estimación. Los símbolos
+cuyo coste medido supere `TCA_BLACKLIST_MULT` x la estimación se
+descartan solos, con el motivo en el embudo.
+
+Probado con diario sintético: un símbolo con 0.02% de deslizamiento da
+0.110% de coste; uno con 0.25% da **0.603%** y queda descartado.
+El informe va en el resumen diario.
+
+### 4. Límite diario de CUENTA (`ACCOUNT_DAILY_LOSS=true`)
+`MAX_DAILY_LOSS_R` era por bot. Con dos bots en real sobre la misma
+cuenta, eso permite perder **el doble** de lo declarado sin que ninguno
+se pare. Ahora se lee el PnL realizado de la cuenta desde las 00:00 UTC
+(`/user/income`) y se convierte a R con el riesgo de referencia.
+
+Es aproximado — si los bots usan `RISK_PCT` distintos, la conversión
+desvía. Si el endpoint no responde, cae al contador propio en vez de
+quedarse sin freno.
+
+### 5. Freno de drawdown (`USE_DD_BRAKE=true`)
+`RISK_PCT` es un porcentaje del saldo, así que en drawdown seguías
+arriesgando lo mismo de un capital menor. Al caer un 10% desde el pico,
+el riesgo se multiplica por 0.5 y **no se restaura hasta recuperar
+hasta el 5%**. La histéresis evita que el factor parpadee en el umbral.
+
+Verificado: 135→120 (dd 11.1%) frena; 120→129 (dd 4.4%) libera. Sizing
+0.3375 normal, 0.1688 frenado.
+
+---
+
+## Lo que NO se implementó, y por qué
+
+- **Smart order routing multi-venue**: reduce slippage pero añade
+  complejidad operativa y exposición a contraparte. Con este tamaño el
+  coste operativo supera el ahorro.
+- **Volatility targeting a nivel cartera**: la estimación de
+  volatilidad mira hacia atrás, así que reduce exposición *después* de
+  que suba, y es procíclica. Con un hueco simultáneo no aporta.
+- **Modelos de impacto de mercado**: tu orden no mueve el libro.
+
+`LOOKBACK_ENERGY` sube de 40 a **160** en las plantillas: con 40, el
+percentil 95 del ratio en ruido puro era 1.41, por encima del umbral de
+1.30, y dos ventanas discrepaban en la decisión el 16% de las veces.

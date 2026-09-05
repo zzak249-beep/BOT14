@@ -66,6 +66,8 @@ class State:
             "open": {},          # symbol -> posición confirmada por el exchange
             "pending": {},       # symbol -> orden limitada enviada, aún sin ejecutar
             "last_signal": {},   # symbol -> timestamp de la última señal
+            "equity_pico": 0.0,  # máximo histórico del saldo (freno de drawdown)
+            "freno_activo": False,
         }
         self._load()
 
