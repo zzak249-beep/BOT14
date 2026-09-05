@@ -188,13 +188,58 @@ class BingX:
         return rows
 
     # ── privado ───────────────────────────────────────────────────────
-    async def balance_usdt(self) -> float:
+    async def cuenta(self) -> dict:
+        """
+        Foto de la cuenta en UNA llamada: disponible y patrimonio.
+
+        LA DISTINCIÓN NO ES COSMÉTICA. availableMargin es el margen
+        LIBRE: baja al abrir una posición porque el margen queda
+        bloqueado, aunque no hayas perdido nada. Usarlo como "saldo"
+        hace que cualquier medida de drawdown se dispare sola en cuanto
+        hay una posición abierta — con un stop del 2%, apalancamiento 2
+        y riesgo 0.5%, el margen bloqueado es el 12.5% del capital y un
+        freno del 10% salta en falso a la primera operación.
+
+        equity = balance realizado + PnL no realizado. Es lo que hay que
+        usar para drawdown y para dimensionar.
+
+        Devuelve {'disponible': x, 'equity': y}.
+        """
         data = await self._private("GET", "/openApi/swap/v2/user/balance")
+        bal = data
         if isinstance(data, dict):
             bal = data.get("balance", data)
-            if isinstance(bal, dict):
-                return float(bal.get("availableMargin", bal.get("balance", 0)) or 0)
-        return 0.0
+        if isinstance(bal, list):
+            bal = bal[0] if bal else {}
+        if not isinstance(bal, dict):
+            return {"disponible": 0.0, "equity": 0.0}
+
+        def _f(*claves):
+            for k in claves:
+                v = bal.get(k)
+                if v not in (None, ""):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        continue
+            return 0.0
+
+        disponible = _f("availableMargin", "availableBalance", "balance")
+        equity = _f("equity")
+        if equity <= 0:
+            # Sin campo equity: reconstruirlo. NUNCA caer en availableMargin.
+            equity = _f("balance", "walletBalance") + _f("unrealizedProfit", "unrealizedPNL")
+        if equity <= 0:
+            equity = disponible
+        return {"disponible": disponible, "equity": equity}
+
+    async def balance_usdt(self) -> float:
+        """Margen DISPONIBLE. Para saber si cabe una orden, no para medir drawdown."""
+        return (await self.cuenta())["disponible"]
+
+    async def equity_usdt(self) -> float:
+        """Patrimonio real. Esto es lo que se usa para drawdown y sizing."""
+        return (await self.cuenta())["equity"]
 
     async def set_margin_mode(self, symbol: str, modo: str = "ISOLATED") -> None:
         """

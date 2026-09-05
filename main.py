@@ -127,6 +127,8 @@ class Bot:
         self._sig_pendiente: dict = {}
         self.riesgo_factor = 1.0      # freno de drawdown
         self.cuenta_r_hoy: float | None = None
+        self._cuenta: dict = {}
+        self._cuenta_ts = 0.0
         self.last_funding_alert = 0.0
         self.btc_ts = 0.0
         self.sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
@@ -236,6 +238,24 @@ class Bot:
         d["r_hoy"] = float(d.get("r_hoy", 0.0)) + r
         self.state.save()
 
+    async def snapshot(self, forzar: bool = False) -> dict:
+        """
+        Saldo y patrimonio, cacheados 30 s.
+
+        Antes se pedía el saldo CUATRO veces por ciclo (freno, límite de
+        cuenta, sizing y funding). Con SCAN_INTERVAL_SEC=60 son 4
+        llamadas por minuto a un endpoint privado, sin ninguna razón:
+        el saldo no cambia entre dos de esas llamadas.
+        """
+        if not forzar and self._cuenta and time.time() - self._cuenta_ts < 30:
+            return self._cuenta
+        try:
+            self._cuenta = await self.api.cuenta()
+            self._cuenta_ts = time.time()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudo leer la cuenta: %s", exc)
+        return self._cuenta or {"disponible": 0.0, "equity": 0.0}
+
     async def actualizar_freno(self) -> None:
         """
         Freno de drawdown sobre el tamaño.
@@ -250,10 +270,10 @@ class Bot:
         if not config.USE_DD_BRAKE or not self.live:
             self.riesgo_factor = 1.0
             return
-        try:
-            saldo = await self.api.balance_usdt()
-        except Exception:  # noqa: BLE001
-            return
+        # PATRIMONIO, no margen disponible: availableMargin baja al
+        # abrir una posición porque el margen queda bloqueado, así que
+        # usarlo aquí dispara el freno en falso a la primera operación.
+        saldo = (await self.snapshot()).get("equity", 0.0)
         if saldo <= 0:
             return
         d = self.state.data
@@ -304,10 +324,7 @@ class Bot:
         pnl = await self.api.realized_pnl_hoy()
         if pnl is None:
             return False   # sin datos: manda el contador propio
-        try:
-            saldo = await self.api.balance_usdt()
-        except Exception:  # noqa: BLE001
-            return False
+        saldo = (await self.snapshot()).get("equity", 0.0)
         riesgo_ref = saldo * config.RISK_PCT / 100.0
         if riesgo_ref <= 0:
             return False
@@ -483,7 +500,9 @@ class Bot:
 
         client_id = f"wav{sig.symbol.split('-')[0][:6]}{int(time.time())}"
         try:
-            equity = await self.api.balance_usdt()
+            cta = await self.snapshot(forzar=True)
+            equity = cta.get("equity", 0.0)
+            disponible = cta.get("disponible", 0.0)
             if equity <= 0:
                 await self.tg.send(f"⚠️ {sig.symbol} sin ejecutar: saldo 0")
                 return False
@@ -514,6 +533,20 @@ class Bot:
                 )
                 return False
             if any(str(p.get("symbol")) == sig.symbol and float(p.get("positionAmt", 0) or 0) != 0 for p in vivas):
+                return False
+
+            # ¿Cabe el margen? El riesgo se calcula sobre el patrimonio,
+            # pero la orden se paga con el margen LIBRE. Sin esta
+            # comprobación BingX rechaza por fondos y parece un fallo.
+            margen_necesario = qty * sig.entry / max(config.LEVERAGE, 1)
+            if margen_necesario > disponible * 0.95:
+                if self.aviso_en_frio(sig.symbol, "margen"):
+                    await self.tg.send(
+                        f"⚠️ <b>{sig.symbol.split('-')[0]}</b> sin abrir: haría falta "
+                        f"{margen_necesario:.2f} USDT de margen y hay {disponible:.2f} libres.\n"
+                        f"<i>Patrimonio {equity:.2f}. La diferencia está bloqueada "
+                        f"en posiciones abiertas.</i>"
+                    )
                 return False
 
             await self.api.set_margin_mode(sig.symbol, config.MARGIN_MODE)
@@ -655,10 +688,7 @@ class Bot:
 
         saldo = 0.0
         if self.live:
-            try:
-                saldo = await self.api.balance_usdt()
-            except Exception:  # noqa: BLE001
-                saldo = 0.0
+            saldo = (await self.snapshot()).get("equity", 0.0)
         if saldo <= 0:
             saldo = config.SALDO_ESTIMADO
 
