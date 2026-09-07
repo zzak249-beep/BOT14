@@ -23,6 +23,7 @@ import httpx
 import config
 import funding
 import journal
+import polymarket as pm
 import strategy
 import tca
 from bingx import BingX, BingXError
@@ -71,8 +72,39 @@ _DEFAULTS = {
     "HEARTBEAT_HOURS": 12, "IDLE_ALERT_DAYS": 5, "ZOMBIE_ALERT_HOURS": 6, "BTC_CONTEXT": True, "FUNDING_ALERTS": True, "FUNDING_EXTREMO": 0.05,
     "FUNDING_ALERT_MIN": 120, "CARRY_MAX_DIAS_COBERTURA": 3.0, "SALDO_ESTIMADO": 135.0, "BTC_FILTER": False, "BTC_MIN_24H": -3.0,
     "TIMEFRAMES": ["5m"], "MIN_RISK_PCT": 0.0,
+    "PM_ENABLED": True, "PM_BASE": "BTC", "PM_REPORT_MIN": 180,
+    "PM_REFRESH_MIN": 15, "PM_BLOCK_ON_EVENT": False,
+    "PM_MIN_LIQUIDITY": 5000.0, "PM_MIN_VOLUME": 20000.0,
+    "PM_TRUST_LO": 0.15, "PM_TRUST_HI": 0.85, "PM_MIN_LADDER": 4,
+    "PM_EVENT_HOURS": 6.0, "PM_EVENT_LO": 0.20, "PM_EVENT_HI": 0.80,
+    "PM_VRP_HIGH": 1.25, "PM_VRP_LOW": 0.80, "PM_TIMEOUT": 12,
     "STATE_PATH": "/data/state_wavelet.json", "LOG_LEVEL": "INFO",
 }
+
+
+def _desde_entorno(nombre: str, valor):
+    """
+    Lee PM_* del entorno de Railway.
+
+    config.py no conoce estos ajustes, así que ensure_config les pondría el
+    valor por defecto y las variables del raw editor no harían nada. Esto
+    evita tener que tocar config.py: un archivo menos que coordinar.
+    """
+    bruto = os.getenv(nombre)
+    if bruto is None:
+        return valor
+    bruto = bruto.strip()
+    try:
+        if isinstance(valor, bool):
+            return bruto.lower() in ("1", "true", "yes", "si", "sí", "on")
+        if isinstance(valor, int):
+            return int(float(bruto))
+        if isinstance(valor, float):
+            return float(bruto)
+    except ValueError:
+        log.warning("%s='%s' no se pudo leer, se usa %r", nombre, bruto, valor)
+        return valor
+    return bruto
 
 
 def ensure_config() -> list[str]:
@@ -80,6 +112,8 @@ def ensure_config() -> list[str]:
     faltan = []
     for nombre, valor in _DEFAULTS.items():
         if not hasattr(config, nombre):
+            if nombre.startswith("PM_"):
+                valor = _desde_entorno(nombre, valor)
             setattr(config, nombre, valor)
             faltan.append(nombre)
     return faltan
@@ -106,6 +140,13 @@ def fmt_signal(sig: strategy.Signal, live: bool) -> str:
         partes.append(
             f"Funding {sig.funding:+.4f}%/8h — {funding.sesgo(sig.funding)}"
         )
+    snap = getattr(sig, "pm", None)
+    if snap and snap.get("ok") and snap.get("vrp"):
+        partes.append(
+            f"Polymarket VRP {snap['vrp']:.2f} — {pm.sesgo(snap)}"
+            + (f" · P(BTC sube) {snap['p_sube']:.0%}" if snap.get("p_sube") else "")
+            + (f" · ⏳ evento en {snap['evento_horas']:.1f}h" if snap.get("evento_activo") else "")
+        )
     return chr(10).join(partes)
 
 
@@ -131,6 +172,9 @@ class Bot:
         self._cuenta_ts = 0.0
         self.last_funding_alert = 0.0
         self.btc_ts = 0.0
+        self.pm_snap: dict = {}
+        self.pm_ts = 0.0
+        self.last_pm_alert = 0.0
         self.sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
         self.journal = journal.Journal(
             os.path.join(os.path.dirname(config.STATE_PATH) or "/data", "operaciones_wavelet.csv")
@@ -157,7 +201,11 @@ class Bot:
             + ("de CUENTA" if config.ACCOUNT_DAILY_LOSS else "por bot")
             + f" {config.MAX_DAILY_LOSS_R}R"
             + (f" · freno de drawdown al {config.DD_BRAKE_PCT}%"
-               if config.USE_DD_BRAKE else "")
+               if config.USE_DD_BRAKE else "") + chr(10)
+            + ("Polymarket: contexto ON"
+               + (" · freno por evento ACTIVO" if config.PM_BLOCK_ON_EVENT
+                  else " · freno por evento en REGISTRO")
+               if config.PM_ENABLED else "Polymarket apagado")
         )
         await self.refresh_symbols()
         while True:
@@ -165,6 +213,7 @@ class Bot:
                 await self.reconcile()
                 await self.maybe_watchlist()
                 await self.maybe_funding()
+                await self.maybe_polymarket()
                 await self.manage_open()
                 await self.maybe_daily_summary()
                 await self.maybe_idle_alert()
@@ -343,6 +392,58 @@ class Bot:
             )
         return True
 
+    async def maybe_polymarket(self) -> None:
+        """
+        Contexto de Polymarket: distribución implícita de BTC y ventanas de
+        evento macro. NO opera allí — con 1,80% de comisión taker y el
+        oráculo 2-5 s por detrás del exchange, ese libro no tiene nada que
+        tú no tengas antes y más barato. Lo que sí es gratis es LEERLO.
+
+        El refresco y el aviso van por separado a propósito: los datos se
+        quieren frescos para el gate, pero el mensaje cada tres horas.
+        """
+        if not config.PM_ENABLED:
+            return
+        if time.time() - self.pm_ts < config.PM_REFRESH_MIN * 60:
+            return
+        self.pm_ts = time.time()
+
+        velas = await self._velas("BTC-USDT")
+        if not velas:
+            log.info("Polymarket: sin velas de BTC, se pospone")
+            return
+        cierres = pm.cierres_de(velas)
+        snap = await pm.snapshot(config, spot=cierres[-1], cierres=cierres,
+                                 timeframe=config.TIMEFRAME, base=config.PM_BASE)
+        self.pm_snap = snap
+        if not snap.get("ok"):
+            log.warning("Polymarket: %s", snap.get("motivo"))
+            return
+        log.info("Polymarket: %d peldanos · VRP %.2f · evento %s",
+                 snap.get("peldanos", 0), snap.get("vrp", 0),
+                 snap.get("evento_horas") if snap.get("evento_activo") else "no")
+
+        if time.time() - self.last_pm_alert < config.PM_REPORT_MIN * 60:
+            return
+        self.last_pm_alert = time.time()
+        texto = pm.format_telegram(snap, config.PM_BASE)
+        if not config.PM_BLOCK_ON_EVENT:
+            texto += chr(10) + "<i>Freno por evento DESACTIVADO: solo registro.</i>"
+        await self.tg.send(texto)
+
+    def pm_bloquea(self) -> tuple[bool, str]:
+        """
+        Único punto donde Polymarket puede tocar una decisión, y SÓLO hacia
+        NO abrir. Nunca abre, nunca cambia el lado, nunca cambia el tamaño.
+        Con PM_BLOCK_ON_EVENT=false devuelve siempre (False, "").
+        """
+        if not config.PM_ENABLED or not config.PM_BLOCK_ON_EVENT:
+            return False, ""
+        s = self.pm_snap
+        if not s.get("ok") or not s.get("evento_activo"):
+            return False, ""
+        return True, f"evento macro en {s.get('evento_horas', 0):.1f} h"
+
     async def _velas(self, sym: str, tf: str | None = None) -> list[dict] | None:
         async with self.sem:
             try:
@@ -356,6 +457,17 @@ class Bot:
         btc = await self.contexto_btc()
         if config.BTC_FILTER and btc is not None and btc < config.BTC_MIN_24H:
             log.info("BTC %.1f%% en 24h: por debajo del mínimo, no se abre", btc)
+            return
+
+        pm_stop, pm_motivo = self.pm_bloquea()
+        if pm_stop:
+            log.info("Sin aperturas: %s", pm_motivo)
+            if self.aviso_en_frio("bot", "pm_evento"):
+                await self.tg.send(
+                    f"⏳ <b>Aperturas en pausa</b> · {pm_motivo}" + chr(10)
+                    + f"<i>{str(self.pm_snap.get('evento'))[:110]}</i>" + chr(10)
+                    + "<i>Las posiciones abiertas no se tocan: solo no se abren nuevas.</i>"
+                )
             return
 
         await self.actualizar_freno()
@@ -417,6 +529,7 @@ class Bot:
             sig.timeframe = tf_señal
             sig.btc_24h = btc
             sig.funding = self.funding.get(sym)
+            sig.pm = self.pm_snap or None
             senales.append(sig)
 
         # RANKING. Con 400 símbolos y un hueco, ejecutar la primera que
@@ -1002,6 +1115,9 @@ class Bot:
                      f"{config.RISK_PCT * self.riesgo_factor:.2f}%")
         if self.cuenta_r_hoy is not None:
             extra += f"\nCuenta hoy: {self.cuenta_r_hoy:+.2f} R (todos los bots)"
+        if self.pm_snap.get("ok") and self.pm_snap.get("vrp"):
+            extra += (f"\n🔮 Polymarket VRP {self.pm_snap['vrp']:.2f} "
+                      f"({pm.sesgo(self.pm_snap)})")
         await self.tg.send(
             f"📊 <b>Resumen diario · Wavelet MRA</b> · {hoy}\n{config.describe()}\n\n"
             f"{self.stats_text()}\nUniverso: {len(self.symbols)} símbolos" + extra
