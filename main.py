@@ -182,8 +182,16 @@ class Bot:
 
     async def start(self) -> None:
         faltan = ensure_config()
-        if faltan:
-            log.error("config.py desactualizado, faltaban: %s", ", ".join(faltan))
+        # Los PM_* NUNCA están en config.py: se inyectan a propósito para no
+        # tener que coordinar un archivo más. Sacarlos por ERROR entrena a
+        # ignorar los ERROR de verdad, que es como se pierde el que importa.
+        pm_faltan = [n for n in faltan if n.startswith("PM_")]
+        otros = [n for n in faltan if not n.startswith("PM_")]
+        if pm_faltan:
+            log.info("Polymarket: %d ajustes desde _DEFAULTS/entorno "
+                     "(esperado, no es un fallo)", len(pm_faltan))
+        if otros:
+            log.error("config.py desactualizado, faltaban: %s", ", ".join(otros))
         log.info("Modo: %s", config.describe())
         await self.tg.send(
             "🤖 <b>Bot Wavelet MRA iniciado</b>" + chr(10)
