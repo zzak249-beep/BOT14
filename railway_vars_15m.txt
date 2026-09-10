@@ -1,0 +1,123 @@
+# ═══════════════════════════════════════════════════════════════════
+# renewed-love · 15m · MODO SEÑAL
+#
+# 15m NO es una preferencia: es lo único que aguantó el backtest de hoy.
+# El filtro de amplitud descartaba el 95% de las velas en 3m, el 88-98%
+# en 5m, y el 56-67% en 15m. Por debajo de 15m no hay recorrido que
+# pague la comisión en símbolos mayores.
+# ═══════════════════════════════════════════════════════════════════
+
+MODE=SIGNAL
+LIVE_CONFIRMED=false
+BINGX_API_KEY=
+BINGX_API_SECRET=
+BINGX_BASE_URL=https://open-api.bingx.com
+TELEGRAM_TOKEN=PON_AQUI_TU_TOKEN
+TELEGRAM_CHAT_ID=PON_AQUI_TU_CHAT_ID
+STATE_PATH=/data/state_15m.json
+LOG_LEVEL=INFO
+RECV_WINDOW=5000
+
+# ── Temporalidad ───────────────────────────────────────────────────
+TIMEFRAME=15m
+TIMEFRAMES=15m
+SCAN_INTERVAL_SEC=60
+
+# ── Coste ──────────────────────────────────────────────────────────
+# 0.07 = maker 0.02 (entrada limitada post-only) + taker 0.05 (el stop
+# es orden a mercado, siempre). Comprueba tus tarifas reales en el
+# centro de tarifas de BingX antes de fiarte de este número.
+COST_ROUNDTRIP_PCT=0.07
+FEE_MAKER_PCT=0.02
+FEE_TAKER_PCT=0.05
+POST_ONLY=true
+ENTRY_TYPE=LIMIT
+LIMIT_OFFSET_PCT=0.05
+LIMIT_TTL_MIN=8
+USE_TCA=true
+MIN_TCA_SAMPLES=10
+TCA_BLACKLIST_MULT=2.0
+
+# ── Amplitud: el filtro que de verdad corta ────────────────────────
+# 0.23 NO es un valor elegido: sale de la aritmética.
+#   MIN_ATR_PCT = coste% / (SL_ATR x MAX_COST_IN_R) = 0.07/(1.5x0.20)
+# Por debajo, la comisión se lleva más del 20% de cada R por
+# definición. MIN_COST_COVER=3.3 exige lo mismo, para que no sea ESE
+# el que corte sin que te enteres.
+MIN_ATR_PCT=0.23
+MIN_COST_COVER=3.3
+MAX_COST_IN_R=0.20
+MAX_RISK_PCT=4.0
+MIN_RISK_PCT=0.0
+MIN_QUOTE_VOLUME_24H=5000000
+
+# ── Motor ──────────────────────────────────────────────────────────
+MRA_LEVELS=4
+CROSS_SOURCE=trend
+LOOKBACK_ENERGY=40
+APPROX_LEN=8
+ATR_LEN=14
+NORMALIZE_SCALES=true
+DOMINANCE_THRESHOLD=1.30
+USE_PERSISTENCE=true
+MIN_PERSISTENCE=0.60
+USE_VOL_FILTER=true
+VOL_LEN=20
+VOL_MULT=1.2
+USE_HTF_FILTER=true
+HTF_MA_LEN=200
+ALLOW_LONG=true
+ALLOW_SHORT=true
+
+# ── Salidas ────────────────────────────────────────────────────────
+SL_ATR=1.5
+TP_ATR=2.5
+MAX_TRADE_MINUTES=120
+USE_TIME_EXIT=true
+TIME_EXIT_ONLY_LOSING=true
+USE_TRAILING=false
+COOLDOWN_BARS=4
+
+# ── Riesgo (200 USDT en cuenta) ────────────────────────────────────
+# RISK_PCT=0.5 son 1.00 USDT por operación. Suena poco y es correcto:
+# ahora mismo lo que hace falta es muestra, no resultado.
+# LEVERAGE=5 no sube el riesgo -- este bot no divide por el
+# apalancamiento. Solo libera margen: 28 USDT por posición en vez de
+# 69, para que quepan dos sin volver al rechazo 101204.
+RISK_PCT=0.5
+LEVERAGE=5
+MARGIN_MODE=ISOLATED
+MAX_CONCURRENT=1
+MAX_TOTAL_POSITIONS=2
+MAX_CONSECUTIVE_LOSSES=3
+COOLDOWN_MINUTES=120
+MAX_DAILY_LOSS_R=3.0
+ACCOUNT_DAILY_LOSS=true
+RANK_CANDIDATES=true
+USE_DD_BRAKE=true
+DD_BRAKE_PCT=10.0
+DD_RESUME_PCT=5.0
+DD_BRAKE_FACTOR=0.5
+
+# ── Universo ───────────────────────────────────────────────────────
+MAX_SYMBOLS=400
+SCAN_CONCURRENCY=8
+EXCLUDE_PREFIXES=NC
+SYMBOL_WHITELIST=
+
+# ── Avisos ─────────────────────────────────────────────────────────
+SIGNAL_COOLDOWN_MIN=30
+WATCHLIST_MIN=60
+DAILY_SUMMARY=true
+DAILY_SUMMARY_HOUR_UTC=7
+HEARTBEAT_HOURS=12
+IDLE_ALERT_DAYS=5
+ZOMBIE_ALERT_HOURS=6
+BTC_CONTEXT=true
+BTC_FILTER=false
+BTC_MIN_24H=-3.0
+FUNDING_ALERTS=true
+FUNDING_EXTREMO=0.05
+FUNDING_ALERT_MIN=120
+CARRY_MAX_DIAS_COBERTURA=3.0
+SALDO_ESTIMADO=200

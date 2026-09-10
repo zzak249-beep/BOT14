@@ -43,14 +43,25 @@ import strategy
 
 # Combinaciones a probar. Pocas y con sentido, no una rejilla enorme:
 # cuantas más pruebas, más fácil encontrar un ganador por azar.
-CLAVES = ("DOMINANCE_THRESHOLD", "SL_ATR", "TP_ATR")
+# MIN_ATR_PCT ESTÁ AQUÍ POR UN MOTIVO MEDIDO. El embudo de 15m dice que
+# el filtro de amplitud descarta el 56-67% de las velas y la dominancia
+# el 30-44% de lo que queda. Barrer DOMINANCE_THRESHOLD sin tocar
+# MIN_ATR_PCT es mover la segunda puerta mientras la primera sigue
+# cerrada: las seis combinaciones chocan contra la misma pared y dan
+# 0 operaciones idénticas.
+#
+# El suelo de MIN_ATR_PCT no es libre: sale de la aritmética del coste.
+#     MIN_ATR_PCT = coste% / (SL_ATR x MAX_COST_IN_R)
+# Con coste 0.07 y stop 1.5xATR eso es 0.23%. Por debajo, la comisión se
+# lleva más del 20% de cada R por definición, no por mala suerte.
+CLAVES = ("MIN_ATR_PCT", "DOMINANCE_THRESHOLD", "SL_ATR")
 COMBINACIONES = [
-    (1.30, 1.5, 2.5),   # actual
-    (1.00, 1.5, 2.5),   # umbral más permisivo
-    (1.60, 1.5, 2.5),   # más exigente
-    (1.30, 1.0, 2.0),   # stop y objetivo más cortos
-    (1.30, 2.0, 3.5),   # más anchos
-    (1.30, 1.5, 4.0),   # dejar correr más
+    (0.23, 1.30, 1.5),   # suelo del coste, resto actual
+    (0.23, 1.00, 1.5),   # dominancia permisiva
+    (0.23, 1.60, 1.5),   # dominancia exigente
+    (0.35, 1.30, 1.5),   # amplitud exigente
+    (0.15, 1.30, 1.5),   # por DEBAJO del suelo: para VER lo que cuesta
+    (0.23, 1.30, 2.0),   # stop más ancho -> menos coste en R
 ]
 
 
@@ -95,7 +106,7 @@ async def main() -> int:
         print("Sin datos.")
         return 1
 
-    print(f"\n{CLAVES[0][:6]:>6} {CLAVES[1][:5]:>5} {CLAVES[2][:8]:>8} │ {'PRIMERA mitad':>22} │ {'SEGUNDA mitad':>22} │")
+    print(f"\n{'ATR%':>6} {'DOMIN':>6} {'SL_ATR':>7} │ {'PRIMERA mitad':>22} │ {'SEGUNDA mitad':>22} │")
     print(f"{'':>6} {'':>5} {'':>8} │ {'(se elige aquí)':>22} │ {'(se comprueba aquí)':>22} │")
     print("─" * 78)
 
@@ -110,7 +121,14 @@ async def main() -> int:
         e1, n1 = evaluar(velas_por_symbol, "primera")
         e2, n2 = evaluar(velas_por_symbol, "segunda")
 
-        if n1 < 10 or n2 < 10:
+        # SIN MUESTRA NO ES LO MISMO QUE SIN VENTAJA. Antes las dos
+        # cosas acababan en el mismo veredicto final ("la estrategia no
+        # tiene ventaja"), y con 0 operaciones eso es afirmar algo que
+        # los datos no dicen: es ausencia de evidencia, no evidencia de
+        # ausencia.
+        if n1 == 0 and n2 == 0:
+            marca = "SIN MUESTRA"
+        elif n1 < 10 or n2 < 10:
             marca = "pocas ops"
         elif e1 > 0 and e2 > 0:
             marca = "✓ AGUANTA"
@@ -121,18 +139,38 @@ async def main() -> int:
 
         filas.append((cover, er, stretch, e1, n1, e2, n2, marca))
         print(
-            f"{cover:>6} {er:>5.2f} {stretch:>8.1f} │ "
+            f"{cover:>6.2f} {er:>6.2f} {stretch:>7.1f} │ "
             f"{e1:+7.3f} R  ({n1:>4} ops) │ "
             f"{e2:+7.3f} R  ({n2:>4} ops) │  {marca}"
         )
 
     print("─" * 78)
     aguantan = [f for f in filas if f[7] == "✓ AGUANTA"]
-    if not aguantan:
+    sin_muestra = [f for f in filas if f[7] in ("SIN MUESTRA", "pocas ops")]
+
+    if len(sin_muestra) == len(filas):
+        # Todas sin muestra: el barrido NO puede concluir nada.
+        ops = sum(f[4] + f[6] for f in filas)
+        print(f"\nNINGUNA combinación llegó a 10 operaciones por mitad "
+              f"({ops} en total).")
+        print("Eso NO significa que la estrategia no tenga ventaja: significa")
+        print("que aquí no hay con qué medirla. Ausencia de evidencia no es")
+        print("evidencia de ausencia.")
+        print("\nDos causas posibles, y se distinguen mirando el embudo del")
+        print("backtest en estos mismos símbolos:")
+        print("  · si domina «sin amplitud», el filtro de coste corta ANTES")
+        print("    que todo lo que este barrido mueve")
+        print("  · si el embudo está repartido, es que faltan símbolos: la")
+        print("    estrategia es muy selectiva y en tres no dispara")
+        print("\nCon 45 días partidos en dos son 22 por mitad. Si la tasa")
+        print("medida es 1 señal cada 45 días en 3 símbolos, harían falta")
+        print("450 días por mitad -- o los 200 símbolos que ya vigila el bot.")
+    elif not aguantan:
         print("\nNINGUNA combinación aguanta las dos mitades.")
-        print("La respuesta honesta no es seguir bajando umbrales: es que")
-        print("en estos símbolos y este periodo la estrategia no tiene")
-        print("ventaja. Aflojar solo produciría más operaciones perdedoras.")
+        print("Con muestra suficiente y resultado negativo en las dos, la")
+        print("respuesta honesta no es seguir bajando umbrales: es que en")
+        print("estos símbolos y este periodo la estrategia no tiene ventaja.")
+        print("Aflojar solo produciría más operaciones perdedoras.")
     else:
         # Se elige la de MÁS OPERACIONES entre las que aguantan, no la de
         # mejor expectativa: con muestras pequeñas la mejor expectativa
