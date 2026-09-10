@@ -1,0 +1,102 @@
+# ── SCALPING 3m · renewed-love ──────────────────────────────────────
+# Arranca en SIGNAL. El coste manda: en 3m con stop 1.5xATR la comisión
+# se lleva 0.10 R en maker+taker y 0.14 R en taker+taker.
+MODE=SIGNAL
+LIVE_CONFIRMED=false
+BINGX_API_KEY=
+BINGX_API_SECRET=
+TELEGRAM_TOKEN=${{TELEGRAM_BOT_TOKEN}}
+TELEGRAM_CHAT_ID=PON_AQUI_TU_CHAT_ID
+STATE_PATH=/data/state_scalp3m.json
+
+# ── Temporalidad ────────────────────────────────────────────────────
+TIMEFRAME=3m
+TIMEFRAMES=3m
+SCAN_INTERVAL_SEC=45
+
+# ── Coste: LO PRIMERO ───────────────────────────────────────────────
+# 0.07 = maker 0.02 (entrada limitada) + taker 0.05 (el stop es a mercado)
+COST_ROUNDTRIP_PCT=0.07
+FEE_MAKER_PCT=0.02
+FEE_TAKER_PCT=0.05
+POST_ONLY=true
+ENTRY_TYPE=LIMIT
+# En 3m una limitada que tarda 10 min en llenarse ya no responde a la
+# señal que la generó.
+LIMIT_OFFSET_PCT=0.03
+LIMIT_TTL_MIN=3
+USE_TCA=true
+MIN_TCA_SAMPLES=10
+TCA_BLACKLIST_MULT=2.0
+
+# ── Amplitud mínima ─────────────────────────────────────────────────
+# MIN_ATR_PCT=0.35 sale de la aritmética: con stop 1.5xATR y coste
+# 0.07%, hace falta ese ATR para que el coste no pase de 0.20 R.
+MIN_ATR_PCT=0.35
+MIN_COST_COVER=5.0
+MAX_COST_IN_R=0.20
+MAX_RISK_PCT=3.0
+MIN_RISK_PCT=0.30
+MIN_QUOTE_VOLUME_24H=5000000
+
+# ── Motor ───────────────────────────────────────────────────────────
+MRA_LEVELS=4
+CROSS_SOURCE=trend
+LOOKBACK_ENERGY=40
+APPROX_LEN=8
+ATR_LEN=14
+NORMALIZE_SCALES=true
+DOMINANCE_THRESHOLD=1.30
+USE_PERSISTENCE=true
+MIN_PERSISTENCE=0.60
+USE_VOL_FILTER=true
+VOL_LEN=20
+VOL_MULT=1.2
+# El filtro de temporalidad superior con 200 velas de 3m son 10 horas.
+USE_HTF_FILTER=true
+HTF_MA_LEN=200
+ALLOW_LONG=true
+ALLOW_SHORT=true
+
+# ── Salidas ─────────────────────────────────────────────────────────
+SL_ATR=1.5
+TP_ATR=2.5
+# 45 min = 15 velas de 3m. Con 120 estarías midiendo otro fenómeno.
+MAX_TRADE_MINUTES=45
+USE_TIME_EXIT=true
+TIME_EXIT_ONLY_LOSING=true
+USE_TRAILING=false
+COOLDOWN_BARS=4
+
+# ── Riesgo ──────────────────────────────────────────────────────────
+RISK_PCT=0.5
+MAX_CONCURRENT=1
+MAX_TOTAL_POSITIONS=2
+LEVERAGE=2
+MARGIN_MODE=ISOLATED
+MAX_CONSECUTIVE_LOSSES=3
+COOLDOWN_MINUTES=90
+MAX_DAILY_LOSS_R=2.0
+
+# ── Universo ────────────────────────────────────────────────────────
+MAX_SYMBOLS=200
+SCAN_CONCURRENCY=8
+EXCLUDE_PREFIXES=NC
+SYMBOL_WHITELIST=
+
+# ── Avisos ──────────────────────────────────────────────────────────
+SIGNAL_COOLDOWN_MIN=30
+WATCHLIST_MIN=60
+DAILY_SUMMARY=true
+DAILY_SUMMARY_HOUR_UTC=7
+HEARTBEAT_HOURS=12
+IDLE_ALERT_DAYS=3
+ZOMBIE_ALERT_HOURS=3
+BTC_CONTEXT=true
+BTC_FILTER=false
+FUNDING_ALERTS=true
+FUNDING_EXTREMO=0.05
+FUNDING_ALERT_MIN=180
+SALDO_ESTIMADO=10
+RECV_WINDOW=5000
+LOG_LEVEL=INFO

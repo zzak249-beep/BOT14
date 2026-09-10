@@ -119,22 +119,6 @@ USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
 TIME_EXIT_ONLY_LOSING = _bool("TIME_EXIT_ONLY_LOSING", True)
 
 # ── Coste y liquidez ──────────────────────────────────────────────────
-# ── Coste: comisiones separadas y TCA ─────────────────────────────────
-# Una limitada POST-ONLY nunca cruza el spread, así que la entrada paga
-# comisión MAKER. Sin post-only, una limitada que cruza se ejecuta como
-# taker y pagas la tarifa alta sin enterarte. La salida (SL/TP son
-# STOP_MARKET) siempre es taker.
-POST_ONLY = _bool("POST_ONLY", True)
-FEE_MAKER_PCT = _float("FEE_MAKER_PCT", 0.02)
-FEE_TAKER_PCT = _float("FEE_TAKER_PCT", 0.05)
-
-# Coste medido por símbolo a partir del diario, en vez de una constante
-# para los 400. Con menos de MIN_TCA_SAMPLES operaciones se usa la
-# estimación: tres fills no son una medición.
-USE_TCA = _bool("USE_TCA", True)
-MIN_TCA_SAMPLES = _int("MIN_TCA_SAMPLES", 10)
-TCA_BLACKLIST_MULT = _float("TCA_BLACKLIST_MULT", 2.0)
-
 COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
 MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
 MIN_COST_COVER = _float("MIN_COST_COVER", 6.0)
@@ -162,30 +146,29 @@ MARGIN_MODE = os.getenv("MARGIN_MODE", "ISOLATED").strip().upper()
 MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
 COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 120)
 MAX_DAILY_LOSS_R = _float("MAX_DAILY_LOSS_R", 3.0)
-# El límite diario aplicado a TODA LA CUENTA, no solo a este bot. Con
-# dos bots en real sobre la misma cuenta, un límite por bot permite
-# perder el doble de lo declarado sin que ninguno se pare.
-ACCOUNT_DAILY_LOSS = _bool("ACCOUNT_DAILY_LOSS", True)
-
-# ── Freno de drawdown ─────────────────────────────────────────────────
-# Sin throttle se compone el error: en drawdown se sigue arriesgando el
-# mismo porcentaje de un capital menor. Al superar DD_BRAKE_PCT desde el
-# pico, el riesgo se multiplica por DD_BRAKE_FACTOR y no se restaura
-# hasta recuperar hasta DD_RESUME_PCT.
-USE_DD_BRAKE = _bool("USE_DD_BRAKE", True)
-DD_BRAKE_PCT = _float("DD_BRAKE_PCT", 10.0)
-DD_RESUME_PCT = _float("DD_RESUME_PCT", 5.0)
-DD_BRAKE_FACTOR = _float("DD_BRAKE_FACTOR", 0.5)
-
-# ── Ranking de candidatos ─────────────────────────────────────────────
-# Con 400 símbolos y un hueco, ejecutar la PRIMERA señal que dispara
-# hace que el orden del universo decida qué operas: azar disfrazado de
-# sistema. Se recogen todas las del ciclo y se ejecuta la mejor.
-RANK_CANDIDATES = _bool("RANK_CANDIDATES", True)
 COOLDOWN_BARS = _int("COOLDOWN_BARS", 4)
 ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
 LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
 LIMIT_TTL_MIN = _int("LIMIT_TTL_MIN", 10)
+
+# ── Coste de ejecución (tca.py) ───────────────────────────────────────
+# Comisiones REALES de BingX en perpetuos, nivel VIP0. La salida es
+# siempre taker porque el stop y el objetivo son órdenes a mercado; solo
+# la entrada puede ser maker, y solo si la limitada no cruza el spread.
+# Comprueba tus tarifas en el centro de tarifas de BingX: con código de
+# referido bajan un 20% (0.016 / 0.040).
+FEE_MAKER_PCT = _float("FEE_MAKER_PCT", 0.02)
+FEE_TAKER_PCT = _float("FEE_TAKER_PCT", 0.05)
+# POST_ONLY hace que BingX RECHACE la limitada si fuera a cruzar el
+# spread, en vez de ejecutarla como taker. main.py ya trata ese rechazo
+# como caso normal y no como error.
+POST_ONLY = _bool("POST_ONLY", True)
+# TCA: mide el deslizamiento REAL por símbolo con el diario y descarta
+# los que cuestan más de TCA_BLACKLIST_MULT veces la comisión teórica.
+# Es el único filtro que un backtest no puede darte.
+USE_TCA = _bool("USE_TCA", True)
+MIN_TCA_SAMPLES = _int("MIN_TCA_SAMPLES", 10)
+TCA_BLACKLIST_MULT = _float("TCA_BLACKLIST_MULT", 2.0)
 
 # ── Avisos ────────────────────────────────────────────────────────────
 SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)

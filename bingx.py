@@ -188,58 +188,13 @@ class BingX:
         return rows
 
     # ── privado ───────────────────────────────────────────────────────
-    async def cuenta(self) -> dict:
-        """
-        Foto de la cuenta en UNA llamada: disponible y patrimonio.
-
-        LA DISTINCIÓN NO ES COSMÉTICA. availableMargin es el margen
-        LIBRE: baja al abrir una posición porque el margen queda
-        bloqueado, aunque no hayas perdido nada. Usarlo como "saldo"
-        hace que cualquier medida de drawdown se dispare sola en cuanto
-        hay una posición abierta — con un stop del 2%, apalancamiento 2
-        y riesgo 0.5%, el margen bloqueado es el 12.5% del capital y un
-        freno del 10% salta en falso a la primera operación.
-
-        equity = balance realizado + PnL no realizado. Es lo que hay que
-        usar para drawdown y para dimensionar.
-
-        Devuelve {'disponible': x, 'equity': y}.
-        """
+    async def balance_usdt(self) -> float:
         data = await self._private("GET", "/openApi/swap/v2/user/balance")
-        bal = data
         if isinstance(data, dict):
             bal = data.get("balance", data)
-        if isinstance(bal, list):
-            bal = bal[0] if bal else {}
-        if not isinstance(bal, dict):
-            return {"disponible": 0.0, "equity": 0.0}
-
-        def _f(*claves):
-            for k in claves:
-                v = bal.get(k)
-                if v not in (None, ""):
-                    try:
-                        return float(v)
-                    except (TypeError, ValueError):
-                        continue
-            return 0.0
-
-        disponible = _f("availableMargin", "availableBalance", "balance")
-        equity = _f("equity")
-        if equity <= 0:
-            # Sin campo equity: reconstruirlo. NUNCA caer en availableMargin.
-            equity = _f("balance", "walletBalance") + _f("unrealizedProfit", "unrealizedPNL")
-        if equity <= 0:
-            equity = disponible
-        return {"disponible": disponible, "equity": equity}
-
-    async def balance_usdt(self) -> float:
-        """Margen DISPONIBLE. Para saber si cabe una orden, no para medir drawdown."""
-        return (await self.cuenta())["disponible"]
-
-    async def equity_usdt(self) -> float:
-        """Patrimonio real. Esto es lo que se usa para drawdown y sizing."""
-        return (await self.cuenta())["equity"]
+            if isinstance(bal, dict):
+                return float(bal.get("availableMargin", bal.get("balance", 0)) or 0)
+        return 0.0
 
     async def set_margin_mode(self, symbol: str, modo: str = "ISOLATED") -> None:
         """
@@ -307,12 +262,6 @@ class BingX:
         precio que le quede al libro.
         """
         position_side = "LONG" if side == "BUY" else "SHORT"
-        # POST-ONLY: la orden se RECHAZA si cruzaría el spread, en vez de
-        # ejecutarse como taker. Sin esto, una limitada agresiva paga la
-        # comisión alta sin que te enteres, y el coste que asume la
-        # estrategia deja de ser el coste real. Un rechazo por post-only
-        # no es un error: es la orden negándose a pagar de más.
-        tif = "PostOnly" if config.POST_ONLY else "GTC"
         return await self._private(
             "POST",
             "/openApi/swap/v2/trade/order",
@@ -323,7 +272,15 @@ class BingX:
                 "type": "LIMIT",
                 "price": price,
                 "quantity": quantity,
-                "timeInForce": tif,
+                # GTC NO garantiza maker: una limitada GTC que cruza el
+                # spread se ejecuta al instante y paga TAKER. Con
+                # POST_ONLY el exchange la RECHAZA en vez de cruzarla,
+                # que es exactamente lo que main.py ya sabe manejar
+                # (busca "immediately match" en el except de BingXError).
+                # En scalping esto no es un matiz: maker+taker cuesta
+                # 0.07% e ida y vuelta en taker 0.10%, un 43% más.
+                "timeInForce": ("PostOnly" if getattr(config, "POST_ONLY", True)
+                                else "GTC"),
                 "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
                 "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl,
                 "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp,
@@ -388,43 +345,6 @@ class BingX:
         except Exception:  # noqa: BLE001
             pass
         return False
-
-    async def realized_pnl_hoy(self) -> float | None:
-        """
-        PnL REALIZADO de toda la cuenta desde las 00:00 UTC, en USDT.
-
-        Incluye lo que hayan cerrado OTROS bots sobre la misma cuenta.
-        Es la única forma de aplicar un límite de pérdida diaria real
-        sin que los bots se comuniquen entre sí: un límite por bot deja
-        que dos pierdan el doble de lo declarado.
-
-        Devuelve None si el endpoint no responde — en ese caso el bot
-        cae al contador propio en vez de quedarse sin freno.
-        """
-        import datetime as _dt
-        inicio = int(_dt.datetime.now(_dt.timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-        try:
-            data = await self._private(
-                "GET", "/openApi/swap/v2/user/income",
-                {"startTime": inicio, "limit": 1000},
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("No se pudo leer el PnL de la cuenta: %s", exc)
-            return None
-        if isinstance(data, dict):
-            data = data.get("income", data.get("data", []))
-        if not isinstance(data, list):
-            return None
-        total = 0.0
-        for x in data:
-            tipo = str(x.get("incomeType", "")).upper()
-            if tipo in ("REALIZED_PNL", "REALIZEDPNL", "COMMISSION", "FUNDING_FEE"):
-                try:
-                    total += float(x.get("income", 0) or 0)
-                except (TypeError, ValueError):
-                    continue
-        return total
 
     async def open_positions(self) -> list[dict]:
         data = await self._private("GET", "/openApi/swap/v2/user/positions")
