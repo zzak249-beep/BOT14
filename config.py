@@ -151,6 +151,25 @@ ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
 LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
 LIMIT_TTL_MIN = _int("LIMIT_TTL_MIN", 10)
 
+# ── Freno de drawdown y límites de cuenta ─────────────────────────────
+# main.py los usa y config.py no los declaraba: caían a los _DEFAULTS
+# del propio main, así que NO se podían tocar desde Railway. El freno de
+# drawdown es el que multiplica el tamaño por DD_BRAKE_FACTOR cuando la
+# cuenta cae — no poder ajustarlo desde fuera es justo lo contrario de
+# lo que hace falta en una racha mala.
+USE_DD_BRAKE = _bool("USE_DD_BRAKE", True)
+DD_BRAKE_PCT = _float("DD_BRAKE_PCT", 10.0)
+DD_RESUME_PCT = _float("DD_RESUME_PCT", 5.0)
+DD_BRAKE_FACTOR = _float("DD_BRAKE_FACTOR", 0.5)
+# Límite diario medido sobre TODA la cuenta, no solo sobre este bot: con
+# varios bots compartiendo saldo, un tope "por bot" permite perder el
+# múltiplo de lo declarado sin que ninguno se pare.
+ACCOUNT_DAILY_LOSS = _bool("ACCOUNT_DAILY_LOSS", True)
+# Con un hueco y varias señales por ciclo, ejecutar la primera hace que
+# decida el ORDEN DEL UNIVERSO. Ordena por coste, que es el único
+# término cierto.
+RANK_CANDIDATES = _bool("RANK_CANDIDATES", True)
+
 # ── Coste de ejecución (tca.py) ───────────────────────────────────────
 # Comisiones REALES de BingX en perpetuos, nivel VIP0. La salida es
 # siempre taker porque el stop y el objetivo son órdenes a mercado; solo
