@@ -20,10 +20,22 @@ coste, sin REQUIRE_ST_BULL, sin el tope de riesgo. Aquí no hay esa
 distancia: lo que mides es exactamente lo que opera.
 
 DE DÓNDE SALEN LOS DATOS
-Binance Futures, endpoint público de klines. Sin API key, sin cuenta,
-sin límite práctico de histórico. La mayoría de perpetuos de BingX
-cotizan también allí con el mismo nombre sin guion (ZEC-USDT →
-ZECUSDT). Si un símbolo no existe en Binance, se avisa y se salta.
+BingX, endpoint público de klines. Sin API key, sin cuenta.
+
+ANTES ERA BINANCE, y estaba mal por dos motivos:
+
+  1. Binance devuelve HTTP 451 desde los servidores de Railway
+     ("Service unavailable from a restricted location"), así que el
+     backtest no se podía correr donde vive el bot.
+
+  2. Y es un fallo de método aunque funcionara: tú operas en BingX.
+     Medir con precios de Binance mete basis y, sobre todo, HUECOS —
+     los perpetuos que solo cotizan en BingX se descartaban en silencio
+     como "sin datos", y son justo los de cola larga que el universo
+     ALL incluye. Eso sesga el resultado hacia las monedas grandes.
+
+El precio a pagar: BingX da menos histórico que Binance. Si pides 180
+días y solo devuelve 60, el script lo dice en vez de callarse.
 
 LO QUE ESTO NO ARREGLA
 El deslizamiento sigue siendo una estimación, y el backtest supone que
@@ -42,7 +54,9 @@ import httpx
 import config
 import strategy
 
-BINANCE_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+BINGX_KLINES = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
+# BingX sirve como mucho 1440 velas por llamada.
+MAX_POR_LLAMADA = 1440
 MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
       "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
 
@@ -68,38 +82,85 @@ class Result:
     descartes: dict[str, int] = field(default_factory=dict)
 
 
+def _fila(k) -> dict | None:
+    """BingX devuelve dicts o listas según versión; se aceptan las dos.
+    OJO: en la respuesta real 'close' va ANTES que 'high', así que se
+    parsea por NOMBRE y nunca por posición."""
+    try:
+        if isinstance(k, dict):
+            return {"time": int(k.get("time", k.get("open_time", 0))),
+                    "open": float(k["open"]), "high": float(k["high"]),
+                    "low": float(k["low"]), "close": float(k["close"]),
+                    "volume": float(k.get("volume", 0) or 0)}
+        return {"time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]),
+                "volume": float(k[5]) if len(k) > 5 else 0.0}
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
 async def download(client: httpx.AsyncClient, symbol: str, interval: str, days: int) -> list[dict]:
-    """Descarga paginando hacia atrás. Binance da 1500 velas por llamada."""
-    binance_sym = symbol.replace("-", "").upper()
+    """
+    Descarga paginando hacia atrás desde BingX, el MISMO exchange donde
+    opera el bot. Sin claves: es el endpoint público.
+
+    Se para sola si BingX deja de devolver velas más antiguas, y avisa
+    de cuántos días ha conseguido de verdad — callarlo haría comparar
+    periodos distintos entre símbolos sin que se note.
+    """
     paso = MS.get(interval, 300_000)
     total = int(days * 24 * 60 * 60 * 1000 / paso)
     fin = int(time.time() * 1000)
     velas: list[dict] = []
+    vacios = 0
 
     while len(velas) < total:
-        faltan = min(1500, total - len(velas))
+        faltan = min(MAX_POR_LLAMADA, total - len(velas))
         inicio = fin - faltan * paso
-        r = await client.get(
-            BINANCE_KLINES,
-            params={"symbol": binance_sym, "interval": interval,
-                    "startTime": inicio, "endTime": fin, "limit": faltan},
-            timeout=30,
-        )
+        try:
+            r = await client.get(
+                BINGX_KLINES,
+                params={"symbol": symbol, "interval": interval,
+                        "startTime": inicio, "endTime": fin, "limit": faltan},
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not velas:
+                raise RuntimeError(f"{symbol}: {exc}") from exc
+            break
         if r.status_code != 200:
             if not velas:
-                raise RuntimeError(f"{binance_sym}: {r.status_code} {r.text[:120]}")
+                raise RuntimeError(f"{symbol}: HTTP {r.status_code} {r.text[:120]}")
             break
-        datos = r.json()
-        if not datos:
+        cuerpo = r.json()
+        if isinstance(cuerpo, dict) and str(cuerpo.get("code", 0)) not in ("0", "None"):
+            if not velas:
+                raise RuntimeError(f"{symbol}: code={cuerpo.get('code')} {cuerpo.get('msg')}")
             break
-        lote = [{"time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-                 "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
-                for k in datos]
-        velas = lote + velas
+        datos = cuerpo.get("data") if isinstance(cuerpo, dict) else cuerpo
+        lote = [x for x in (_fila(k) for k in (datos or [])) if x]
+        if not lote:
+            vacios += 1
+            if vacios >= 2:      # BingX ya no tiene más histórico
+                break
+            fin = inicio - 1
+            await asyncio.sleep(0.2)
+            continue
+        vacios = 0
+        lote.sort(key=lambda v: v["time"])
+        # Sin deduplicar, un solape entre páginas mete la misma vela dos
+        # veces y el motor la evalúa como si fueran dos barras distintas.
+        conocidos = {v["time"] for v in velas}
+        velas = [x for x in lote if x["time"] not in conocidos] + velas
         fin = lote[0]["time"] - 1
-        await asyncio.sleep(0.15)  # cortesía con el endpoint público
+        await asyncio.sleep(0.2)   # cortesía con el endpoint público
 
     velas.sort(key=lambda v: v["time"])
+    if velas:
+        dias_reales = (velas[-1]["time"] - velas[0]["time"]) / 86_400_000
+        if dias_reales < days * 0.8:
+            print(f"  {symbol}: BingX solo dio {dias_reales:.0f} días de los "
+                  f"{days} pedidos ({len(velas)} velas)")
     return velas
 
 
@@ -291,7 +352,8 @@ async def main() -> int:
     days = int(sys.argv[3]) if len(sys.argv) > 3 else 180
     mensual = "--mensual" in sys.argv
 
-    print(f"Descargando {days} días en {interval} para {len(symbols)} símbolo(s)...")
+    print(f"Descargando {days} días en {interval} para {len(symbols)} símbolo(s) "
+          f"desde BingX (el mismo exchange donde opera el bot)...")
     print(f"Filtros activos: coste {config.COST_ROUNDTRIP_PCT}% · "
           f"riesgo {config.MIN_RISK_PCT}-{config.MAX_RISK_PCT}%")
 
