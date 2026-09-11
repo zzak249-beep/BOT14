@@ -36,6 +36,161 @@ COLUMNAS = [
 ]
 
 
+# Columnas del registro de SEÑALES (todas, ejecutadas o no). Es un
+# archivo aparte del diario de operaciones: mezclarlos haría que las
+# ejecutadas aparecieran dos veces y que el análisis las contara doble.
+COLUMNAS_SENALES = [
+    "ts_señal", "fecha_utc", "hora_utc", "dow", "symbol", "side", "timeframe",
+    "price", "sl", "tp", "atr_pct", "riesgo_pct",
+    "coste_r", "coste_comision_r", "coste_funding_r", "coste_tick_r",
+    "ratio", "persist", "h8", "funding", "btc_24h",
+    "ejecutada", "motivo",
+]
+
+
+class RegistroSenales:
+    """
+    Toda señal que el motor genera, se ejecute o no.
+
+    POR QUÉ HACE FALTA UN ARCHIVO APARTE. journal.py solo escribe cuando
+    el bot ABRE posición. Con MODE=SIGNAL no abre nunca, así que las
+    señales salían por Telegram y se evaporaban: el 11/09,
+    operaciones_wavelet.csv llevaba nueve días con 200 bytes —solo la
+    cabecera— mientras el bot generaba ~1.9 señales al día.
+
+    Sin esto, esperar dos meses no acumula NADA. Y las preguntas que
+    hacen falta —si el coste separa ganadoras de perdedoras, si hay
+    estacionalidad por sesión, si las descartadas iban mejor— solo se
+    pueden contestar sobre las señales que NO se operaron.
+
+    La hora y el día se guardan ya calculados en UTC: derivarlos después
+    del timestamp invita a que cada script use una zona distinta.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.path.exists():
+                with self.path.open("w", newline="") as f:
+                    csv.writer(f).writerow(COLUMNAS_SENALES)
+        except Exception as exc:  # noqa: BLE001
+            log.error("No se pudo crear el registro de señales: %s", exc)
+
+    def anotar(self, sig, ejecutada: bool, motivo: str = "") -> None:
+        """Nunca lanza: un fallo aquí no puede tumbar una señal."""
+        try:
+            ahora = dt.datetime.now(dt.timezone.utc)
+            riesgo_pct = (abs(sig.entry - sig.sl) / sig.entry * 100.0) if sig.entry else 0.0
+            fila = {
+                "ts_señal": int(ahora.timestamp() * 1000),
+                "fecha_utc": ahora.isoformat(timespec="seconds"),
+                "hora_utc": ahora.hour,
+                "dow": ahora.weekday(),
+                "symbol": sig.symbol,
+                "side": "LONG" if str(sig.side).upper() in ("BUY", "LONG") else "SHORT",
+                "timeframe": getattr(sig, "timeframe", "") or "",
+                "price": f"{sig.entry:.10g}",
+                "sl": f"{sig.sl:.10g}",
+                "tp": f"{getattr(sig, 'tp', 0):.10g}" if getattr(sig, "tp", None) else "",
+                "atr_pct": f"{getattr(sig, 'atr_pct', 0):.4f}",
+                "riesgo_pct": f"{riesgo_pct:.4f}",
+                "coste_r": f"{getattr(sig, 'coste_r', 0):.4f}",
+                "coste_comision_r": f"{getattr(sig, 'coste_comision_r', 0):.4f}",
+                "coste_funding_r": f"{getattr(sig, 'coste_funding_r', 0):.4f}",
+                "coste_tick_r": f"{getattr(sig, 'coste_tick_r', 0):.4f}",
+                "ratio": f"{getattr(sig, 'ratio', 0):.4f}",
+                "persist": f"{getattr(sig, 'persist', 0):.4f}",
+                "h8": f"{getattr(sig, 'h8', 0):.10g}",
+                "funding": (f"{sig.funding:.4f}" if getattr(sig, "funding", None) is not None else ""),
+                "btc_24h": (f"{sig.btc_24h:.2f}" if getattr(sig, "btc_24h", None) is not None else ""),
+                "ejecutada": int(bool(ejecutada)),
+                "motivo": motivo,
+            }
+            with self.path.open("a", newline="") as f:
+                csv.DictWriter(f, COLUMNAS_SENALES).writerow(fila)
+        except Exception as exc:  # noqa: BLE001
+            log.error("No se pudo registrar la señal: %s", exc)
+
+
+# Columnas del registro de SEÑALES (todas, ejecutadas o no). Archivo
+# aparte del diario de operaciones: mezclarlos haría que las ejecutadas
+# aparecieran dos veces y el análisis las contara doble.
+COLUMNAS_SENALES = [
+    "ts_señal", "fecha_utc", "hora_utc", "dow", "symbol", "side", "timeframe",
+    "price", "sl", "tp", "atr_pct", "riesgo_pct",
+    "coste_r", "coste_comision_r", "coste_funding_r", "coste_tick_r",
+    "ratio", "persist", "h8", "funding", "btc_24h",
+    "ejecutada", "motivo",
+]
+
+
+class RegistroSenales:
+    """
+    Toda señal que el motor genera, se ejecute o no.
+
+    POR QUÉ HACE FALTA UN ARCHIVO APARTE. Journal solo escribe cuando el
+    bot ABRE posición. Con MODE=SIGNAL no abre nunca, así que las señales
+    salían por Telegram y se evaporaban: el 11/09,
+    operaciones_wavelet.csv llevaba nueve días con 200 bytes —solo la
+    cabecera— mientras el bot generaba ~1.9 señales al día.
+
+    Sin esto, esperar dos meses no acumula NADA. Y las preguntas que
+    importan —si el coste separa ganadoras de perdedoras, si hay
+    estacionalidad por sesión, si las descartadas iban mejor que las
+    operadas— solo se pueden contestar sobre las señales que NO se
+    operaron. Ese contrafactual no existe en ningún otro sitio.
+
+    La hora y el día van ya calculados en UTC: derivarlos después del
+    timestamp invita a que cada script use una zona distinta.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.path.exists():
+                with self.path.open("w", newline="") as f:
+                    csv.writer(f).writerow(COLUMNAS_SENALES)
+        except Exception as exc:  # noqa: BLE001
+            log.error("No se pudo crear el registro de señales: %s", exc)
+
+    def anotar(self, sig, ejecutada: bool = False, motivo: str = "") -> None:
+        """Nunca lanza: un fallo aquí no puede tumbar una señal."""
+        try:
+            ahora = dt.datetime.now(dt.timezone.utc)
+            riesgo_pct = (abs(sig.entry - sig.sl) / sig.entry * 100.0) if sig.entry else 0.0
+            fila = {
+                "ts_señal": int(ahora.timestamp() * 1000),
+                "fecha_utc": ahora.isoformat(timespec="seconds"),
+                "hora_utc": ahora.hour,
+                "dow": ahora.weekday(),
+                "symbol": sig.symbol,
+                "side": "LONG" if str(sig.side).upper() in ("BUY", "LONG") else "SHORT",
+                "timeframe": getattr(sig, "timeframe", "") or "",
+                "price": f"{sig.entry:.10g}",
+                "sl": f"{sig.sl:.10g}",
+                "tp": f"{getattr(sig, 'tp', 0):.10g}" if getattr(sig, "tp", None) else "",
+                "atr_pct": f"{getattr(sig, 'atr_pct', 0):.4f}",
+                "riesgo_pct": f"{riesgo_pct:.4f}",
+                "coste_r": f"{getattr(sig, 'coste_r', 0):.4f}",
+                "coste_comision_r": f"{getattr(sig, 'coste_comision_r', 0):.4f}",
+                "coste_funding_r": f"{getattr(sig, 'coste_funding_r', 0):.4f}",
+                "coste_tick_r": f"{getattr(sig, 'coste_tick_r', 0):.4f}",
+                "ratio": f"{getattr(sig, 'ratio', 0):.4f}",
+                "persist": f"{getattr(sig, 'persist', 0):.4f}",
+                "h8": f"{getattr(sig, 'h8', 0):.10g}",
+                "funding": (f"{sig.funding:.4f}" if getattr(sig, "funding", None) is not None else ""),
+                "btc_24h": (f"{sig.btc_24h:.2f}" if getattr(sig, "btc_24h", None) is not None else ""),
+                "ejecutada": int(bool(ejecutada)),
+                "motivo": motivo,
+            }
+            with self.path.open("a", newline="") as f:
+                csv.DictWriter(f, COLUMNAS_SENALES).writerow(fila)
+        except Exception as exc:  # noqa: BLE001
+            log.error("No se pudo registrar la señal: %s", exc)
+
+
 class Journal:
     def __init__(self, path: str) -> None:
         self.path = Path(path)

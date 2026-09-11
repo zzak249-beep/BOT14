@@ -179,6 +179,11 @@ class Bot:
         self.journal = journal.Journal(
             os.path.join(os.path.dirname(config.STATE_PATH) or "/data", "operaciones_wavelet.csv")
         )
+        # TODAS las señales, ejecutadas o no. En SIGNAL es el único sitio
+        # donde queda constancia de lo que el motor encontró.
+        self.registro = journal.RegistroSenales(
+            os.path.join(os.path.dirname(config.STATE_PATH) or "/data", "senales_todas.csv")
+        )
 
     async def start(self) -> None:
         faltan = ensure_config()
@@ -523,7 +528,8 @@ class Bot:
                 # El funding se pasa AQUÍ, no después: si va en contra,
                 # el coste cambia y puede descartar la señal. Asignarlo
                 # tras evaluar dejaba el filtro de coste ciego a él.
-                s_tf, m_tf = strategy.evaluate(sym, velas, self.funding.get(sym))
+                s_tf, m_tf = strategy.evaluate(
+                    sym, velas, self.funding.get(sym), self.api.tick_size(sym))
                 if s_tf is not None:
                     sig, motivo, tf_señal = s_tf, m_tf, tf
                     break
@@ -595,6 +601,12 @@ class Bot:
         lleno, no te enteraras de las señales.
         """
         log.info("SEÑAL %s %s entrada=%.8g sl=%.8g ratio=%.2f", sig.symbol, sig.side, sig.entry, sig.sl, sig.ratio)
+
+        # Se anota ANTES de decidir si se ejecuta. Si el registro
+        # dependiera del resultado, en SIGNAL no se guardaría ninguna —
+        # que es exactamente lo que estaba pasando.
+        self.registro.anotar(sig, ejecutada=False,
+                             motivo="" if hay_hueco else "sin hueco")
 
         # AVISO — siempre, con enfriamiento para no repetir cada ciclo.
         ultimos = self.state.data.setdefault("last_signal", {})
