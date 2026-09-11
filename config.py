@@ -208,6 +208,13 @@ BTC_CONTEXT = _bool("BTC_CONTEXT", True)
 # días en cubrir la comisión de abrir. Por eso el bot NO monta carry:
 # solo avisa cuando el funding está tan alto que sí compensaría, con el
 # cálculo hecho sobre el saldo real.
+# El funding ENTRA en el coste de la señal, no solo en el comentario.
+# Medido con el aviso de RVN del 11/09: comisión 0.04 R y funding
+# -0.5038%/8h con los cortos pagando. Manteniendo 2 h eso suma 0.078 R
+# más, o sea el triple del coste anunciado. Ponlo a false solo para
+# comparar contra el comportamiento anterior.
+FUNDING_EN_COSTE = _bool("FUNDING_EN_COSTE", True)
+
 FUNDING_ALERTS = _bool("FUNDING_ALERTS", True)
 FUNDING_EXTREMO = _float("FUNDING_EXTREMO", 0.05)
 FUNDING_ALERT_MIN = _int("FUNDING_ALERT_MIN", 120)

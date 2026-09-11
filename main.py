@@ -520,7 +520,10 @@ class Bot:
                 velas = await self._velas(sym, tf)
                 if not velas:
                     continue
-                s_tf, m_tf = strategy.evaluate(sym, velas)
+                # El funding se pasa AQUÍ, no después: si va en contra,
+                # el coste cambia y puede descartar la señal. Asignarlo
+                # tras evaluar dejaba el filtro de coste ciego a él.
+                s_tf, m_tf = strategy.evaluate(sym, velas, self.funding.get(sym))
                 if s_tf is not None:
                     sig, motivo, tf_señal = s_tf, m_tf, tf
                     break

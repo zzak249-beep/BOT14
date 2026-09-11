@@ -65,7 +65,9 @@ class Signal:
     persist: float       # ER de la tendencia: 1 = línea recta, 0 = va y vuelve
     atr_pct: float
     riesgo_pct: float
-    coste_r: float
+    coste_r: float          # comisión + funding esperado, en R
+    coste_comision_r: float = 0.0   # solo comisión
+    coste_funding_r: float = 0.0    # solo funding, por MAX_TRADE_MINUTES
     timeframe: str = ""
     btc_24h: float | None = None
     funding: float | None = None
@@ -193,7 +195,38 @@ def min_velas() -> int:
                (config.HTF_MA_LEN + 20) if config.USE_HTF_FILTER else 0)
 
 
-def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
+def coste_funding_r(rate_pct: float | None, side: str, riesgo_pct: float,
+                    minutos: int | None = None) -> float:
+    """
+    Funding que se paga (o cobra) por mantener la posición, expresado en R.
+
+    POR QUÉ ESTO IMPORTA MÁS DE LO QUE PARECE. El aviso de RVN del
+    11/09 traía "coste 0.04 R" y un funding de -0.5038%/8h. Con los
+    cortos pagando y un stop del 1.62%, mantener dos horas añade
+
+        0.5038 x (2/8) / 1.62 = 0.078 R
+
+    o sea el DOBLE de la comisión, que era 0.04. A ocho horas serían
+    0.31 R: siete veces. El mensaje decía 0.04 y el coste real era 0.12.
+
+    Signo: funding positivo lo pagan los LARGOS. Así que un corto con
+    funding positivo COBRA, y el resultado sale negativo — eso es una
+    ayuda y se resta del coste, no se ignora.
+    """
+    if rate_pct is None or riesgo_pct <= 0:
+        return 0.0
+    try:
+        mins = int(minutos if minutos is not None else getattr(config, "MAX_TRADE_MINUTES", 120))
+        fraccion = max(mins, 0) / 480.0          # el intervalo de funding son 8 h
+        paga = float(rate_pct) * fraccion        # % del nocional
+        signo = 1.0 if str(side).upper() in ("BUY", "LONG") else -1.0
+        return signo * paga / riesgo_pct
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def evaluate(symbol: str, candles: list[dict],
+             funding_rate: float | None = None) -> tuple[Signal | None, str]:
     if len(candles) < min_velas():
         return None, "pocas velas"
 
@@ -261,9 +294,22 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     if riesgo <= 0:
         return None, "riesgo no válido"
     riesgo_pct = riesgo / entrada * 100.0
-    coste_r = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
+    coste_com = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
+
+    # El funding entra en el coste, no en el comentario. Solo cuenta si
+    # está activado: con MAX_TRADE_MINUTES corto y funding normal es
+    # calderilla, pero en un símbolo al 552% anual multiplica el coste.
+    coste_fun = 0.0
+    if getattr(config, "FUNDING_EN_COSTE", True):
+        coste_fun = coste_funding_r(funding_rate, side, riesgo_pct)
+    coste_r = coste_com + coste_fun
 
     if coste_r > config.MAX_COST_IN_R:
+        if coste_fun > 0.01 and coste_com <= config.MAX_COST_IN_R:
+            # Distinguirlo importa: si el que se pasa es el funding, el
+            # símbolo puede servir en el otro sentido o con menos tiempo.
+            return None, (f"funding en contra (comisión {coste_com:.2f}R + "
+                          f"funding {coste_fun:.2f}R = {coste_r:.2f}R)")
         return None, f"stop demasiado cerca (coste {coste_r:.2f}R)"
     if riesgo_pct > config.MAX_RISK_PCT:
         return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
@@ -274,7 +320,9 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
         Signal(symbol=symbol, side=side, entry=entrada, sl=sl, tp=tp,
                ratio=ratio, umbral=config.DOMINANCE_THRESHOLD, h8=h8,
                persist=persist,
-               atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r),
+               atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r,
+               coste_comision_r=coste_com, coste_funding_r=coste_fun,
+               funding=funding_rate),
         "ok",
     )
 
