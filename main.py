@@ -528,8 +528,13 @@ class Bot:
                 # El funding se pasa AQUÍ, no después: si va en contra,
                 # el coste cambia y puede descartar la señal. Asignarlo
                 # tras evaluar dejaba el filtro de coste ciego a él.
+                #
+                # (12/09: aquí había un self.api.tick_size(sym) de más.
+                # BingX no tiene ese método y evaluate() solo acepta tres
+                # argumentos — AttributeError en CADA ciclo de scan_once,
+                # bloqueando toda señal desde el primer escaneo. Quitado.)
                 s_tf, m_tf = strategy.evaluate(
-                    sym, velas, self.funding.get(sym), self.api.tick_size(sym))
+                    sym, velas, self.funding.get(sym))
                 if s_tf is not None:
                     sig, motivo, tf_señal = s_tf, m_tf, tf
                     break

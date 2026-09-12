@@ -196,6 +196,58 @@ class BingX:
                 return float(bal.get("availableMargin", bal.get("balance", 0)) or 0)
         return 0.0
 
+    async def cuenta(self) -> dict:
+        """
+        Saldo de la cuenta en un dict: equity y margen disponible por
+        separado. main.py.snapshot() ya lo llama y esperaba este método
+        — no existía, así que el freno de drawdown y el límite diario
+        de cuenta caían siempre al saldo 0.0 de reserva, en silencio
+        (snapshot() atrapa la excepción y solo deja un warning en log).
+
+        balance_usdt() lee el MISMO endpoint pero solo devuelve
+        availableMargin (o balance si falta): sirve para el sizing,
+        pero actualizar_freno() necesita PATRIMONIO real (equity), que
+        solo baja si la cuenta pierde de verdad. El margen disponible
+        baja también al quedar bloqueado en una posición abierta y
+        ganada, y usarlo ahí dispararía el freno en falso a la primera
+        operación — es exactamente el motivo que ya deja escrito el
+        comentario de actualizar_freno().
+        """
+        data = await self._private("GET", "/openApi/swap/v2/user/balance")
+        bal = data.get("balance", data) if isinstance(data, dict) else {}
+        if not isinstance(bal, dict):
+            bal = {}
+        return {
+            "disponible": float(bal.get("availableMargin", 0) or 0),
+            "equity": float(bal.get("equity", bal.get("balance", 0)) or 0),
+        }
+
+    async def realized_pnl_hoy(self) -> float | None:
+        """
+        PnL realizado de la cuenta desde las 00:00 UTC.
+
+        NO IMPLEMENTADO todavía — devuelve None a propósito. El mismo
+        problema que cuenta(): main.py.limite_cuenta_alcanzado() ya
+        llama a esto y el método no existía, así que el límite diario
+        DE CUENTA (a diferencia del límite por bot, que sí funciona)
+        estaba muerto en silencio.
+
+        La diferencia con cuenta() es que aquí no hay endpoint ya usado
+        en este cliente del que tirar: el candidato es
+        /openApi/swap/v2/user/income (histórico de flujo de fondos),
+        pero sin haber visto una respuesta real no hay que adivinar el
+        nombre exacto del incomeType para "PnL realizado" ni si hace
+        falta paginar. Un filtro equivocado devolvería un número que
+        PARECE bueno y no lo es — peor que no tener el dato.
+
+        Devolver None mantiene el camino que limite_cuenta_alcanzado()
+        ya preveía para esto ("sin datos: manda el contador propio"):
+        el límite por bot sigue activo, solo el de CUENTA queda
+        inactivo hasta implementar esto contra una respuesta real de
+        BingX.
+        """
+        return None
+
     async def set_margin_mode(self, symbol: str, modo: str = "ISOLATED") -> None:
         """
         Fija el modo de margen del símbolo.
