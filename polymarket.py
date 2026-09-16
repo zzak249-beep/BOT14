@@ -91,6 +91,11 @@ DEFAULTS = {
     "PM_VRP_HIGH": 1.25,
     "PM_VRP_LOW": 0.80,
     "PM_TIMEOUT": 12,
+    # Gamma devuelve como mucho 100 por página: pedir 500 no da 500, da 100.
+    # Hay que paginar, y hay que hacerlo con criterio porque ordenado por
+    # volumen las primeras páginas son política y deportes.
+    "PM_PAGINAS": 12,            # 12 x 100 = 1200 mercados
+    "PM_TAGS": "bitcoin,crypto", # etiquetas de /events que se piden primero
 }
 
 
@@ -210,14 +215,92 @@ def parse_strike(pregunta: str) -> float | None:
     return v if v > 0 else None
 
 
+# Cómo se consiguieron los mercados en la última llamada. Se enseña en el
+# aviso: si la escalera falla, lo primero que hay que saber es si el fallo
+# está en la descarga o en el filtrado.
+ORIGEN: dict[str, int] = {}
+
+
+def _norm(raw) -> list:
+    if isinstance(raw, dict):
+        return raw.get("data") or raw.get("markets") or raw.get("events") or []
+    return raw or []
+
+
+def _por_etiquetas(config: Any, timeout: int) -> list:
+    """
+    Los peldaños de BTC viven dentro de un EVENTO ("What price will Bitcoin
+    hit..."), no sueltos en el ranking global de volumen. Pedirlos por
+    etiqueta los trae directamente, sin depender de que asomen entre los
+    mercados más negociados del sitio.
+    """
+    out: list = []
+    tags = [t.strip() for t in str(cfg(config, "PM_TAGS")).split(",") if t.strip()]
+    for tag in tags:
+        try:
+            data = _norm(_get(f"{GAMMA}/events",
+                              {"active": "true", "closed": "false",
+                               "tag_slug": tag, "limit": 100}, timeout))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("etiqueta %s falló: %s", tag, exc)
+            continue
+        n = 0
+        for ev in data:
+            for m in (ev.get("markets") or []):
+                out.append(m)
+                n += 1
+        ORIGEN[f"tag:{tag}"] = n
+    return out
+
+
+def _paginado(config: Any, timeout: int) -> list:
+    """Barrido general. 100 por página, que es el tope real de Gamma."""
+    out: list = []
+    paginas = int(cfg(config, "PM_PAGINAS"))
+    for i in range(max(paginas, 1)):
+        try:
+            lote = _norm(_get(f"{GAMMA}/markets",
+                              {"active": "true", "closed": "false",
+                               "limit": 100, "offset": i * 100,
+                               "order": "volumeNum", "ascending": "false"}, timeout))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("página %d falló: %s", i, exc)
+            break
+        if not lote:
+            break
+        out.extend(lote)
+        if len(lote) < 100:
+            break
+    ORIGEN["paginado"] = len(out)
+    return out
+
+
 def _mercados(config: Any) -> list:
+    """
+    Primero por etiqueta (dirigido), luego el barrido paginado. Se juntan y
+    se quitan duplicados por id: un mercado puede venir por los dos caminos.
+    """
     timeout = int(cfg(config, "PM_TIMEOUT"))
-    data = _get(f"{GAMMA}/markets",
-                {"closed": "false", "limit": 500, "order": "volumeNum",
-                 "ascending": "false"}, timeout)
-    if isinstance(data, dict):
-        data = data.get("data") or data.get("markets") or []
-    return data or []
+    ORIGEN.clear()
+    bruto = _por_etiquetas(config, timeout) + _paginado(config, timeout)
+    vistos: set = set()
+    out: list = []
+    for m in bruto:
+        if not isinstance(m, dict):
+            continue
+        clave = m.get("id") or m.get("conditionId") or m.get("slug") or m.get("question")
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        out.append(m)
+    ORIGEN["únicos"] = len(out)
+    return out
+
+
+# Por qué se cayó cada mercado. Sin esto, "sin escalera" no distingue entre
+# "no hay mercados de BTC", "los umbrales de liquidez se los comen" y "las
+# preguntas están redactadas de otra forma". Son tres arreglos distintos.
+EMBUDO: dict[str, int] = {}
 
 
 def escalera(config: Any, mercados: list, base: str = "BTC") -> list[Peldano]:
@@ -225,43 +308,69 @@ def escalera(config: Any, mercados: list, base: str = "BTC") -> list[Peldano]:
         base.upper(), base.lower())
     minliq = float(cfg(config, "PM_MIN_LIQUIDITY"))
     minvol = float(cfg(config, "PM_MIN_VOLUME"))
+    EMBUDO.clear()
+    EMBUDO["leídos"] = len(mercados)
+
+    def cae(motivo):
+        EMBUDO[motivo] = EMBUDO.get(motivo, 0) + 1
+
     out: list[Peldano] = []
     for m in mercados:
-        q = m.get("question") or ""
+        q = m.get("question") or m.get("title") or ""
         ql = q.lower()
         if nombre not in ql and base.lower() not in ql:
-            continue
-        liq = float(m.get("liquidityNum") or m.get("liquidity") or 0)
-        vol = float(m.get("volumeNum") or m.get("volume") or 0)
-        if liq < minliq or vol < minvol:
-            continue
+            continue                       # ni se cuenta: no es del subyacente
+        EMBUDO["del subyacente"] = EMBUDO.get("del subyacente", 0) + 1
+
         strike = parse_strike(q)
         if strike is None:
+            cae("sin strike en la pregunta")
             continue
+        if not any(w in ql for w in _ENCIMA) and not any(w in ql for w in _DEBAJO):
+            cae("sin arriba/abajo")
+            continue
+
+        liq = float(m.get("liquidityNum") or m.get("liquidity") or 0)
+        vol = float(m.get("volumeNum") or m.get("volume") or 0)
+        if liq < minliq:
+            cae("poca liquidez")
+            continue
+        if vol < minvol:
+            cae("poco volumen")
+            continue
+
         outs = [str(o).lower() for o in _lista(m.get("outcomes"))]
         precios = [float(p) for p in _lista(m.get("outcomePrices")) if p not in (None, "")]
         if len(precios) < 2 or len(outs) < 2:
+            cae("sin precios")
             continue
         try:
             p_si = precios[outs.index("yes")]
         except ValueError:
             p_si = precios[0]
-        if any(w in ql for w in _ENCIMA):
-            p_encima = p_si
-        elif any(w in ql for w in _DEBAJO):
-            p_encima = 1.0 - p_si
-        else:
-            continue
-        bruto = m.get("endDate") or m.get("end_date_iso")
+        p_encima = p_si if any(w in ql for w in _ENCIMA) else 1.0 - p_si
+
+        bruto = m.get("endDate") or m.get("end_date_iso") or m.get("endDateIso")
         if not bruto:
+            cae("sin fecha de vencimiento")
             continue
         try:
             vence = datetime.fromisoformat(str(bruto).replace("Z", "+00:00"))
         except ValueError:
+            cae("fecha ilegible")
             continue
         out.append(Peldano(strike, p_encima, vence, q, liq, vol))
+
+    EMBUDO["peldaños"] = len(out)
     out.sort(key=lambda p: p.strike)
     return out
+
+
+def diagnostico() -> str:
+    """Una línea con de dónde salieron los mercados y dónde se cayeron."""
+    org = " · ".join(f"{k}: {v}" for k, v in ORIGEN.items()) or "sin datos"
+    emb = " · ".join(f"{k}: {v}" for k, v in EMBUDO.items() if v) or "sin datos"
+    return f"origen → {org}\nembudo → {emb}"
 
 
 # ──────────────────────────────────────────── ajuste de la distribución
@@ -401,6 +510,7 @@ def _snapshot_sync(config: Any, spot: float, sigma_vela: float,
         "ok": True,
         "motivo": imp.motivo,
         "mercados": len(mercados),
+        "diagnostico": diagnostico(),
         "peldanos": imp.n,
         "horizonte_dias": round(imp.horizonte_dias, 1),
         "mediana": round(imp.mediana, 8) if imp.ok else None,
@@ -454,6 +564,10 @@ def format_telegram(snap: dict, base: str = "BTC") -> str:
     else:
         L.append(f"Escalera no utilizable: {snap['motivo']} "
                  f"({snap.get('mercados', 0)} mercados leídos)")
+        # El diagnóstico va en el propio aviso: si no, hay que entrar en los
+        # logs de Railway para saber si el fallo es de descarga o de filtro.
+        if snap.get("diagnostico"):
+            L.append(f"<code>{snap['diagnostico']}</code>")
     if snap.get("evento_activo"):
         L.append("")
         L.append(f"⏳ <b>Evento macro en {snap['evento_horas']:.1f} h</b>")
