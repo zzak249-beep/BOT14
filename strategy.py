@@ -68,6 +68,13 @@ class Signal:
     coste_r: float          # comisión + funding esperado, en R
     coste_comision_r: float = 0.0   # solo comisión
     coste_funding_r: float = 0.0    # solo funding, por MAX_TRADE_MINUTES
+    # RESERVADO Y SIEMPRE 0. El diario ya escribe esta columna vía getattr,
+    # así que existía como fantasma. Se declara para que el dato sea
+    # explícito, no para fingir que está medido: el coste de cruzar el
+    # spread necesita el tick real del contrato, que este cliente de BingX
+    # no pide. Mientras valga 0, la columna coste_tick_r del CSV es 0 a
+    # propósito y no "sin deslizamiento".
+    coste_tick_r: float = 0.0
     timeframe: str = ""
     btc_24h: float | None = None
     funding: float | None = None
@@ -379,6 +386,42 @@ def position_size(equity: float, entry: float, sl: float,
         f = 1.0
     f = min(max(f, 0.0), 1.0)
     return (equity * config.RISK_PCT * f / 100.0) / riesgo
+
+
+def calidad(sig: Signal) -> tuple:
+    """
+    Clave de ordenación del ranking de candidatas.
+
+    ESTA FUNCIÓN FALTABA Y TUMBABA EL ESCANEO. main.py hace
+    `senales.sort(key=strategy.calidad)` cuando RANK_CANDIDATES está
+    activo (lo está por defecto) y hay MÁS DE UNA señal en el ciclo. Sin
+    ella, AttributeError: el except de start() se lo traga, el ciclo
+    entero muere antes de handle_signal y ni se avisa ni se registra
+    ninguna señal de ese ciclo. Con un solo candidato no pasa nada,
+    porque el sort va dentro de un `if len(senales) > 1` — por eso podía
+    llevar días ocurriendo con la única huella de un traceback en los
+    logs. Es el mismo patrón que el `tick_size` inexistente del 12/09.
+
+    EL ORDEN, Y POR QUÉ ESTE. Primero el COSTE ascendente: de los tres
+    términos es el único CIERTO en el momento de decidir — la comisión y
+    el funding se conocen, la dominancia y el ER son estimaciones de algo
+    que todavía no ha pasado. Ordenar por "la señal más bonita" es elegir
+    por la parte que no se sabe.
+
+    Desempates, los dos descendentes: persistencia (el ER de la tendencia,
+    que es lo que de verdad separa tendencia de oscilación) y después
+    dominancia. Se devuelve una tupla porque sorted() la compara elemento
+    a elemento y así el criterio queda escrito en una línea legible.
+
+    NO es una puntuación combinada a propósito. Sumar coste, ER y
+    dominancia con pesos exigiría unos pesos, y esos pesos serían una
+    creencia sin medir metida en el orden de ejecución.
+    """
+    return (
+        getattr(sig, "coste_r", 99.0),
+        -getattr(sig, "persist", 0.0),
+        -getattr(sig, "ratio", 0.0),
+    )
 
 
 def watch_status(candles: list[dict]) -> dict | None:
