@@ -189,6 +189,29 @@ USE_TCA = _bool("USE_TCA", True)
 MIN_TCA_SAMPLES = _int("MIN_TCA_SAMPLES", 10)
 TCA_BLACKLIST_MULT = _float("TCA_BLACKLIST_MULT", 2.0)
 
+# ── MODO MANUAL: señales completas para entrar a mano ─────────────────
+# En MODE=SIGNAL el bot nunca usaba fmt_signal(): todas las señales caían
+# al mensaje AGRUPADO de volcar_avisos(), que es compacto a propósito
+# (nació para no repetir 1920 mensajes). Compacto está bien para vigilar
+# y es inservible para operar: no trae cantidad, ni caducidad, ni el
+# plan de salida.
+#
+# Con ALERT_FULL, si el ciclo produce pocas señales se manda un PARTE
+# COMPLETO por cada una — con todo lo que hace falta para teclear la
+# orden en BingX sin calcular nada. Si produce muchas, se vuelve al
+# agrupado: el límite existe para que el modo manual no reinvente la
+# fatiga de alertas que ya costó 1920 mensajes sin leer.
+ALERT_FULL = _bool("ALERT_FULL", True)
+MANUAL_MAX_ALERTAS = _int("MANUAL_MAX_ALERTAS", 4)
+# Cantidad calculada con SALDO_ESTIMADO (en SIGNAL no hay saldo real que
+# consultar). Si tu saldo cambia, ACTUALIZA SALDO_ESTIMADO o la cantidad
+# del parte será la de otra cuenta.
+MANUAL_SIZING = _bool("MANUAL_SIZING", True)
+# Caducidad de la señal. Una señal de hace 40 minutos a un precio que ya
+# se movió un 2% NO es la señal que se generó: es otra operación con el
+# mismo nombre. El parte lleva la hora límite escrita.
+SIGNAL_TTL_MIN = _int("SIGNAL_TTL_MIN", 15)
+
 # ── Avisos ────────────────────────────────────────────────────────────
 SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
 WATCHLIST_MIN = _int("WATCHLIST_MIN", 30)

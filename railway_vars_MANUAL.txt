@@ -1,0 +1,125 @@
+# ── BOT14 · renewed-love · MODO MANUAL ──────────────────────────────
+# El bot NO abre nada. Detecta, calcula la orden y te manda el parte
+# por Telegram. Entras tú en BingX si lo ves oportuno.
+MODE=SIGNAL
+LIVE_CONFIRMED=false
+
+# API SOLO LECTURA. En SIGNAL el bot no manda órdenes, pero si algún día
+# tocas MODE por error, una clave sin permiso de trading es el cerrojo
+# que te salva. Déjalas vacías si no quieres ni eso.
+BINGX_API_KEY=
+BINGX_API_SECRET=
+
+TELEGRAM_TOKEN=${{TELEGRAM_BOT_TOKEN}}
+TELEGRAM_CHAT_ID=PON_AQUI_TU_CHAT_ID
+STATE_PATH=/data/state_wavelet.json
+
+# ── Partes de entrada manual ────────────────────────────────────────
+ALERT_FULL=true
+# Más de 4 señales en un ciclo vuelve al mensaje agrupado. Súbelo solo
+# si prefieres 8 mensajes seguidos a uno resumido.
+MANUAL_MAX_ALERTAS=4
+MANUAL_SIZING=true
+# Caducidad del parte. En 5m, 15 min son 3 velas: pasadas esas, el
+# precio del parte ya no es el precio.
+SIGNAL_TTL_MIN=15
+# EL NÚMERO QUE MÁS IMPORTA DEL MODO MANUAL: la cantidad del parte sale
+# de aquí. Si tu saldo real no es este, la cantidad es la de otra cuenta.
+SALDO_ESTIMADO=135
+RISK_PCT=0.5
+LEVERAGE=2
+MARGIN_MODE=ISOLATED
+
+# ── Avisos ──────────────────────────────────────────────────────────
+# 45 min por símbolo: suficiente para no repetir la misma señal en cada
+# vela y poco para no perderte un giro real del mismo par.
+SIGNAL_COOLDOWN_MIN=45
+WATCHLIST_MIN=30
+DAILY_SUMMARY=true
+DAILY_SUMMARY_HOUR_UTC=7
+HEARTBEAT_HOURS=12
+ZOMBIE_ALERT_HOURS=6
+IDLE_ALERT_DAYS=5
+BTC_CONTEXT=true
+BTC_FILTER=false
+FUNDING_ALERTS=true
+FUNDING_EXTREMO=0.05
+FUNDING_ALERT_MIN=120
+FUNDING_EN_COSTE=true
+
+# ── Motor (sin tocar: es lo que estás midiendo) ─────────────────────
+TIMEFRAME=5m
+TIMEFRAMES=5m
+SCAN_INTERVAL_SEC=60
+MRA_LEVELS=4
+CROSS_SOURCE=trend
+LOOKBACK_ENERGY=40
+APPROX_LEN=8
+ATR_LEN=14
+NORMALIZE_SCALES=true
+DOMINANCE_THRESHOLD=1.30
+USE_PERSISTENCE=true
+MIN_PERSISTENCE=0.60
+USE_VOL_FILTER=true
+VOL_LEN=20
+VOL_MULT=1.2
+USE_HTF_FILTER=true
+HTF_MA_LEN=200
+ALLOW_LONG=true
+ALLOW_SHORT=true
+
+# ── Salidas y coste ─────────────────────────────────────────────────
+SL_ATR=1.5
+TP_ATR=2.5
+MAX_TRADE_MINUTES=120
+USE_TIME_EXIT=true
+TIME_EXIT_ONLY_LOSING=true
+USE_TRAILING=false
+# 0.07 = maker 0.02 + taker 0.05. Si entras a mercado a mano, el coste
+# real es 0.10 y la mitad de los partes no deberían pasar el filtro:
+# sube esto a 0.10 si vas a entrar SIEMPRE a mercado.
+COST_ROUNDTRIP_PCT=0.07
+FEE_MAKER_PCT=0.02
+FEE_TAKER_PCT=0.05
+POST_ONLY=true
+ENTRY_TYPE=LIMIT
+MIN_ATR_PCT=0.5
+MIN_COST_COVER=6.0
+MAX_COST_IN_R=0.20
+MAX_RISK_PCT=4.0
+MIN_RISK_PCT=0.0
+MIN_QUOTE_VOLUME_24H=2000000
+
+# ── Universo ────────────────────────────────────────────────────────
+MAX_SYMBOLS=400
+SCAN_CONCURRENCY=8
+EXCLUDE_PREFIXES=NC
+SYMBOL_WHITELIST=
+
+# ── Frenos (inertes en SIGNAL, puestos para cuando pases a LIVE) ────
+MAX_CONCURRENT=1
+MAX_TOTAL_POSITIONS=3
+MAX_CONSECUTIVE_LOSSES=3
+COOLDOWN_MINUTES=120
+MAX_DAILY_LOSS_R=3.0
+USE_DD_BRAKE=true
+DD_BRAKE_PCT=10.0
+DD_RESUME_PCT=5.0
+DD_BRAKE_FACTOR=0.5
+ACCOUNT_DAILY_LOSS=true
+RANK_CANDIDATES=true
+USE_TCA=true
+MIN_TCA_SAMPLES=10
+TCA_BLACKLIST_MULT=2.0
+LIMIT_OFFSET_PCT=0.05
+LIMIT_TTL_MIN=10
+
+# ── Polymarket (contexto, sin frenar nada) ──────────────────────────
+PM_ENABLED=true
+PM_BASE=BTC
+PM_REPORT_MIN=180
+PM_REFRESH_MIN=15
+PM_BLOCK_ON_EVENT=false
+
+RECV_WINDOW=5000
+LOG_LEVEL=INFO
